@@ -140,13 +140,19 @@ func splitAndFilterSpans(
 }
 
 // clusterNodeCount returns the approximate number of nodes in the cluster.
-func clusterNodeCount(g *gossip.Gossip) int {
+func clusterNodeCount(gw gossip.DeprecatedGossip) (int, error) {
+	g, err := gw.OptionalErr(47970)
+	if err != nil {
+		return 0, err
+	}
 	var nodes int
-	_ = g.IterateInfos(gossip.KeyNodeIDPrefix, func(_ string, _ gossip.Info) error {
-		nodes++
-		return nil
-	})
-	return nodes
+	_ = g.IterateInfos(
+		gossip.KeyNodeIDPrefix, func(_ string, _ gossip.Info) error {
+			nodes++
+			return nil
+		},
+	)
+	return nodes, nil
 }
 
 type spanAndTime struct {
@@ -516,7 +522,10 @@ func (b *backupResumer) Resume(
 		log.Warningf(ctx, "unable to load backup checkpoint while resuming job %d: %v", *b.job.ID(), err)
 	}
 
-	numClusterNodes := clusterNodeCount(p.ExecCfg().Gossip)
+	numClusterNodes, err := clusterNodeCount(p.ExecCfg().Gossip)
+	if err != nil {
+		return err
+	}
 
 	res, err := backup(
 		ctx,
@@ -541,6 +550,14 @@ func (b *backupResumer) Resume(
 	}
 	b.deleteCheckpoint(ctx, p.ExecCfg())
 
+	if ptsID != nil && !b.testingKnobs.ignoreProtectedTimestamps {
+		if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			return b.releaseProtectedTimestamp(ctx, txn, p.ExecCfg().ProtectedTimestampProvider)
+		}); err != nil {
+			log.Errorf(ctx, "failed to release protected timestamp: %v", err)
+		}
+	}
+
 	resultsCh <- tree.Datums{
 		tree.NewDInt(tree.DInt(*b.job.ID())),
 		tree.NewDString(string(jobs.StatusSucceeded)),
@@ -548,14 +565,6 @@ func (b *backupResumer) Resume(
 		tree.NewDInt(tree.DInt(res.Rows)),
 		tree.NewDInt(tree.DInt(res.IndexEntries)),
 		tree.NewDInt(tree.DInt(res.DataSize)),
-	}
-
-	if ptsID != nil && !b.testingKnobs.ignoreProtectedTimestamps {
-		if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			return b.releaseProtectedTimestamp(ctx, txn, p.ExecCfg().ProtectedTimestampProvider)
-		}); err != nil {
-			log.Errorf(ctx, "failed to release protected timestamp: %v", err)
-		}
 	}
 
 	// Collect telemetry.

@@ -72,11 +72,11 @@ func setExplainBundleResult(
 			return
 		}
 
-		url := fmt.Sprintf("  %s/_admin/v1/stmtbundle/%d", execCfg.AdminURL(), diagID)
 		text = []string{
-			"Download the bundle from:",
-			url,
-			"or from the Admin UI (Advanced Debug -> Statement Diagnostics).",
+			"Statement diagnostics bundle generated. Download from the Admin UI (Advanced",
+			"Debug -> Statement Diagnostics History) or use the direct link below.",
+			fmt.Sprintf("Admin UI: %s", execCfg.AdminURL()),
+			fmt.Sprintf("Direct link: %s/_admin/v1/stmtbundle/%d", execCfg.AdminURL(), diagID),
 		}
 	}()
 
@@ -253,12 +253,32 @@ func (b *stmtBundleBuilder) addDistSQLDiagrams() {
 func (b *stmtBundleBuilder) addTrace() tree.Datum {
 	traceJSON, traceJSONStr, err := traceToJSON(b.trace)
 	if err != nil {
-		b.z.AddFile("trace.txt", err.Error())
+		b.z.AddFile("trace.json", err.Error())
 	} else {
 		b.z.AddFile("trace.json", traceJSONStr)
 	}
+
+	cfg := tree.DefaultPrettyCfg()
+	cfg.UseTabs = false
+	cfg.LineWidth = 100
+	cfg.TabWidth = 2
+	cfg.Simplify = true
+	cfg.Align = tree.PrettyNoAlign
+	cfg.JSONFmt = true
+	stmt := cfg.Pretty(b.plan.stmt.AST)
+
 	// The JSON is not very human-readable, so we include another format too.
-	b.z.AddFile("trace.txt", b.trace.String())
+	b.z.AddFile("trace.txt", fmt.Sprintf("%s\n\n\n\n%s", stmt, b.trace.String()))
+
+	// Note that we're going to include the non-anonymized statement in the trace.
+	// But then again, nothing in the trace is anonymized.
+	jaegerJSON, err := b.trace.ToJaegerJSON(stmt)
+	if err != nil {
+		b.z.AddFile("trace-jaeger.txt", err.Error())
+	} else {
+		b.z.AddFile("trace-jaeger.json", jaegerJSON)
+	}
+
 	return traceJSON
 }
 
@@ -462,7 +482,10 @@ func (c *stmtEnvCollector) PrintSettings(w io.Writer) error {
 	}{
 		{sessionSetting: "reorder_joins_limit", clusterSetting: ReorderJoinsLimitClusterValue},
 		{sessionSetting: "enable_zigzag_join", clusterSetting: zigzagJoinClusterMode},
-		{sessionSetting: "optimizer_foreign_keys", clusterSetting: optDrivenFKClusterMode},
+		{sessionSetting: "optimizer_foreign_keys", clusterSetting: optDrivenFKChecksClusterMode},
+		{sessionSetting: "experimental_optimizer_foreign_key_cascades", clusterSetting: optDrivenFKCascadesClusterMode},
+		{sessionSetting: "optimizer_use_histograms", clusterSetting: optUseHistogramsClusterMode},
+		{sessionSetting: "optimizer_use_multicol_stats", clusterSetting: optUseMultiColStatsClusterMode},
 	}
 
 	for _, s := range relevantSettings {

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -44,6 +45,10 @@ import (
 )
 
 const (
+	// RunningStatusDrainingNames used to indicate that the job was draining names
+	// for dropped descriptors. This constant is now deprecated and only exists
+	// to be used for migrating old jobs.
+	RunningStatusDrainingNames jobs.RunningStatus = "draining names"
 	// RunningStatusWaitingGC is for jobs that are currently in progress and
 	// are waiting for the GC interval to expire
 	RunningStatusWaitingGC jobs.RunningStatus = "waiting for GC TTL"
@@ -68,7 +73,7 @@ type SchemaChanger struct {
 	tableID           sqlbase.ID
 	mutationID        sqlbase.MutationID
 	droppedDatabaseID sqlbase.ID
-	nodeID            roachpb.NodeID
+	sqlInstanceID     base.SQLInstanceID
 	db                *kv.DB
 	leaseMgr          *LeaseManager
 
@@ -92,7 +97,7 @@ type SchemaChanger struct {
 func NewSchemaChangerForTesting(
 	tableID sqlbase.ID,
 	mutationID sqlbase.MutationID,
-	nodeID roachpb.NodeID,
+	sqlInstanceID base.SQLInstanceID,
 	db kv.DB,
 	leaseMgr *LeaseManager,
 	jobRegistry *jobs.Registry,
@@ -100,14 +105,14 @@ func NewSchemaChangerForTesting(
 	settings *cluster.Settings,
 ) SchemaChanger {
 	return SchemaChanger{
-		tableID:     tableID,
-		mutationID:  mutationID,
-		nodeID:      nodeID,
-		db:          &db,
-		leaseMgr:    leaseMgr,
-		jobRegistry: jobRegistry,
-		settings:    settings,
-		execCfg:     execCfg,
+		tableID:       tableID,
+		mutationID:    mutationID,
+		sqlInstanceID: sqlInstanceID,
+		db:            &db,
+		leaseMgr:      leaseMgr,
+		jobRegistry:   jobRegistry,
+		settings:      settings,
+		execCfg:       execCfg,
 	}
 }
 
@@ -249,7 +254,7 @@ func (sc *SchemaChanger) maybeBackfillCreateTableAs(
 			sc.execCfg.LeaseHolderCache,
 			txn,
 			func(ts hlc.Timestamp) {
-				_ = sc.clock.Update(ts)
+				sc.clock.Update(ts)
 			},
 			// Make a session tracing object on-the-fly. This is OK
 			// because it sets "enabled: false" and thus none of the
@@ -258,7 +263,7 @@ func (sc *SchemaChanger) maybeBackfillCreateTableAs(
 		)
 		defer recv.Release()
 
-		rec, err := sc.distSQLPlanner.checkSupportForNode(localPlanner.curPlan.plan)
+		rec, err := sc.distSQLPlanner.checkSupportForNode(localPlanner.curPlan.main)
 		var planAndRunErr error
 		localPlanner.runWithOptions(resolveFlags{skipCache: true}, func() {
 			// Resolve subqueries before running the queries' physical plan.
@@ -282,7 +287,7 @@ func (sc *SchemaChanger) maybeBackfillCreateTableAs(
 			}}
 
 			PlanAndRunCTAS(ctx, sc.distSQLPlanner, localPlanner,
-				txn, isLocal, localPlanner.curPlan.plan, out, recv)
+				txn, isLocal, localPlanner.curPlan.main, out, recv)
 			if planAndRunErr = rw.Err(); planAndRunErr != nil {
 				return
 			}
@@ -348,8 +353,9 @@ func (sc *SchemaChanger) drainNames(ctx context.Context) error {
 		func(txn *kv.Txn) error {
 			b := txn.NewBatch()
 			for _, drain := range namesToReclaim {
-				err := sqlbase.RemoveObjectNamespaceEntry(ctx, txn, drain.ParentID, drain.ParentSchemaID,
-					drain.Name, false /* KVTrace */)
+				err := sqlbase.RemoveObjectNamespaceEntry(
+					ctx, txn, sc.execCfg.Codec, drain.ParentID, drain.ParentSchemaID, drain.Name, false, /* KVTrace */
+				)
 				if err != nil {
 					return err
 				}
@@ -369,29 +375,8 @@ func startGCJob(
 	details jobspb.SchemaChangeGCDetails,
 ) error {
 	var sj *jobs.StartableJob
-	descriptorIDs := make([]sqlbase.ID, 0)
-	if len(details.Indexes) > 0 {
-		if len(descriptorIDs) == 0 {
-			descriptorIDs = []sqlbase.ID{details.ParentID}
-		}
-	} else if len(details.Tables) > 0 {
-		for _, table := range details.Tables {
-			descriptorIDs = append(descriptorIDs, table.ID)
-		}
-	} else {
-		// Nothing to GC.
-		return nil
-	}
-
+	jobRecord := CreateGCJobRecord(schemaChangeDescription, username, details)
 	if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		jobRecord := jobs.Record{
-			Description:   fmt.Sprintf("GC for %s", schemaChangeDescription),
-			Username:      username,
-			DescriptorIDs: descriptorIDs,
-			Details:       details,
-			Progress:      jobspb.SchemaChangeGCProgress{},
-			NonCancelable: true,
-		}
 		var err error
 		if sj, err = jobRegistry.CreateStartableJobWithTxn(ctx, jobRecord, txn, nil /* resultCh */); err != nil {
 			return err
@@ -404,16 +389,6 @@ func startGCJob(
 		return err
 	}
 	return nil
-}
-
-func (sc *SchemaChanger) startGCJob(
-	ctx context.Context, details jobspb.SchemaChangeGCDetails, isRollback bool,
-) error {
-	description := sc.job.Payload().Description
-	if isRollback {
-		description = "ROLLBACK of " + description
-	}
-	return startGCJob(ctx, sc.db, sc.jobRegistry, sc.job.Payload().Username, description, details)
 }
 
 // Execute the entire schema change in steps.
@@ -467,7 +442,9 @@ func (sc *SchemaChanger) exec(ctx context.Context) error {
 				},
 			},
 		}
-		if err := sc.startGCJob(ctx, gcDetails, false /* isRollback */); err != nil {
+		if err := startGCJob(
+			ctx, sc.db, sc.jobRegistry, sc.job.Payload().Username, sc.job.Payload().Description, gcDetails,
+		); err != nil {
 			return err
 		}
 	}
@@ -550,9 +527,11 @@ func (sc *SchemaChanger) handlePermanentSchemaChangeError(
 	ctx context.Context, err error, evalCtx *extendedEvalContext,
 ) error {
 	if rollbackErr := sc.rollbackSchemaChange(ctx, err); rollbackErr != nil {
-		// Note: the "err" object is captured by rollbackSchemaChange(), so
-		// it does not simply disappear.
-		return errors.Wrap(rollbackErr, "while rolling back schema change")
+		// From now on, the returned error will be a secondary error of the returned
+		// error, so we'll record the original error now.
+		secondary := errors.Wrap(err, "original error when rolling back mutations")
+		sqltelemetry.RecordError(ctx, secondary, &sc.settings.SV)
+		return errors.WithSecondaryError(rollbackErr, secondary)
 	}
 
 	// TODO (lucy): This is almost the same as in exec(), maybe refactor.
@@ -595,7 +574,7 @@ func (sc *SchemaChanger) handlePermanentSchemaChangeError(
 // initialize the job running status.
 func (sc *SchemaChanger) initJobRunningStatus(ctx context.Context) error {
 	return sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		desc, err := sqlbase.GetTableDescFromID(ctx, txn, sc.tableID)
+		desc, err := sqlbase.GetTableDescFromID(ctx, txn, sc.execCfg.Codec, sc.tableID)
 		if err != nil {
 			return err
 		}
@@ -637,44 +616,18 @@ func (sc *SchemaChanger) initJobRunningStatus(ctx context.Context) error {
 func (sc *SchemaChanger) rollbackSchemaChange(ctx context.Context, err error) error {
 	log.Warningf(ctx, "reversing schema change %d due to irrecoverable error: %s", *sc.job.ID(), err)
 	if errReverse := sc.maybeReverseMutations(ctx, err); errReverse != nil {
-		// Although the backfill did hit an integrity constraint violation
-		// and made a decision to reverse the mutations,
-		// maybeReverseMutations() failed. If exec() is called again the entire
-		// schema change will be retried.
-
-		// Note: we capture the original error as "secondary" to ensure it
-		// does not fully disappear.
-		// However, since it is not in the main causal chain any more,
-		// it will become invisible to further telemetry. So before
-		// we relegate it to a secondary, go through the recording motions.
-		// This ensures that any important error gets reported to Sentry, etc.
-		secondary := errors.Wrap(err, "original error when reversing mutations")
-		sqltelemetry.RecordError(ctx, secondary, &sc.settings.SV)
-		return errors.WithSecondaryError(errReverse, secondary)
+		return errReverse
 	}
 
 	if fn := sc.testingKnobs.RunAfterMutationReversal; fn != nil {
-		if err := fn(); err != nil {
+		if err := fn(*sc.job.ID()); err != nil {
 			return err
 		}
 	}
 
 	// After this point the schema change has been reversed and any retry
 	// of the schema change will act upon the reversed schema change.
-	if errPurge := sc.runStateMachineAndBackfill(ctx); errPurge != nil {
-		// Don't return this error because we do want the caller to know
-		// that an integrity constraint was violated with the original
-		// schema change. The reversed schema change will be
-		// retried via the async schema change manager.
-
-		// Since the errors are going to disappear, do the recording
-		// motions on them. This ensures that any assertion failure or
-		// other important error underneath gets recorded properly.
-		log.Warningf(ctx, "error purging mutation: %+v\nwhile handling error: %+v", errPurge, err)
-		sqltelemetry.RecordError(ctx, err, &sc.settings.SV)
-		sqltelemetry.RecordError(ctx, errPurge, &sc.settings.SV)
-	}
-	return nil
+	return sc.runStateMachineAndBackfill(ctx)
 }
 
 // RunStateMachineBeforeBackfill moves the state machine forward
@@ -774,7 +727,7 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 		fksByBackrefTable = make(map[sqlbase.ID][]*sqlbase.ConstraintToUpdate)
 		interleaveParents = make(map[sqlbase.ID]struct{})
 
-		desc, err := sqlbase.GetTableDescFromID(ctx, txn, sc.tableID)
+		desc, err := sqlbase.GetTableDescFromID(ctx, txn, sc.execCfg.Codec, sc.tableID)
 		if err != nil {
 			return err
 		}
@@ -826,9 +779,13 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 		}
 	}
 
+	// Jobs (for GC, etc.) that need to be started immediately after the table
+	// descriptor updates are published.
+	var childJobs []*jobs.StartableJob
 	update := func(txn *kv.Txn, descs map[sqlbase.ID]*sqlbase.MutableTableDescriptor) error {
 		// Reset vars here because update function can be called multiple times in a retry.
 		isRollback = false
+		childJobs = nil
 
 		i := 0
 		scDesc, ok := descs[sc.tableID]
@@ -864,9 +821,18 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 						},
 						ParentID: sc.tableID,
 					}
-					if err := sc.startGCJob(ctx, indexGCDetails, isRollback); err != nil {
+
+					description := sc.job.Payload().Description
+					if isRollback {
+						description = "ROLLBACK of " + description
+					}
+					gcJobRecord := CreateGCJobRecord(description, sc.job.Payload().Username, indexGCDetails)
+					indexGCJob, err := sc.jobRegistry.CreateStartableJobWithTxn(ctx, gcJobRecord, txn, nil /* resultsCh */)
+					if err != nil {
 						return err
 					}
+					log.VEventf(ctx, 2, "created index GC job %d", *indexGCJob.ID())
+					childJobs = append(childJobs, indexGCJob)
 				}
 			}
 			if constraint := mutation.GetConstraint(); constraint != nil &&
@@ -923,7 +889,7 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 				// If we performed MakeMutationComplete on a PrimaryKeySwap mutation, then we need to start
 				// a job for the index deletion mutations that the primary key swap mutation added, if any.
 				mutationID := scDesc.ClusterVersion.NextMutationID
-				span := scDesc.PrimaryIndexSpan()
+				span := scDesc.PrimaryIndexSpan(sc.execCfg.Codec)
 				var spanList []jobspb.ResumeSpanList
 				for j := len(scDesc.ClusterVersion.Mutations); j < len(scDesc.Mutations); j++ {
 					spanList = append(spanList,
@@ -948,10 +914,12 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 						Progress:      jobspb.SchemaChangeProgress{},
 						NonCancelable: true,
 					}
-					job, err := sc.jobRegistry.CreateJobWithTxn(ctx, jobRecord, txn)
+					job, err := sc.jobRegistry.CreateStartableJobWithTxn(ctx, jobRecord, txn, nil /* resultsCh */)
 					if err != nil {
 						return err
 					}
+					log.VEventf(ctx, 2, "created job %d to drop previous indexes", *job.ID())
+					childJobs = append(childJobs, job)
 					scDesc.MutationJobs = append(scDesc.MutationJobs, sqlbase.TableDescriptor_MutationJob{
 						MutationID: mutationID,
 						JobID:      *job.ID(),
@@ -993,14 +961,25 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 			txn,
 			schemaChangeEventType,
 			int32(sc.tableID),
-			int32(sc.nodeID),
+			int32(sc.sqlInstanceID),
 			struct {
 				MutationID uint32
 			}{uint32(sc.mutationID)},
 		)
 	})
 	if err != nil {
+		for _, job := range childJobs {
+			if rollbackErr := job.CleanupOnRollback(ctx); rollbackErr != nil {
+				log.Warningf(ctx, "failed to clean up job: %v", rollbackErr)
+			}
+		}
 		return nil, err
+	}
+	for _, job := range childJobs {
+		if _, err := job.Start(ctx); err != nil {
+			log.Warningf(ctx, "starting job %d failed with error: %v", *job.ID(), err)
+		}
+		log.VEventf(ctx, 2, "started job %d", *job.ID())
 	}
 	return descs[sc.tableID], nil
 }
@@ -1015,7 +994,7 @@ func (sc *SchemaChanger) notFirstInLine(
 	err := sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		notFirst = false
 		var err error
-		desc, err = sqlbase.GetTableDescFromID(ctx, txn, sc.tableID)
+		desc, err = sqlbase.GetTableDescFromID(ctx, txn, sc.execCfg.Codec, sc.tableID)
 		if err != nil {
 			return err
 		}
@@ -1063,13 +1042,19 @@ func (sc *SchemaChanger) refreshStats() {
 // applying a schema change. If a column being added is reversed and dropped,
 // all new indexes referencing the column will also be dropped.
 func (sc *SchemaChanger) maybeReverseMutations(ctx context.Context, causingError error) error {
+	if fn := sc.testingKnobs.RunBeforeMutationReversal; fn != nil {
+		if err := fn(*sc.job.ID()); err != nil {
+			return err
+		}
+	}
+
 	// Get the other tables whose foreign key backreferences need to be removed.
 	var fksByBackrefTable map[sqlbase.ID][]*sqlbase.ConstraintToUpdate
 	alreadyReversed := false
 	err := sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		fksByBackrefTable = make(map[sqlbase.ID][]*sqlbase.ConstraintToUpdate)
 		var err error
-		desc, err := sqlbase.GetTableDescFromID(ctx, txn, sc.tableID)
+		desc, err := sqlbase.GetTableDescFromID(ctx, txn, sc.execCfg.Codec, sc.tableID)
 		if err != nil {
 			return err
 		}
@@ -1180,7 +1165,7 @@ func (sc *SchemaChanger) maybeReverseMutations(ctx context.Context, causingError
 		// Read the table descriptor from the store. The Version of the
 		// descriptor has already been incremented in the transaction and
 		// this descriptor can be modified without incrementing the version.
-		tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, sc.tableID)
+		tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, sc.execCfg.Codec, sc.tableID)
 		if err != nil {
 			return err
 		}
@@ -1210,7 +1195,7 @@ func (sc *SchemaChanger) maybeReverseMutations(ctx context.Context, causingError
 			txn,
 			EventLogReverseSchemaChange,
 			int32(sc.tableID),
-			int32(sc.nodeID),
+			int32(sc.sqlInstanceID),
 			struct {
 				Error      string
 				MutationID uint32
@@ -1238,7 +1223,7 @@ func (sc *SchemaChanger) updateJobForRollback(
 	ctx context.Context, txn *kv.Txn, tableDesc *sqlbase.TableDescriptor,
 ) error {
 	// Initialize refresh spans to scan the entire table.
-	span := tableDesc.PrimaryIndexSpan()
+	span := tableDesc.PrimaryIndexSpan(sc.execCfg.Codec)
 	var spanList []jobspb.ResumeSpanList
 	for _, m := range tableDesc.Mutations {
 		if m.MutationID == sc.mutationID {
@@ -1400,11 +1385,36 @@ func (sc *SchemaChanger) reverseMutation(
 	return mutation, columns
 }
 
+// CreateGCJobRecord creates the job record for a GC job, setting some
+// properties which are common for all GC jobs.
+func CreateGCJobRecord(
+	originalDescription string, username string, details jobspb.SchemaChangeGCDetails,
+) jobs.Record {
+	descriptorIDs := make([]sqlbase.ID, 0)
+	if len(details.Indexes) > 0 {
+		if len(descriptorIDs) == 0 {
+			descriptorIDs = []sqlbase.ID{details.ParentID}
+		}
+	} else {
+		for _, table := range details.Tables {
+			descriptorIDs = append(descriptorIDs, table.ID)
+		}
+	}
+	return jobs.Record{
+		Description:   fmt.Sprintf("GC for %s", originalDescription),
+		Username:      username,
+		DescriptorIDs: descriptorIDs,
+		Details:       details,
+		Progress:      jobspb.SchemaChangeGCProgress{},
+		NonCancelable: true,
+	}
+}
+
 // GCJobTestingKnobs is for testing the Schema Changer GC job.
 // Note that this is defined here for testing purposes to avoid cyclic
 // dependencies.
 type GCJobTestingKnobs struct {
-	RunBeforeResume func()
+	RunBeforeResume func(jobID int64) error
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
@@ -1423,6 +1433,9 @@ type SchemaChangerTestingKnobs struct {
 	// RunBeforeBackfill is called just before starting the backfill.
 	RunBeforeBackfill func() error
 
+	// RunAfterBackfill is called after completing a backfill.
+	RunAfterBackfill func(jobID int64) error
+
 	// RunBeforeIndexBackfill is called just before starting the index backfill, after
 	// fixing the index backfill scan timestamp.
 	RunBeforeIndexBackfill func()
@@ -1438,12 +1451,21 @@ type SchemaChangerTestingKnobs struct {
 	// after setting the job status to validating.
 	RunBeforeConstraintValidation func() error
 
+	// RunBeforeMutationReversal runs at the beginning of maybeReverseMutations.
+	RunBeforeMutationReversal func(jobID int64) error
+
 	// RunAfterMutationReversal runs in OnFailOrCancel after the mutations have
 	// been reversed.
-	RunAfterMutationReversal func() error
+	RunAfterMutationReversal func(jobID int64) error
 
-	// RunAtStartOfOnFailOrCancel
-	RunBeforeOnFailOrCancel func()
+	// RunAtStartOfOnFailOrCancel runs at the start of the OnFailOrCancel hook.
+	RunBeforeOnFailOrCancel func(jobID int64) error
+
+	// RunAfterOnFailOrCancel runs after the OnFailOrCancel hook.
+	RunAfterOnFailOrCancel func(jobID int64) error
+
+	// RunBeforeResume runs at the start of the Resume hook.
+	RunBeforeResume func(jobID int64) error
 
 	// OldNamesDrainedNotification is called during a schema change,
 	// after all leases on the version of the descriptor with the old
@@ -1475,7 +1497,10 @@ func (*SchemaChangerTestingKnobs) ModuleTestingKnobs() {}
 // used in the surrounding SQL session, so session tracing is unable
 // to capture schema change activity.
 func createSchemaChangeEvalCtx(
-	ctx context.Context, ts hlc.Timestamp, ieFactory sqlutil.SessionBoundInternalExecutorFactory,
+	ctx context.Context,
+	execCfg *ExecutorConfig,
+	ts hlc.Timestamp,
+	ieFactory sqlutil.SessionBoundInternalExecutorFactory,
 ) extendedEvalContext {
 	dummyLocation := time.UTC
 
@@ -1502,6 +1527,7 @@ func createSchemaChangeEvalCtx(
 		// because it sets "enabled: false" and thus none of the
 		// other fields are used.
 		Tracing: &SessionTracing{},
+		ExecCfg: execCfg,
 		EvalContext: tree.EvalContext{
 			SessionData:      sd,
 			InternalExecutor: ieFactory(ctx, sd),
@@ -1512,6 +1538,13 @@ func createSchemaChangeEvalCtx(
 			Planner:            &sqlbase.DummyEvalPlanner{},
 			SessionAccessor:    &sqlbase.DummySessionAccessor{},
 			PrivilegedAccessor: &sqlbase.DummyPrivilegedAccessor{},
+			Settings:           execCfg.Settings,
+			TestingKnobs:       execCfg.EvalContextTestingKnobs,
+			ClusterID:          execCfg.ClusterID(),
+			ClusterName:        execCfg.RPCContext.ClusterName(),
+			NodeID:             execCfg.NodeID,
+			Codec:              execCfg.Codec,
+			Locality:           execCfg.Locality,
 		},
 	}
 	// The backfill is going to use the current timestamp for the various
@@ -1541,13 +1574,18 @@ func (r schemaChangeResumer) Resume(
 		p.ExecCfg().SchemaChangerTestingKnobs.SchemaChangeJobNoOp() {
 		return nil
 	}
+	if fn := p.ExecCfg().SchemaChangerTestingKnobs.RunBeforeResume; fn != nil {
+		if err := fn(*r.job.ID()); err != nil {
+			return err
+		}
+	}
 
 	execSchemaChange := func(tableID sqlbase.ID, mutationID sqlbase.MutationID, droppedDatabaseID sqlbase.ID) error {
 		sc := SchemaChanger{
 			tableID:              tableID,
 			mutationID:           mutationID,
 			droppedDatabaseID:    droppedDatabaseID,
-			nodeID:               p.ExecCfg().NodeID.Get(),
+			sqlInstanceID:        p.ExecCfg().NodeID.SQLInstanceID(),
 			db:                   p.ExecCfg().DB,
 			leaseMgr:             p.ExecCfg().LeaseManager,
 			testingKnobs:         p.ExecCfg().SchemaChangerTestingKnobs,
@@ -1594,9 +1632,19 @@ func (r schemaChangeResumer) Resume(
 		return nil
 	}
 
+	// For an empty database, the zone config for it was already GC'ed and there's
+	// nothing left to do.
+	if details.DroppedDatabaseID != sqlbase.InvalidID && len(details.DroppedTables) == 0 {
+		return nil
+	}
+
 	// If a database is being dropped, handle this separately by draining names
 	// for all the tables.
-	if details.DroppedDatabaseID != sqlbase.InvalidID {
+	//
+	// This also covers other cases where we have a leftover 19.2 job that drops
+	// multiple tables in a single job (e.g., TRUNCATE on multiple tables), so
+	// it's possible for DroppedDatabaseID to be unset.
+	if details.DroppedDatabaseID != sqlbase.InvalidID || len(details.DroppedTables) > 1 {
 		for i := range details.DroppedTables {
 			droppedTable := &details.DroppedTables[i]
 			if err := execSchemaChange(droppedTable.ID, sqlbase.InvalidMutationID, details.DroppedDatabaseID); err != nil {
@@ -1608,15 +1656,24 @@ func (r schemaChangeResumer) Resume(
 		for i, table := range details.DroppedTables {
 			tablesToGC[i] = jobspb.SchemaChangeGCDetails_DroppedID{ID: table.ID, DropTime: dropTime}
 		}
-		databaseGCDetails := jobspb.SchemaChangeGCDetails{
+		multiTableGCDetails := jobspb.SchemaChangeGCDetails{
 			Tables:   tablesToGC,
 			ParentID: details.DroppedDatabaseID,
 		}
-		return startGCJob(ctx, p.ExecCfg().DB, p.ExecCfg().JobRegistry, r.job.Payload().Username, r.job.Payload().Description, databaseGCDetails)
+
+		return startGCJob(
+			ctx,
+			p.ExecCfg().DB,
+			p.ExecCfg().JobRegistry,
+			r.job.Payload().Username,
+			r.job.Payload().Description,
+			multiTableGCDetails,
+		)
 	}
 	if details.TableID == sqlbase.InvalidID {
-		return errors.AssertionFailedf("job has no database ID or table ID")
+		return errors.AssertionFailedf("schema change has no specified database or table(s)")
 	}
+
 	return execSchemaChange(details.TableID, details.MutationID, details.DroppedDatabaseID)
 }
 
@@ -1635,7 +1692,7 @@ func (r schemaChangeResumer) OnFailOrCancel(ctx context.Context, phs interface{}
 	sc := SchemaChanger{
 		tableID:              details.TableID,
 		mutationID:           details.MutationID,
-		nodeID:               p.ExecCfg().NodeID.Get(),
+		sqlInstanceID:        p.ExecCfg().NodeID.SQLInstanceID(),
 		db:                   p.ExecCfg().DB,
 		leaseMgr:             p.ExecCfg().LeaseManager,
 		testingKnobs:         p.ExecCfg().SchemaChangerTestingKnobs,
@@ -1653,7 +1710,9 @@ func (r schemaChangeResumer) OnFailOrCancel(ctx context.Context, phs interface{}
 	}
 
 	if fn := sc.testingKnobs.RunBeforeOnFailOrCancel; fn != nil {
-		fn()
+		if err := fn(*r.job.ID()); err != nil {
+			return err
+		}
 	}
 
 	if r.job.Payload().FinalResumeError == nil {
@@ -1678,12 +1737,42 @@ func (r schemaChangeResumer) OnFailOrCancel(ctx context.Context, phs interface{}
 			// We check for this case so that we can just return the error without
 			// wrapping it in a retry error.
 			return rollbackErr
-		default:
-			// Always retry when we get any other error. Otherwise we risk leaving the
-			// in-progress schema change state on the table descriptor indefinitely.
-			// Note that, in theory, this could mean retrying the job forever even for
-			// an error we can't recover from, if there's a bug.
+		case !isPermanentSchemaChangeError(rollbackErr):
+			// Check if the error is on a whitelist of errors we should retry on, and
+			// have the job registry retry.
 			return jobs.NewRetryJobError(rollbackErr.Error())
+		default:
+			// All other errors lead to a failed job.
+			//
+			// TODO (lucy): We have a problem where some schema change rollbacks will
+			// never succeed because the backfiller can't handle rolling back schema
+			// changes that involve dropping a column; see #46541. (This is probably
+			// not the only bug that could cause rollbacks to fail.) For historical
+			// context: This was the case in 19.2 and probably earlier versions as
+			// well, and in those earlier versions, the old async schema changer would
+			// keep retrying the rollback and failing in the background because the
+			// mutation would still be left on the table descriptor. In the present
+			// schema change job, we return an error immediately and put the job in a
+			// terminal state instead of retrying indefinitely, basically to make the
+			// behavior similar to 19.2: If the rollback fails, we end up returning
+			// immediately (instead of retrying and blocking indefinitely), and the
+			// table descriptor is left in a bad state with some mutations that we
+			// can't clean up.
+			//
+			// Ultimately, this is untenable, and we should figure out some better way
+			// of dealing with failed rollbacks. Part of the solution is just making
+			// rollbacks (especially of dropped columns) more robust, but part of it
+			// will likely involve some sort of medium-term solution for cleaning up
+			// mutations that we can't make any progress on (see #47456). In the long
+			// term we'll hopefully be rethinking what it even means to "roll back" a
+			// (transactional) schema change.
+			return rollbackErr
+		}
+	}
+
+	if fn := sc.testingKnobs.RunAfterOnFailOrCancel; fn != nil {
+		if err := fn(*r.job.ID()); err != nil {
+			return err
 		}
 	}
 	return nil

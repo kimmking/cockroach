@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
@@ -70,7 +69,12 @@ func declareKeysEndTxn(
 		header.Txn.AssertInitialized(context.TODO())
 		minTxnTS = header.Txn.MinTimestamp
 		abortSpanAccess := spanset.SpanReadOnly
-		if !et.Commit && et.Poison {
+		if !et.Commit {
+			// Rollback EndTxn requests may write to the abort span, either if
+			// their Poison flag is set, in which case they will add an abort
+			// span entry, or if their Poison flag is not set and an abort span
+			// entry already exists on this Range, in which case they will clear
+			// that entry.
 			abortSpanAccess = spanset.SpanReadWrite
 		}
 		latchSpans.AddNonMVCC(abortSpanAccess, roachpb.Span{
@@ -223,6 +227,12 @@ func EndTxn(
 		// not suffered regression.
 		switch reply.Txn.Status {
 		case roachpb.COMMITTED:
+			// This can happen if the coordinator had left the transaction in the
+			// implicitly committed state, and is now coming to clean it up. Someone
+			// else must have performed the STAGING->COMMITTED transition in the
+			// meantime. The TransactionStatusError is going to be handled by the
+			// txnCommitter interceptor.
+			log.VEventf(ctx, 2, "transaction found to be already committed")
 			return result.Result{}, roachpb.NewTransactionCommittedStatusError()
 
 		case roachpb.ABORTED:
@@ -351,6 +361,20 @@ func EndTxn(
 		}
 		if err := pd.MergeAndDestroy(triggerResult); err != nil {
 			return result.Result{}, err
+		}
+	} else if reply.Txn.Status == roachpb.ABORTED {
+		// If this is the system config span and we're aborted, add a trigger to
+		// potentially gossip now that we've removed an intent. This is important
+		// to deal with cases where previously committed values were not gossipped
+		// due to an outstanding intent.
+		if cArgs.EvalCtx.ContainsKey(keys.SystemConfigSpan.Key) {
+			if err := pd.MergeAndDestroy(result.Result{
+				Local: result.LocalResult{
+					MaybeGossipSystemConfigIfHaveFailure: true,
+				},
+			}); err != nil {
+				return result.Result{}, err
+			}
 		}
 	}
 
@@ -482,7 +506,7 @@ func resolveLocalLocks(
 				externalLocks = append(externalLocks, span)
 				return nil
 			}
-			update := roachpb.MakeLockUpdateWithDur(txn, span, lock.Replicated)
+			update := roachpb.MakeLockUpdate(txn, span)
 			if len(span.EndKey) == 0 {
 				// For single-key lock updates, do a KeyAddress-aware check of
 				// whether it's contained in our Range.

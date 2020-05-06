@@ -1334,7 +1334,7 @@ func TestRefreshPendingCommands(t *testing.T) {
 			for i := 0; i < 2; i++ {
 				wg.Add(1)
 				go func(i int) {
-					mtc.stores[i].SetDraining(true)
+					mtc.stores[i].SetDraining(true, nil /* reporter */)
 					wg.Done()
 				}(i)
 			}
@@ -1803,7 +1803,7 @@ func TestReplicateRestartAfterTruncation(t *testing.T) {
 func runReplicateRestartAfterTruncation(t *testing.T, removeBeforeTruncateAndReAdd bool) {
 	sc := kvserver.TestStoreConfig(nil)
 	// Don't timeout raft leaders or range leases (see the relation between
-	// RaftElectionTimeoutTicks and rangeLeaseActiveDuration). This test expects
+	// RaftElectionTimeoutTicks and RangeLeaseActiveDuration). This test expects
 	// mtc.stores[0] to hold the range lease for range 1.
 	sc.RaftElectionTimeoutTicks = 1000000
 	sc.Clock = nil // manual clock
@@ -2198,16 +2198,11 @@ func TestQuotaPool(t *testing.T) {
 // as active for the purpose of proposal throttling.
 func TestWedgedReplicaDetection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	if testing.Short() {
-		// Takes 10s to run - #33654.
-		t.Skip("short flag")
-	}
 
 	const numReplicas = 3
 	const rangeID = 1
 
 	sc := kvserver.TestStoreConfig(nil)
-	sc.Clock = nil // manual clock
 	// Suppress timeout-based elections to avoid leadership changes in ways
 	// this test doesn't expect.
 	sc.RaftElectionTimeoutTicks = 100000
@@ -2252,9 +2247,11 @@ func TestWedgedReplicaDetection(t *testing.T) {
 	wg.Wait()
 	defer followerRepl.RaftUnlock()
 
-	// Increment leader's clock close to MaxQuotaReplicaLivenessDuration, but
-	// not past it.
-	mtc.manualClock.Increment(kvserver.MaxQuotaReplicaLivenessDuration.Nanoseconds() - 1)
+	// TODO(andrei): The test becomes flaky with a lower threshold because the
+	// follower is considered inactive just below. Figure out how to switch the
+	// test to a manual clock. The activity tracking for followers uses the
+	// physical clock.
+	inactivityThreshold := time.Second
 
 	// Send a request to the leader replica. followerRepl is locked so it will
 	// not respond.
@@ -2272,7 +2269,7 @@ func TestWedgedReplicaDetection(t *testing.T) {
 
 	// The follower should still be active.
 	followerID := followerRepl.ReplicaID()
-	if !leaderRepl.IsFollowerActive(ctx, followerID) {
+	if !leaderRepl.IsFollowerActiveSince(ctx, followerID, inactivityThreshold) {
 		t.Fatalf("expected follower to still be considered active")
 	}
 
@@ -2281,9 +2278,6 @@ func TestWedgedReplicaDetection(t *testing.T) {
 	// would bump the last active timestamp on the leader. Because of this,
 	// we check whether the follower is eventually considered inactive.
 	testutils.SucceedsSoon(t, func() error {
-		// Increment leader's clock past MaxQuotaReplicaLivenessDuration
-		mtc.manualClock.Increment(kvserver.MaxQuotaReplicaLivenessDuration.Nanoseconds() + 1)
-
 		// Send another request to the leader replica. followerRepl is locked
 		// so it will not respond.
 		if _, pErr := leaderRepl.Send(ctx, ba); pErr != nil {
@@ -2291,7 +2285,7 @@ func TestWedgedReplicaDetection(t *testing.T) {
 		}
 
 		// The follower should no longer be considered active.
-		if leaderRepl.IsFollowerActive(ctx, followerID) {
+		if leaderRepl.IsFollowerActiveSince(ctx, followerID, inactivityThreshold) {
 			return errors.New("expected follower to be considered inactive")
 		}
 		return nil
@@ -3914,6 +3908,18 @@ func TestInitRaftGroupOnRequest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	storeCfg := kvserver.TestStoreConfig(nil /* clock */)
 	storeCfg.TestingKnobs.DisableMergeQueue = true
+	// Don't timeout range leases (see the relation between
+	// RaftElectionTimeoutTicks and RangeLeaseActiveDuration). This test expects
+	// the replica that holds the lease before the cluster is restarted to
+	// continue holding it after the restart, regardless of how long the restart
+	// takes.
+	storeCfg.RaftElectionTimeoutTicks = 1000000
+	// Disable async intent resolution. This can lead to flakiness in the test
+	// because it allows for the intents written by the split transaction to be
+	// resolved at any time, including after the nodes are restarted. The intent
+	// resolution on the RHS's local range descriptor can both wake up the RHS
+	// range's Raft group and result in the wrong replica acquiring the lease.
+	storeCfg.TestingKnobs.IntentResolverKnobs.DisableAsyncIntentResolution = true
 	mtc := &multiTestContext{
 		storeConfig: &storeCfg,
 		// TODO(andrei): This test was written before multiTestContexts started with
@@ -3945,6 +3951,8 @@ func TestInitRaftGroupOnRequest(t *testing.T) {
 	mtc.restart()
 
 	// Get replica from the store which isn't the leaseholder.
+	// NOTE: StoreID is 1-indexed and storeIdx is 0-indexed, so despite what
+	// this might look like, this is grabbing the replica without the lease.
 	storeIdx := int(lease.Replica.StoreID) % len(mtc.stores)
 	if repl = mtc.stores[storeIdx].LookupReplica(roachpb.RKey(splitKey)); repl == nil {
 		t.Fatal("replica should not be nil for RHS range")
@@ -4478,7 +4486,7 @@ func TestDefaultConnectionDisruptionDoesNotInterfereWithSystemTraffic(t *testing
 	}
 	mtc.replicateRange(1, 1, 2)
 	// Make a key that's in the user data space.
-	keyA := append(keys.MakeTablePrefix(100), 'a')
+	keyA := append(keys.SystemSQLCodec.TablePrefix(100), 'a')
 	replica1 := mtc.stores[0].LookupReplica(roachpb.RKey(keyA))
 	mtc.replicateRange(replica1.RangeID, 1, 2)
 	// Create a test function so that we can run the test both immediately after
@@ -4833,7 +4841,7 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 
 		// Split off a non-system range so we don't have to account for node liveness
 		// traffic.
-		scratchTableKey := keys.MakeTablePrefix(math.MaxUint32)
+		scratchTableKey := keys.SystemSQLCodec.TablePrefix(math.MaxUint32)
 		// Put some data in the range so we'll have something to test for.
 		keyA = append(append(roachpb.Key{}, scratchTableKey...), 'a')
 		keyB = append(append(roachpb.Key{}, scratchTableKey...), 'b')

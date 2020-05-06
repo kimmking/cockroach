@@ -125,7 +125,7 @@ func (c *CustomFuncs) foldStringToRegclassCast(
 
 	c.mem.Metadata().AddDependency(opt.DepByName(&resName), ds, privilege.SELECT)
 
-	regclassOid := tree.NewDOidWithName(tree.DInt(ds.PostgresDescriptorID()), types.RegClass, string(tn.TableName))
+	regclassOid := tree.NewDOidWithName(tree.DInt(ds.PostgresDescriptorID()), types.RegClass, string(tn.ObjectName))
 	return c.f.ConstructConstVal(regclassOid, typ), nil
 
 }
@@ -145,10 +145,7 @@ func (c *CustomFuncs) FoldCast(input opt.ScalarExpr, typ *types.T) opt.ScalarExp
 	}
 
 	datum := memo.ExtractConstDatum(input)
-	texpr, err := tree.NewTypedCastExpr(datum, typ)
-	if err != nil {
-		return nil
-	}
+	texpr := tree.NewTypedCastExpr(datum, typ)
 
 	result, err := texpr.Eval(c.f.evalCtx)
 	if err != nil {
@@ -493,4 +490,37 @@ var FoldFunctionWhitelist = map[string]struct{}{
 	"json_array_length":            {},
 	"jsonb_array_length":           {},
 	"crdb_internal.locality_value": {},
+	"st_geomfromtext":              {},
+	"st_geometryfromtext":          {},
+	"st_geomfromewkt":              {},
+	"st_geomfromwkb":               {},
+	"st_geomfromewkb":              {},
+	"st_geomfromgeojson":           {},
+	"st_geogfromtext":              {},
+	"st_geographyfromtext":         {},
+	"st_geogfromewkt":              {},
+	"st_geogfromwkb":               {},
+	"st_geogfromewkb":              {},
+	"st_geogfromgeojson":           {},
+	"st_astext":                    {},
+	"st_asewkt":                    {},
+	"st_asbinary":                  {},
+	"st_asewkb":                    {},
+	"st_ashexwkb":                  {},
+	"st_ashexewkb":                 {},
+	"st_askml":                     {},
+	"st_asgeojson":                 {},
+	"st_area":                      {},
+	"st_length":                    {},
+	"st_perimeter":                 {},
+	"st_distance":                  {},
+	"st_covers":                    {},
+	"st_coveredby":                 {},
+	"st_contains":                  {},
+	"st_crosses":                   {},
+	"st_equals":                    {},
+	"st_intersects":                {},
+	"st_overlaps":                  {},
+	"st_touches":                   {},
+	"st_within":                    {},
 }

@@ -163,6 +163,8 @@
 <tr><td><a href="float.html">float</a> <code><</code> <a href="float.html">float</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="float.html">float</a> <code><</code> <a href="int.html">int</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="float.html">float[]</a> <code><</code> <a href="float.html">float[]</a></td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>geography <code><</code> geography</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>geometry <code><</code> geometry</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="inet.html">inet</a> <code><</code> <a href="inet.html">inet</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="inet.html">inet[]</a> <code><</code> <a href="inet.html">inet[]</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="int.html">int</a> <code><</code> <a href="decimal.html">decimal</a></td><td><a href="bool.html">bool</a></td></tr>
@@ -220,6 +222,8 @@
 <tr><td><a href="float.html">float</a> <code><=</code> <a href="float.html">float</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="float.html">float</a> <code><=</code> <a href="int.html">int</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="float.html">float[]</a> <code><=</code> <a href="float.html">float[]</a></td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>geography <code><=</code> geography</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>geometry <code><=</code> geometry</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="inet.html">inet</a> <code><=</code> <a href="inet.html">inet</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="inet.html">inet[]</a> <code><=</code> <a href="inet.html">inet[]</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="int.html">int</a> <code><=</code> <a href="decimal.html">decimal</a></td><td><a href="bool.html">bool</a></td></tr>
@@ -276,6 +280,8 @@
 <tr><td><a href="float.html">float</a> <code>=</code> <a href="float.html">float</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="float.html">float</a> <code>=</code> <a href="int.html">int</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="float.html">float[]</a> <code>=</code> <a href="float.html">float[]</a></td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>geography <code>=</code> geography</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>geometry <code>=</code> geometry</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="inet.html">inet</a> <code>=</code> <a href="inet.html">inet</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="inet.html">inet[]</a> <code>=</code> <a href="inet.html">inet[]</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="int.html">int</a> <code>=</code> <a href="decimal.html">decimal</a></td><td><a href="bool.html">bool</a></td></tr>
@@ -348,6 +354,8 @@
 <tr><td><a href="date.html">date</a> <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="decimal.html">decimal</a> <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="float.html">float</a> <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>geography <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>geometry <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="inet.html">inet</a> <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="int.html">int</a> <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="interval.html">interval</a> <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
@@ -382,6 +390,8 @@
 <tr><td><a href="float.html">float</a> <code>IS NOT DISTINCT FROM</code> <a href="float.html">float</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="float.html">float</a> <code>IS NOT DISTINCT FROM</code> <a href="int.html">int</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="float.html">float[]</a> <code>IS NOT DISTINCT FROM</code> <a href="float.html">float[]</a></td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>geography <code>IS NOT DISTINCT FROM</code> geography</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>geometry <code>IS NOT DISTINCT FROM</code> geometry</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="inet.html">inet</a> <code>IS NOT DISTINCT FROM</code> <a href="inet.html">inet</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="inet.html">inet[]</a> <code>IS NOT DISTINCT FROM</code> <a href="inet.html">inet[]</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="int.html">int</a> <code>IS NOT DISTINCT FROM</code> <a href="decimal.html">decimal</a></td><td><a href="bool.html">bool</a></td></tr>
@@ -440,6 +450,12 @@
 <tr><td>varbit <code>|</code> varbit</td><td>varbit</td></tr>
 </tbody></table>
 <table><thead>
+<tr><td><code>|/</code></td><td>Return</td></tr>
+</thead><tbody>
+<tr><td><code>|/</code><a href="decimal.html">decimal</a></td><td><a href="decimal.html">decimal</a></td></tr>
+<tr><td><code>|/</code><a href="float.html">float</a></td><td><a href="float.html">float</a></td></tr>
+</tbody></table>
+<table><thead>
 <tr><td><code>||</code></td><td>Return</td></tr>
 </thead><tbody>
 <tr><td><a href="bool.html">bool</a> <code>||</code> <a href="bool.html">bool[]</a></td><td><a href="bool.html">bool[]</a></td></tr>
@@ -458,6 +474,8 @@
 <tr><td><a href="float.html">float</a> <code>||</code> <a href="float.html">float[]</a></td><td><a href="float.html">float[]</a></td></tr>
 <tr><td><a href="float.html">float[]</a> <code>||</code> <a href="float.html">float</a></td><td><a href="float.html">float[]</a></td></tr>
 <tr><td><a href="float.html">float[]</a> <code>||</code> <a href="float.html">float[]</a></td><td><a href="float.html">float[]</a></td></tr>
+<tr><td>geography <code>||</code> geography</td><td>geography</td></tr>
+<tr><td>geometry <code>||</code> geometry</td><td>geometry</td></tr>
 <tr><td><a href="inet.html">inet</a> <code>||</code> <a href="inet.html">inet[]</a></td><td><a href="inet.html">inet[]</a></td></tr>
 <tr><td><a href="inet.html">inet[]</a> <code>||</code> <a href="inet.html">inet</a></td><td><a href="inet.html">inet[]</a></td></tr>
 <tr><td><a href="inet.html">inet[]</a> <code>||</code> <a href="inet.html">inet[]</a></td><td><a href="inet.html">inet[]</a></td></tr>
@@ -487,6 +505,12 @@
 <tr><td><a href="uuid.html">uuid[]</a> <code>||</code> <a href="uuid.html">uuid</a></td><td><a href="uuid.html">uuid[]</a></td></tr>
 <tr><td><a href="uuid.html">uuid[]</a> <code>||</code> <a href="uuid.html">uuid[]</a></td><td><a href="uuid.html">uuid[]</a></td></tr>
 <tr><td>varbit <code>||</code> varbit</td><td>varbit</td></tr>
+</tbody></table>
+<table><thead>
+<tr><td><code>||/</code></td><td>Return</td></tr>
+</thead><tbody>
+<tr><td><code>||/</code><a href="decimal.html">decimal</a></td><td><a href="decimal.html">decimal</a></td></tr>
+<tr><td><code>||/</code><a href="float.html">float</a></td><td><a href="float.html">float</a></td></tr>
 </tbody></table>
 <table><thead>
 <tr><td><code>~</code></td><td>Return</td></tr>

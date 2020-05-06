@@ -17,8 +17,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
@@ -71,7 +72,11 @@ func (n *explainVecNode) startExec(params runParams) error {
 	}
 
 	distSQLPlanner.FinalizePlan(planCtx, &plan)
-	flows := plan.GenerateFlowSpecs(params.extendedEvalCtx.NodeID)
+	nodeID, err := params.extendedEvalCtx.NodeID.OptionalNodeIDErr(distsql.MultiTenancyIssueNo)
+	if err != nil {
+		return err
+	}
+	flows := plan.GenerateFlowSpecs(nodeID)
 	flowCtx := makeFlowCtx(planCtx, plan, params)
 	flowCtx.Cfg.ClusterID = &distSQLPlanner.rpcCtx.ClusterID
 
@@ -108,7 +113,7 @@ func (n *explainVecNode) startExec(params runParams) error {
 		// It is possible that when iterating over execinfra.OpNodes we will hit
 		// a panic (an input that doesn't implement OpNode interface), so we're
 		// catching such errors.
-		if err := execerror.CatchVectorizedRuntimeError(func() {
+		if err := colexecerror.CatchVectorizedRuntimeError(func() {
 			for _, op := range opChains {
 				formatOpChain(op, node, verbose)
 			}

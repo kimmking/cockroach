@@ -251,7 +251,7 @@ func (b *Builder) buildScalar(
 	case *tree.CastExpr:
 		texpr := t.Expr.(tree.TypedExpr)
 		arg := b.buildScalar(texpr, inScope, nil, nil, colRefs)
-		out = b.factory.ConstructCast(arg, t.Type)
+		out = b.factory.ConstructCast(arg, t.ResolvedType())
 
 	case *tree.CoalesceExpr:
 		args := make(memo.ScalarListExpr, len(t.Exprs))
@@ -387,7 +387,7 @@ func (b *Builder) buildScalar(
 		actualType := t.Expr.(tree.TypedExpr).ResolvedType()
 
 		found := false
-		for _, typ := range t.Types {
+		for _, typ := range t.ResolvedTypes() {
 			if actualType.Equivalent(typ) {
 				found = true
 				break
@@ -705,6 +705,10 @@ func (b *Builder) constructUnary(
 		return b.factory.ConstructUnaryMinus(input)
 	case tree.UnaryComplement:
 		return b.factory.ConstructUnaryComplement(input)
+	case tree.UnarySqrt:
+		return b.factory.ConstructUnarySqrt(input)
+	case tree.UnaryCbrt:
+		return b.factory.ConstructUnaryCbrt(input)
 	}
 	panic(errors.AssertionFailedf("unhandled unary operator: %s", log.Safe(un)))
 }

@@ -139,6 +139,9 @@ func NewIntPool(name string, capacity uint64, options ...Option) *IntPool {
 // Acquisitions of 0 return immediately with no error, even if the IntPool is
 // closed.
 //
+// Acquisitions of more than 0 from a pool with 0 capacity always returns an
+// ErrNotEnoughQuota.
+//
 // Safe for concurrent use.
 func (p *IntPool) Acquire(ctx context.Context, v uint64) (*IntAlloc, error) {
 	return p.acquireMaybeWait(ctx, v, true /* wait */)
@@ -154,6 +157,10 @@ func (p *IntPool) acquireMaybeWait(ctx context.Context, v uint64, wait bool) (*I
 	// Special case acquisitions of size 0.
 	if v == 0 {
 		return p.newIntAlloc(0), nil
+	}
+	// Special case capacity of 0.
+	if p.Capacity() == 0 {
+		return nil, ErrNotEnoughQuota
 	}
 	// The maximum capacity is math.MaxInt64 so we can always truncate requests
 	// to that value.
@@ -287,7 +294,10 @@ func (p *IntPool) Len() int {
 }
 
 // ApproximateQuota will report approximately the amount of quota available in
-// the pool.
+// the pool. It's "approximate" because, if there's an acquisition in progress,
+// this might return an "intermediate" value - one that does not fully reflect
+// the capacity either before that acquisitions started or after it will have
+// finished.
 func (p *IntPool) ApproximateQuota() (q uint64) {
 	p.qp.ApproximateQuota(func(r Resource) {
 		if ia, ok := r.(*intAlloc); ok {
@@ -295,6 +305,11 @@ func (p *IntPool) ApproximateQuota() (q uint64) {
 		}
 	})
 	return q
+}
+
+// Full returns true if no quota is outstanding.
+func (p *IntPool) Full() bool {
+	return p.ApproximateQuota() == p.Capacity()
 }
 
 // Close signals to all ongoing and subsequent acquisitions that the pool is

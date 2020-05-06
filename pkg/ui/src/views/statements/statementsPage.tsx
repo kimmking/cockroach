@@ -17,7 +17,7 @@ import Helmet from "react-helmet";
 import { connect } from "react-redux";
 import { createSelector } from "reselect";
 import { RouteComponentProps, withRouter } from "react-router-dom";
-
+import { paginationPageCount } from "src/components/pagination/pagination";
 import * as protos from "src/js/protos";
 import { refreshStatementDiagnosticsRequests, refreshStatements } from "src/redux/apiReducers";
 import { CachedDataReducerState } from "src/redux/cachedDataReducer";
@@ -32,7 +32,6 @@ import Dropdown, { DropdownOption } from "src/views/shared/components/dropdown";
 import Loading from "src/views/shared/components/loading";
 import { PageConfig, PageConfigItem } from "src/views/shared/components/pageconfig";
 import { SortSetting } from "src/views/shared/components/sortabletable";
-import Empty from "../app/components/empty";
 import { Search } from "../app/components/Search";
 import { AggregateStatistics, makeStatementsColumns, StatementsSortedTable } from "./statementsTable";
 import ActivateDiagnosticsModal, { ActivateDiagnosticsModalRef } from "src/views/statements/diagnostics/activateDiagnosticsModal";
@@ -45,6 +44,8 @@ import { getMatchParamByName } from "src/util/query";
 import { trackPaginate, trackSearch } from "src/util/analytics";
 
 import "./statements.styl";
+import { ISortedTablePagination } from "../shared/components/sortedtable";
+import { statementsTable } from "src/util/docs";
 
 type ICollectedStatementStatistics = protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 
@@ -58,15 +59,11 @@ interface OwnProps {
   refreshStatementDiagnosticsRequests: typeof refreshStatementDiagnosticsRequests;
   dismissAlertMessage: () => void;
 }
-type PaginationSettings = {
-  pageSize: number;
-  current: number;
-};
 
 export interface StatementsPageState {
   sortSetting: SortSetting;
-  pagination: PaginationSettings;
   search?: string;
+  pagination: ISortedTablePagination;
 }
 
 export type StatementsPageProps = OwnProps & RouteComponentProps<any>;
@@ -141,6 +138,18 @@ export class StatementsPage extends React.Component<StatementsPageProps, Stateme
     const { history } = this.props;
     history.location.pathname = `/statements/${app.value}`;
     history.replace(history.location);
+    this.resetPagination();
+  }
+
+  resetPagination = () => {
+    this.setState((prevState) => {
+      return {
+        pagination: {
+          current: 1,
+          pageSize: prevState.pagination.pageSize,
+        },
+      };
+    });
   }
 
   componentDidMount() {
@@ -166,7 +175,8 @@ export class StatementsPage extends React.Component<StatementsPageProps, Stateme
     trackPaginate(current);
   }
   onSubmitSearchField = (search: string) => {
-    this.setState({ pagination: { ...this.state.pagination, current: 1 }, search });
+    this.setState({ search });
+    this.resetPagination();
     this.syncHistory({
       "q": search,
     });
@@ -206,24 +216,6 @@ export class StatementsPage extends React.Component<StatementsPageProps, Stateme
     }
   }
 
-  renderCounts = () => {
-    const { pagination: { current, pageSize }, search } = this.state;
-    const { match } = this.props;
-    const appAttrValue = getMatchParamByName(match, appAttr);
-    const selectedApp = appAttrValue || "";
-    const total = this.filteredStatementsData().length;
-    const pageCount = current * pageSize > total ? total : current * pageSize;
-    const count = total > 10 ? pageCount : current * total;
-    if (search.length > 0) {
-      const text = `${total} ${total > 1 || total === 0 ? "results" : "result"} for`;
-      const filter = selectedApp ? <React.Fragment>in <span className="label">{selectedApp}</span></React.Fragment> : null;
-      return (
-        <React.Fragment>{text} <span className="label">{search}</span> {filter}</React.Fragment>
-      );
-    }
-    return `${count} of ${total} statements`;
-  }
-
   renderLastCleared = () => {
     const { lastReset } = this.props;
     return `Last cleared ${moment.utc(lastReset).format(DATE_FORMAT)}`;
@@ -231,8 +223,11 @@ export class StatementsPage extends React.Component<StatementsPageProps, Stateme
 
   noStatementResult = () => (
     <>
-      <p>There are no SQL statements that match your search or filter since this page was last cleared.</p>
-      <a href="https://www.cockroachlabs.com/docs/stable/admin-ui-statements-page.html" target="_blank">Learn more about the statement page</a>
+      <h3 className="table__no-results--title">There are no SQL statements that match your search or filter since this page was last cleared.</h3>
+      <p className="table__no-results--description">
+        <span>Statements are cleared every hour by default, or according to your configuration.</span>
+        <a href={statementsTable} target="_blank">Learn more</a>
+      </p>
     </>
   )
 
@@ -266,39 +261,35 @@ export class StatementsPage extends React.Component<StatementsPageProps, Stateme
         <section className="cl-table-container">
           <div className="cl-table-statistic">
             <h4 className="cl-count-title">
-              {this.renderCounts()}
+              {paginationPageCount({ ...pagination, total: this.filteredStatementsData().length }, "statements", match, appAttr, search)}
             </h4>
             <h4 className="last-cleared-title">
               {this.renderLastCleared()}
             </h4>
           </div>
-          {data.length === 0 && search.length === 0 && (
-            <Empty
-              title="This page helps you identify frequently executed or high latency SQL statements."
-              description="No SQL statements were executed since this page was last cleared."
-              buttonHref="https://www.cockroachlabs.com/docs/stable/admin-ui-statements-page.html"
-            />
-          )}
-          {(data.length > 0 || search.length > 0) && (
-            <div className="cl-table-wrapper">
-              <StatementsSortedTable
-                className="statements-table"
-                data={data}
-                columns={
-                  makeStatementsColumns(
-                    statements,
-                    selectedApp,
-                    search,
-                    this.activateDiagnosticsRef,
-                  )
-                }
-                sortSetting={this.state.sortSetting}
-                onChangeSortSetting={this.changeSortSetting}
-                renderNoResult={this.noStatementResult()}
-                pagination={pagination}
-              />
-            </div>
-          )}
+          <StatementsSortedTable
+            className="statements-table"
+            data={data}
+            columns={
+              makeStatementsColumns(
+                statements,
+                selectedApp,
+                search,
+                this.activateDiagnosticsRef,
+              )
+            }
+            empty={data.length === 0 && search.length === 0}
+            emptyProps={{
+              title: "There are no statements since this page was last cleared.",
+              description: "Statements help you identify frequently executed or high latency SQL statements. Statements are cleared every hour by default, or according to your configuration.",
+              label: "Learn more",
+              onClick: () => window.open(statementsTable),
+            }}
+            sortSetting={this.state.sortSetting}
+            onChangeSortSetting={this.changeSortSetting}
+            renderNoResult={this.noStatementResult()}
+            pagination={pagination}
+          />
         </section>
         <Pagination
           size="small"

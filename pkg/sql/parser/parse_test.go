@@ -118,6 +118,17 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b TIMETZ)`},
 		{`CREATE TABLE a (b TIME(3))`},
 		{`CREATE TABLE a (b TIMETZ(3))`},
+		{`CREATE TABLE a (b GEOGRAPHY(POINT,4326))`},
+		{`CREATE TABLE a (b GEOGRAPHY(LINESTRING,4326))`},
+		{`CREATE TABLE a (b GEOGRAPHY(POLYGON,4326))`},
+		{`CREATE TABLE a (b GEOGRAPHY(MULTIPOINT,4326))`},
+		{`CREATE TABLE a (b GEOGRAPHY(MULTILINESTRING,4326))`},
+		{`CREATE TABLE a (b GEOGRAPHY(MULTIPOLYGON,4326))`},
+		{`CREATE TABLE a (b GEOGRAPHY(GEOMETRY,4326))`},
+		{`CREATE TABLE a (b GEOGRAPHY(GEOMETRYCOLLECTION,4326))`},
+		{`CREATE TABLE a (b GEOMETRY)`},
+		{`CREATE TABLE a (b GEOMETRY(POINT))`},
+		{`CREATE TABLE a (b GEOMETRY(POINT,4326))`},
 		{`CREATE TABLE a (b UUID)`},
 		{`CREATE TABLE a (b INET)`},
 		{`CREATE TABLE a (b "char")`},
@@ -276,7 +287,13 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b STRING[] COLLATE de)`},
 		{`CREATE TABLE a (b STRING(3)[] COLLATE de)`},
 
+		{`CREATE TABLE a (LIKE b)`},
+		{`CREATE TABLE a (LIKE b, c INT8)`},
+		{`CREATE TABLE a (LIKE b EXCLUDING INDEXES INCLUDING INDEXES)`},
+		{`CREATE TABLE a (LIKE b INCLUDING ALL EXCLUDING INDEXES, c INT8)`},
+
 		{`CREATE VIEW a AS SELECT * FROM b`},
+		{`CREATE OR REPLACE VIEW a AS SELECT * FROM b`},
 		{`EXPLAIN CREATE VIEW a AS SELECT * FROM b`},
 		{`CREATE VIEW a AS SELECT b.* FROM b LIMIT 5`},
 		{`CREATE VIEW a AS (SELECT c, d FROM b WHERE c > 0 ORDER BY c)`},
@@ -317,6 +334,20 @@ func TestParse(t *testing.T) {
 		{`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 0.9`},
 		{`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '2016-01-01'`},
 		{`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 0.1 AS OF SYSTEM TIME '2016-01-01'`},
+
+		{`CREATE TYPE a AS ENUM ()`},
+		{`CREATE TYPE a AS ENUM ('a')`},
+		{`CREATE TYPE a AS ENUM ('a', 'b', 'c')`},
+		{`CREATE TYPE a.b AS ENUM ('a', 'b', 'c')`},
+		{`CREATE TYPE a.b.c AS ENUM ('a', 'b', 'c')`},
+
+		{`DROP TYPE a`},
+		{`DROP TYPE a, b, c`},
+		{`DROP TYPE db.sc.a, sc.a`},
+		{`DROP TYPE IF EXISTS db.sc.a, sc.a`},
+		{`DROP TYPE db.sc.a, sc.a CASCADE`},
+		{`DROP TYPE IF EXISTS db.sc.a, sc.a CASCADE`},
+		{`DROP TYPE IF EXISTS db.sc.a, sc.a RESTRICT`},
 
 		{`DELETE FROM a`},
 		{`EXPLAIN DELETE FROM a`},
@@ -687,6 +718,8 @@ func TestParse(t *testing.T) {
 		{`SELECT (a->'x')->'y'`},
 		{`SELECT (a->'x')->>'y'`},
 		{`SELECT b && c`},
+		{`SELECT |/a`},
+		{`SELECT ||/a`},
 
 		{`SELECT 1 FROM t`},
 		{`SELECT 1, 2 FROM t`},
@@ -748,12 +781,18 @@ func TestParse(t *testing.T) {
 		{`SELECT 'foo'::TIME(6)`},
 		{`SELECT '0'::INTERVAL`},
 
+		{`SELECT 'foo'::GEOGRAPHY(POINT,4326)`},
+		{`SELECT 'foo'::GEOMETRY`},
+		{`SELECT 'foo'::GEOMETRY(POINT)`},
+		{`SELECT 'foo'::GEOMETRY(POINT,4326)`},
+
 		{`SELECT '192.168.0.1'::INET`},
 		{`SELECT '192.168.0.1':::INET`},
 		{`SELECT INET '192.168.0.1'`},
 
 		{`SELECT 1:::REGTYPE`},
 		{`SELECT 1:::REGPROC`},
+		{`SELECT 1:::REGPROCEDURE`},
 		{`SELECT 1:::REGCLASS`},
 		{`SELECT 1:::REGNAMESPACE`},
 
@@ -764,6 +803,23 @@ func TestParse(t *testing.T) {
 
 		{`SELECT 0xf0 FROM t`},
 		{`SELECT 0xF0 FROM t`},
+
+		// Test various cases of qualified and not statically known types.
+		{`SELECT 1::notatype`},
+		{`SELECT 1::schem.typ`},
+		{`SELECT 1::int4.typ`},
+		{`SELECT 1::db.schem.typ`},
+		{`SELECT 1::db.int4.typ[]`},
+		{`CREATE TABLE t (x special.type)`},
+		{`CREATE TABLE t (x int4.type)`},
+		{`CREATE TABLE t (x notatype)`},
+		{`SELECT 1 IS OF (my.type, int4.type)`},
+		{`SELECT my.type ''`},
+		{`SELECT int4.type ''`},
+		{`SELECT foo ''`},
+		{`SELECT CAST(1.2 + 2.3 AS notatype)`},
+		{`SELECT ANNOTATE_TYPE(1.2 + 2.3, notatype)`},
+		{`SELECT 'f'::blah`},
 
 		// Escaping may change since the scanning process loses information
 		// (you can write e'\'' or ''''), but these are the idempotent cases.
@@ -1417,6 +1473,11 @@ func TestParse(t *testing.T) {
 		{`WITH cte AS (SELECT 1) SELECT * FROM cte`},
 		{`WITH cte (x) AS (INSERT INTO abc VALUES (1, 2)), cte2 (y) AS (SELECT x + 1 FROM cte) SELECT * FROM cte, cte2`},
 		{`WITH RECURSIVE cte (x) AS (SELECT 1), cte2 (y) AS (SELECT x + 1 FROM cte) SELECT 1`},
+		{`WITH cte AS MATERIALIZED (SELECT 1) SELECT * FROM cte`},
+		{`WITH RECURSIVE cte AS MATERIALIZED (SELECT 1) SELECT * FROM cte`},
+		{`WITH cte AS NOT MATERIALIZED (SELECT 1) SELECT * FROM cte`},
+		{`WITH cte (x) AS MATERIALIZED (INSERT INTO abc VALUES (1, 2)), cte2 (y) AS NOT MATERIALIZED (SELECT x + 1 FROM cte) SELECT * FROM cte, cte2`},
+		{`WITH RECURSIVE cte (x) AS MATERIALIZED (INSERT INTO abc VALUES (1, 2)), cte2 (y) AS NOT MATERIALIZED (SELECT x + 1 FROM cte) SELECT * FROM cte, cte2`},
 	}
 	var p parser.Parser // Verify that the same parser can be reused.
 	for _, d := range testData {
@@ -1486,6 +1547,8 @@ func TestParse2(t *testing.T) {
 			`CREATE TABLE a (b VARCHAR, c VARCHAR(3))`},
 		{`CREATE TABLE a (b BIT VARYING(2), c BIT(1))`,
 			`CREATE TABLE a (b VARBIT(2), c BIT)`},
+		{`CREATE TABLE a (b GEOGRAPHY(POINT))`, `CREATE TABLE a (b GEOGRAPHY(POINT,4326))`},
+		{`CREATE TABLE a (b GEOGRAPHY)`, `CREATE TABLE a (b GEOGRAPHY(GEOMETRY,4326))`},
 
 		{`CREATE STATISTICS a ON col1 FROM t AS OF SYSTEM TIME '2016-01-01'`,
 			`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '2016-01-01'`},
@@ -1496,6 +1559,9 @@ func TestParse2(t *testing.T) {
 		{`SELECT CAST(1 AS _int8)`, `SELECT CAST(1 AS INT8[])`},
 		{`SELECT CAST(1 AS "_int8")`, `SELECT CAST(1 AS INT8[])`},
 		{`SELECT SERIAL8 'foo', 'foo'::SERIAL8`, `SELECT INT8 'foo', 'foo'::INT8`},
+
+		{`SELECT 'foo'::GEOGRAPHY`, `SELECT 'foo'::GEOGRAPHY(GEOMETRY,4326)`},
+		{`SELECT 'foo'::GEOGRAPHY(POINT)`, `SELECT 'foo'::GEOGRAPHY(POINT,4326)`},
 
 		{`SELECT 'a'::TIMESTAMP(3)`, `SELECT 'a'::TIMESTAMP(3)`},
 		{`SELECT 'a'::TIMESTAMP(3) WITHOUT TIME ZONE`, `SELECT 'a'::TIMESTAMP(3)`},
@@ -2281,6 +2347,11 @@ $function$`,
 		{`SELECT '{}'::JSONB ?& 'a' = false`, `SELECT ('{}'::JSONB ?& 'a') = false`},
 		{`SELECT '{}'::JSONB @> '{}'::JSONB = false`, `SELECT ('{}'::JSONB @> '{}'::JSONB) = false`},
 		{`SELECT '{}'::JSONB <@ '{}'::JSONB = false`, `SELECT ('{}'::JSONB <@ '{}'::JSONB) = false`},
+
+		{`SELECT 1::db.int4.typ array [1]`, `SELECT 1::db.int4.typ[]`},
+		{`SELECT 1::int4.typ array [1]`, `SELECT 1::int4.typ[]`},
+		{`SELECT 1::db.int4.typ array`, `SELECT 1::db.int4.typ[]`},
+		{`CREATE TABLE t (x int4.type array [1])`, `CREATE TABLE t (x int4.type[])`},
 	}
 	for _, d := range testData {
 		t.Run(d.sql, func(t *testing.T) {
@@ -2510,11 +2581,6 @@ DETAIL: source SQL:
 SELECT 1e-
        ^
 HINT: try \h SELECT`},
-		{"SELECT foo''",
-			`at or near "": syntax error: type does not exist
-DETAIL: source SQL:
-SELECT foo''
-          ^`},
 		{
 			`SELECT 0x FROM t`,
 			`lexical error: invalid hexadecimal numeric literal
@@ -2622,20 +2688,6 @@ ALTER TABLE t RENAME COLUMN x TO family
 HINT: try \h ALTER TABLE`,
 		},
 		{
-			`SELECT CAST(1.2+2.3 AS notatype)`,
-			`at or near "notatype": syntax error: type does not exist
-DETAIL: source SQL:
-SELECT CAST(1.2+2.3 AS notatype)
-                       ^`,
-		},
-		{
-			`SELECT ANNOTATE_TYPE(1.2+2.3, notatype)`,
-			`at or near "notatype": syntax error: type does not exist
-DETAIL: source SQL:
-SELECT ANNOTATE_TYPE(1.2+2.3, notatype)
-                              ^`,
-		},
-		{
 			`CREATE USER foo WITH PASSWORD`,
 			`at or near "EOF": syntax error
 DETAIL: source SQL:
@@ -2700,13 +2752,6 @@ SELECT EXISTS(SELECT 1)[1]
 DETAIL: source SQL:
 SELECT 1 + ANY ARRAY[1, 2, 3]
                              ^`,
-		},
-		{
-			`SELECT 'f'::"blah"`,
-			`at or near "blah": syntax error: type does not exist
-DETAIL: source SQL:
-SELECT 'f'::"blah"
-            ^`,
 		},
 		// Ensure that the support for ON ROLE <namelist> doesn't leak
 		// where it should not be recognized.
@@ -3163,7 +3208,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`DROP SUBSCRIPTION a`, 0, `drop subscription`, ``},
 		{`DROP TEXT SEARCH a`, 7821, `drop text`, ``},
 		{`DROP TRIGGER a`, 28296, `drop`, ``},
-		{`DROP TYPE a`, 27793, `drop type`, ``},
 
 		{`DISCARD PLANS`, 0, `discard plans`, ``},
 		{`DISCARD SEQUENCES`, 0, `discard sequences`, ``},
@@ -3179,8 +3223,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE TABLE a(x INT[][])`, 32552, ``, ``},
 		{`CREATE TABLE a(x INT[1][2])`, 32552, ``, ``},
 		{`CREATE TABLE a(x INT ARRAY[1][2])`, 32552, ``, ``},
-
-		{`CREATE TABLE a(LIKE b)`, 30840, ``, ``},
 
 		{`CREATE TABLE a(b INT8) WITH OIDS`, 0, `create table with oids`, ``},
 
@@ -3198,6 +3240,11 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE TABLE a(b INT8, UNIQUE (b) DEFERRABLE)`, 31632, `deferrable`, ``},
 		{`CREATE TABLE a(b INT8, CHECK (b > 0) DEFERRABLE)`, 31632, `deferrable`, ``},
 
+		{`CREATE TABLE a (LIKE b INCLUDING COMMENTS)`, 47071, `like table`, ``},
+		{`CREATE TABLE a (LIKE b INCLUDING IDENTITY)`, 47071, `like table`, ``},
+		{`CREATE TABLE a (LIKE b INCLUDING STATISTICS)`, 47071, `like table`, ``},
+		{`CREATE TABLE a (LIKE b INCLUDING STORAGE)`, 47071, `like table`, ``},
+
 		{`CREATE TEMP TABLE a (a int) ON COMMIT DROP`, 46556, `drop`, ``},
 		{`CREATE TEMP TABLE a (a int) ON COMMIT DELETE ROWS`, 46556, `delete rows`, ``},
 		{`CREATE TEMP TABLE IF NOT EXISTS a (a int) ON COMMIT DROP`, 46556, `drop`, ``},
@@ -3209,11 +3256,9 @@ func TestUnimplementedSyntax(t *testing.T) {
 
 		{`CREATE SEQUENCE a AS DOUBLE PRECISION`, 25110, `FLOAT8`, ``},
 
-		{`CREATE OR REPLACE VIEW a AS SELECT b`, 24897, ``, ``},
 		{`CREATE RECURSIVE VIEW a AS SELECT b`, 0, `create recursive view`, ``},
 
 		{`CREATE TYPE a AS (b)`, 27792, ``, ``},
-		{`CREATE TYPE a AS ENUM (b)`, 24873, ``, ``},
 		{`CREATE TYPE a AS RANGE b`, 27791, ``, ``},
 		{`CREATE TYPE a (b)`, 27793, `base`, ``},
 		{`CREATE TYPE a`, 27793, `shell`, ``},

@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -192,6 +193,7 @@ func (ex *connExecutor) execStmtInOpenState(
 	var finishCollectionDiagnostics StmtDiagnosticsTraceFinishFunc
 
 	if explainBundle, ok := stmt.AST.(*tree.ExplainAnalyzeDebug); ok {
+		telemetry.Inc(sqltelemetry.ExplainAnalyzeDebugUseCounter)
 		// Always collect diagnostics for EXPLAIN ANALYZE (DEBUG).
 		shouldCollectDiagnostics = true
 		// Strip off the explain node to execute the inner statement.
@@ -211,6 +213,9 @@ func (ex *connExecutor) execStmtInOpenState(
 		p.discardRows = true
 	} else {
 		shouldCollectDiagnostics, finishCollectionDiagnostics = ex.stmtDiagnosticsRecorder.ShouldCollectDiagnostics(ctx, stmt.AST)
+		if shouldCollectDiagnostics {
+			telemetry.Inc(sqltelemetry.StatementDiagnosticsCollectedCounter)
+		}
 	}
 
 	if shouldCollectDiagnostics {
@@ -324,7 +329,11 @@ func (ex *connExecutor) execStmtInOpenState(
 			}
 			typeHints = make(tree.PlaceholderTypes, stmt.NumPlaceholders)
 			for i, t := range s.Types {
-				typeHints[i] = t
+				resolved, err := tree.ResolveType(t, ex.planner.semaCtx.GetTypeResolver())
+				if err != nil {
+					return makeErrEvent(err)
+				}
+				typeHints[i] = resolved
 			}
 		}
 		if _, err := ex.addPreparedStmt(
@@ -612,7 +621,7 @@ func (ex *connExecutor) checkTableTwoVersionInvariant(ctx context.Context) error
 
 	// Create a new transaction to retry with a higher timestamp than the
 	// timestamps used in the retry loop above.
-	ex.state.mu.txn = kv.NewTxnWithSteppingEnabled(ctx, ex.transitionCtx.db, ex.transitionCtx.nodeID)
+	ex.state.mu.txn = kv.NewTxnWithSteppingEnabled(ctx, ex.transitionCtx.db, ex.transitionCtx.nodeIDOrZero)
 	if err := ex.state.mu.txn.SetUserPriority(userPriority); err != nil {
 		return err
 	}
@@ -720,7 +729,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 
 	var cols sqlbase.ResultColumns
 	if stmt.AST.StatementType() == tree.Rows {
-		cols = planColumns(planner.curPlan.plan)
+		cols = planColumns(planner.curPlan.main)
 	}
 	if err := ex.initStatementResult(ctx, res, stmt, cols); err != nil {
 		res.SetError(err)
@@ -729,8 +738,10 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 
 	ex.sessionTracing.TracePlanCheckStart(ctx)
 	distributePlan := false
-	distributePlan = shouldDistributePlan(
-		ctx, ex.sessionData.DistSQLMode, ex.server.cfg.DistSQLPlanner, planner.curPlan.plan)
+	if _, noMultiTenancy := planner.execCfg.NodeID.OptionalNodeID(); noMultiTenancy {
+		distributePlan = shouldDistributePlan(
+			ctx, ex.sessionData.DistSQLMode, ex.server.cfg.DistSQLPlanner, planner.curPlan.main)
+	}
 	ex.sessionTracing.TracePlanCheckEnd(ctx, nil, distributePlan)
 
 	if ex.server.cfg.TestingKnobs.BeforeExecute != nil {
@@ -824,7 +835,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 		ex.server.cfg.RangeDescriptorCache, ex.server.cfg.LeaseHolderCache,
 		planner.txn,
 		func(ts hlc.Timestamp) {
-			_ = ex.server.cfg.Clock.Update(ts)
+			ex.server.cfg.Clock.Update(ts)
 		},
 		&ex.sessionTracing,
 	)
@@ -848,7 +859,9 @@ func (ex *connExecutor) execWithDistSQLEngine(
 	}
 
 	var evalCtxFactory func() *extendedEvalContext
-	if len(planner.curPlan.subqueryPlans) != 0 || len(planner.curPlan.postqueryPlans) != 0 {
+	if len(planner.curPlan.subqueryPlans) != 0 ||
+		len(planner.curPlan.cascades) != 0 ||
+		len(planner.curPlan.checkPlans) != 0 {
 		// The factory reuses the same object because the contexts are not used
 		// concurrently.
 		var factoryEvalCtx extendedEvalContext
@@ -876,7 +889,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 	// We pass in whether or not we wanted to distribute this plan, which tells
 	// the planner whether or not to plan remote table readers.
 	cleanup := ex.server.cfg.DistSQLPlanner.PlanAndRun(
-		ctx, evalCtx, planCtx, planner.txn, planner.curPlan.plan, recv,
+		ctx, evalCtx, planCtx, planner.txn, planner.curPlan.main, recv,
 	)
 	// Note that we're not cleaning up right away because postqueries might
 	// need to have access to the main query tree.
@@ -885,11 +898,9 @@ func (ex *connExecutor) execWithDistSQLEngine(
 		return recv.bytesRead, recv.rowsRead, recv.commErr
 	}
 
-	if len(planner.curPlan.postqueryPlans) != 0 {
-		ex.server.cfg.DistSQLPlanner.PlanAndRunPostqueries(
-			ctx, planner, evalCtxFactory, planner.curPlan.postqueryPlans, recv, distribute,
-		)
-	}
+	ex.server.cfg.DistSQLPlanner.PlanAndRunCascadesAndChecks(
+		ctx, planner, evalCtxFactory, &planner.curPlan.planComponents, recv, distribute,
+	)
 
 	return recv.bytesRead, recv.rowsRead, recv.commErr
 }
@@ -911,14 +922,14 @@ func (ex *connExecutor) beginTransactionTimestampsAndReadMode(
 	historicalTimestamp *hlc.Timestamp,
 	err error,
 ) {
-	now := ex.server.cfg.Clock.Now()
+	now := ex.server.cfg.Clock.PhysicalTime()
 	if s.Modes.AsOf.Expr == nil {
 		rwMode = ex.readWriteModeWithSessionDefault(s.Modes.ReadWriteMode)
-		return rwMode, now.GoTime(), nil, nil
+		return rwMode, now, nil, nil
 	}
 	ex.statsCollector.reset(&ex.server.sqlStats, ex.appStats, &ex.phaseTimes)
 	p := &ex.planner
-	ex.resetPlanner(ctx, p, nil /* txn */, now.GoTime())
+	ex.resetPlanner(ctx, p, nil /* txn */, now)
 	ts, err := p.EvalAsOfTimestamp(s.Modes.AsOf)
 	if err != nil {
 		return 0, time.Time{}, nil, err
@@ -954,34 +965,28 @@ func (ex *connExecutor) execStmtInNoTxnState(
 				ex.incrementExecutedStmtCounter(stmt)
 			}
 		}()
-		pri, err := priorityToProto(s.Modes.UserPriority)
-		if err != nil {
-			return ex.makeErrEvent(err, s)
-		}
 		mode, sqlTs, historicalTs, err := ex.beginTransactionTimestampsAndReadMode(ctx, s)
 		if err != nil {
 			return ex.makeErrEvent(err, s)
 		}
 		return eventTxnStart{ImplicitTxn: fsm.False},
 			makeEventTxnStartPayload(
-				pri, mode, sqlTs,
+				ex.txnPriorityWithSessionDefault(s.Modes.UserPriority),
+				mode,
+				sqlTs,
 				historicalTs,
 				ex.transitionCtx)
 	case *tree.CommitTransaction, *tree.ReleaseSavepoint,
 		*tree.RollbackTransaction, *tree.SetTransaction, *tree.Savepoint:
 		return ex.makeErrEvent(errNoTransactionInProgress, stmt.AST)
 	default:
-		mode := tree.ReadWrite
-		if ex.sessionData.DefaultReadOnly {
-			mode = tree.ReadOnly
-		}
 		// NB: Implicit transactions are created without a historical timestamp even
 		// though the statement might contain an AOST clause. In these cases the
 		// clause is evaluated and applied execStmtInOpenState.
 		return eventTxnStart{ImplicitTxn: fsm.True},
 			makeEventTxnStartPayload(
-				roachpb.NormalUserPriority,
-				mode,
+				ex.txnPriorityWithSessionDefault(tree.UnspecifiedUserPriority),
+				ex.readWriteModeWithSessionDefault(tree.UnspecifiedReadWriteMode),
 				ex.server.cfg.Clock.PhysicalTime(),
 				nil, /* historicalTimestamp */
 				ex.transitionCtx)

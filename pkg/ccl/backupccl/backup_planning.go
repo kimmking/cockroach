@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -86,14 +87,14 @@ type tableAndIndex struct {
 // spansForAllTableIndexes returns non-overlapping spans for every index and
 // table passed in. They would normally overlap if any of them are interleaved.
 func spansForAllTableIndexes(
-	tables []*sqlbase.TableDescriptor, revs []BackupManifest_DescriptorRevision,
+	codec keys.SQLCodec, tables []*sqlbase.TableDescriptor, revs []BackupManifest_DescriptorRevision,
 ) []roachpb.Span {
 
 	added := make(map[tableAndIndex]bool, len(tables))
 	sstIntervalTree := interval.NewTree(interval.ExclusiveOverlapper)
 	for _, table := range tables {
 		for _, index := range table.AllNonDropIndexes() {
-			if err := sstIntervalTree.Insert(intervalSpan(table.IndexSpan(index.ID)), false); err != nil {
+			if err := sstIntervalTree.Insert(intervalSpan(table.IndexSpan(codec, index.ID)), false); err != nil {
 				panic(errors.NewAssertionErrorWithWrappedErrf(err, "IndexSpan"))
 			}
 			added[tableAndIndex{tableID: table.ID, indexID: index.ID}] = true
@@ -107,7 +108,7 @@ func spansForAllTableIndexes(
 			for _, idx := range tbl.AllNonDropIndexes() {
 				key := tableAndIndex{tableID: tbl.ID, indexID: idx.ID}
 				if !added[key] {
-					if err := sstIntervalTree.Insert(intervalSpan(tbl.IndexSpan(idx.ID)), false); err != nil {
+					if err := sstIntervalTree.Insert(intervalSpan(tbl.IndexSpan(codec, idx.ID)), false); err != nil {
 						panic(errors.NewAssertionErrorWithWrappedErrf(err, "IndexSpan"))
 					}
 					added[key] = true
@@ -394,6 +395,7 @@ func backupPlanHook(
 
 		var encryption *roachpb.FileEncryptionOptions
 		var prevBackups []BackupManifest
+		g := ctxgroup.WithContext(ctx)
 		if len(incrementalFrom) > 0 {
 			if encryptionPassphrase != nil {
 				exportStore, err := makeCloudStorage(ctx, incrementalFrom[0])
@@ -410,20 +412,28 @@ func backupPlanHook(
 				}
 			}
 			prevBackups = make([]BackupManifest, len(incrementalFrom))
-			for i, uri := range incrementalFrom {
-				// TODO(lucy): We may want to upgrade the table descs to the newer
-				// foreign key representation here, in case there are backups from an
-				// older cluster. Keeping the descriptors as they are works for now
-				// since all we need to do is get the past backups' table/index spans,
-				// but it will be safer for future code to avoid having older-style
-				// descriptors around.
-				desc, err := ReadBackupManifestFromURI(
-					ctx, uri, makeCloudStorage, encryption,
-				)
-				if err != nil {
-					return errors.Wrapf(err, "failed to read backup from %q", uri)
-				}
-				prevBackups[i] = desc
+			for i := range incrementalFrom {
+				i := i
+				g.GoCtx(func(ctx context.Context) error {
+					// TODO(lucy): We may want to upgrade the table descs to the newer
+					// foreign key representation here, in case there are backups from an
+					// older cluster. Keeping the descriptors as they are works for now
+					// since all we need to do is get the past backups' table/index spans,
+					// but it will be safer for future code to avoid having older-style
+					// descriptors around.
+					uri := incrementalFrom[i]
+					desc, err := ReadBackupManifestFromURI(
+						ctx, uri, makeCloudStorage, encryption,
+					)
+					if err != nil {
+						return errors.Wrapf(err, "failed to read backup from %q", uri)
+					}
+					prevBackups[i] = desc
+					return nil
+				})
+			}
+			if err := g.Wait(); err != nil {
+				return err
 			}
 		} else {
 			exists, err := containsManifest(ctx, defaultStore)
@@ -443,22 +453,35 @@ func backupPlanHook(
 
 				prev, err := findPriorBackups(ctx, defaultStore)
 				if err != nil {
-					return err
+					return errors.Wrapf(err, "determining base for incremental backup")
 				}
-				prevBackups = make([]BackupManifest, 0, len(prev)+1)
+				prevBackups = make([]BackupManifest, len(prev)+1)
 
 				m, err := readBackupManifestFromStore(ctx, defaultStore, encryption)
 				if err != nil {
 					return errors.Wrap(err, "loading base backup manifest")
 				}
-				prevBackups = append(prevBackups, m)
+				prevBackups[0] = m
 
-				for _, inc := range prev {
-					m, err := readBackupManifest(ctx, defaultStore, inc, encryption)
-					if err != nil {
-						return errors.Wrapf(err, "loading prior backup part manifest %q", inc)
-					}
-					prevBackups = append(prevBackups, m)
+				if m.DescriptorCoverage == tree.AllDescriptors &&
+					backupStmt.DescriptorCoverage != tree.AllDescriptors {
+					return errors.Errorf("cannot append a backup of specific tables or databases to a full-cluster backup")
+				}
+
+				for i := range prev {
+					i := i
+					g.GoCtx(func(ctx context.Context) error {
+						inc := prev[i]
+						m, err := readBackupManifest(ctx, defaultStore, inc, encryption)
+						if err != nil {
+							return errors.Wrapf(err, "loading prior backup part manifest %q", inc)
+						}
+						prevBackups[i+1] = m
+						return nil
+					})
+				}
+				if err := g.Wait(); err != nil {
+					return err
 				}
 
 				// Pick a piece-specific suffix and update the destination path(s).
@@ -505,7 +528,7 @@ func backupPlanHook(
 			}
 		}
 
-		spans := spansForAllTableIndexes(tables, revs)
+		spans := spansForAllTableIndexes(p.ExecCfg().Codec, tables, revs)
 
 		if len(prevBackups) > 0 {
 			tablesInPrev := make(map[sqlbase.ID]struct{})
@@ -547,6 +570,11 @@ func backupPlanHook(
 			}
 		}
 
+		nodeID, err := p.ExecCfg().NodeID.OptionalNodeIDErr(47970)
+		if err != nil {
+			return err
+		}
+
 		// if CompleteDbs is lost by a 1.x node, FormatDescriptorTrackingVersion
 		// means that a 2.0 node will disallow `RESTORE DATABASE foo`, but `RESTORE
 		// foo.table1, foo.table2...` will still work. MVCCFilter would be
@@ -565,7 +593,7 @@ func backupPlanHook(
 			IntroducedSpans:    newSpans,
 			FormatVersion:      BackupFormatDescriptorTrackingVersion,
 			BuildInfo:          build.GetInfo(),
-			NodeID:             p.ExecCfg().NodeID.Get(),
+			NodeID:             nodeID,
 			ClusterID:          p.ExecCfg().ClusterID(),
 			Statistics:         tableStatistics,
 			DescriptorCoverage: backupStmt.DescriptorCoverage,

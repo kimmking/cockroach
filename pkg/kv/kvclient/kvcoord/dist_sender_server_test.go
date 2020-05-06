@@ -34,11 +34,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/kvclientutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -133,8 +133,6 @@ func setupMultipleRanges(ctx context.Context, db *kv.DB, splitAt ...string) erro
 	return nil
 }
 
-var errInfo = testutils.MakeCaller(3, 2)
-
 type checkResultsMode int
 
 const (
@@ -168,6 +166,7 @@ func checkSpanResults(
 	expSatisfied map[int]struct{},
 	opt checkOptions,
 ) {
+	t.Helper()
 	if len(expResults) != len(results) {
 		t.Fatalf("only got %d results, wanted %d", len(expResults), len(results))
 	}
@@ -177,14 +176,14 @@ func checkSpanResults(
 		count += len(res.Rows)
 		if opt.mode == Strict {
 			if len(res.Rows) != len(expResults[i]) {
-				t.Fatalf("%s: scan %d (%s): expected %d rows, got %d (%s)",
-					errInfo(), i, spans[i], len(expResults[i]), len(res.Rows), res)
+				t.Fatalf("scan %d (%s): expected %d rows, got %d (%s)",
+					i, spans[i], len(expResults[i]), len(res.Rows), res)
 			}
 		}
 		for j, kv := range res.Rows {
 			if key, expKey := string(kv.Key), expResults[i][j]; key != expKey {
-				t.Fatalf("%s: scan %d (%s) expected result %d to be %q; got %q",
-					errInfo(), i, spans[i], j, expKey, key)
+				t.Fatalf("scan %d (%s) expected result %d to be %q; got %q",
+					i, spans[i], j, expKey, key)
 			}
 		}
 	}
@@ -203,20 +202,21 @@ func checkResumeSpanScanResults(
 	expSatisfied map[int]struct{},
 	opt checkOptions,
 ) {
+	t.Helper()
 	for i, res := range results {
 		rowLen := len(res.Rows)
 		// Check that satisfied scans don't have resume spans.
 		if _, satisfied := expSatisfied[i]; satisfied {
 			if res.ResumeSpan != nil {
-				t.Fatalf("%s: satisfied scan %d (%s) has ResumeSpan: %v",
-					errInfo(), i, spans[i], res.ResumeSpan)
+				t.Fatalf("satisfied scan %d (%s) has ResumeSpan: %v",
+					i, spans[i], res.ResumeSpan)
 			}
 			continue
 		}
 
 		if res.ResumeReason == roachpb.RESUME_UNKNOWN {
-			t.Fatalf("%s: scan %d (%s): no resume reason. resume span: %+v",
-				errInfo(), i, spans[i], res.ResumeSpan)
+			t.Fatalf("scan %d (%s): no resume reason. resume span: %+v",
+				i, spans[i], res.ResumeSpan)
 		}
 
 		// The scan is not expected to be satisfied, so there must be a resume span.
@@ -225,25 +225,25 @@ func checkResumeSpanScanResults(
 		// otherwise.
 		resumeKey := string(res.ResumeSpan.Key)
 		if res.ResumeReason != roachpb.RESUME_KEY_LIMIT {
-			t.Fatalf("%s: scan %d (%s): unexpected resume reason %s",
-				errInfo(), i, spans[i], res.ResumeReason)
+			t.Fatalf("scan %d (%s): unexpected resume reason %s",
+				i, spans[i], res.ResumeReason)
 		}
 		if rowLen == 0 {
 			if resumeKey != spans[i][0] {
-				t.Fatalf("%s: scan %d: expected resume %s, got: %s",
-					errInfo(), i, spans[i][0], resumeKey)
+				t.Fatalf("scan %d: expected resume %s, got: %s",
+					i, spans[i][0], resumeKey)
 			}
 		} else {
 			lastRes := expResults[i][rowLen-1]
 			if resumeKey <= lastRes {
-				t.Fatalf("%s: scan %d: expected resume %s to be above last result %s",
-					errInfo(), i, resumeKey, lastRes)
+				t.Fatalf("scan %d: expected resume %s to be above last result %s",
+					i, resumeKey, lastRes)
 			}
 		}
 
 		// The EndKey must be untouched.
 		if key, expKey := string(res.ResumeSpan.EndKey), spans[i][1]; key != expKey {
-			t.Errorf("%s: expected resume endkey %d to be %q; got %q", errInfo(), i, expKey, key)
+			t.Errorf("expected resume endkey %d to be %q; got %q", i, expKey, key)
 		}
 	}
 }
@@ -257,12 +257,13 @@ func checkResumeSpanReverseScanResults(
 	expSatisfied map[int]struct{},
 	opt checkOptions,
 ) {
+	t.Helper()
 	for i, res := range results {
 		rowLen := len(res.Rows)
 		// Check that satisfied scans don't have resume spans.
 		if _, satisfied := expSatisfied[i]; satisfied {
 			if res.ResumeSpan != nil {
-				t.Fatalf("%s: satisfied scan %d has ResumeSpan: %v", errInfo(), i, res.ResumeSpan)
+				t.Fatalf("satisfied scan %d has ResumeSpan: %v", i, res.ResumeSpan)
 			}
 			continue
 		}
@@ -273,25 +274,25 @@ func checkResumeSpanReverseScanResults(
 		// otherwise.
 		resumeKey := string(res.ResumeSpan.EndKey)
 		if res.ResumeReason != roachpb.RESUME_KEY_LIMIT {
-			t.Fatalf("%s: scan %d (%s): unexpected resume reason %s",
-				errInfo(), i, spans[i], res.ResumeReason)
+			t.Fatalf("scan %d (%s): unexpected resume reason %s",
+				i, spans[i], res.ResumeReason)
 		}
 		if rowLen == 0 {
 			if resumeKey != spans[i][1] {
-				t.Fatalf("%s: scan %d (%s) expected resume %s, got: %s",
-					errInfo(), i, spans[i], spans[i][1], resumeKey)
+				t.Fatalf("scan %d (%s) expected resume %s, got: %s",
+					i, spans[i], spans[i][1], resumeKey)
 			}
 		} else {
 			lastRes := expResults[i][rowLen-1]
 			if resumeKey >= lastRes {
-				t.Fatalf("%s: scan %d: expected resume %s to be below last result %s",
-					errInfo(), i, resumeKey, lastRes)
+				t.Fatalf("scan %d: expected resume %s to be below last result %s",
+					i, resumeKey, lastRes)
 			}
 		}
 
 		// The Key must be untouched.
 		if key, expKey := string(res.ResumeSpan.Key), spans[i][0]; key != expKey {
-			t.Errorf("%s: expected resume key %d to be %q; got %q", errInfo(), i, expKey, key)
+			t.Errorf("expected resume key %d to be %q; got %q", i, expKey, key)
 		}
 	}
 }
@@ -512,10 +513,10 @@ func TestMultiRangeBoundedBatchScan(t *testing.T) {
 	}
 }
 
-// TestMultiRangeBoundedBatchScanUnsortedOrder runs two non-overlapping
-// scan requests out of order and shows how the batch response can
-// contain two partial responses.
-func TestMultiRangeBoundedBatchScanUnsortedOrder(t *testing.T) {
+// TestMultiRangeBoundedBatchScanPartialResponses runs multiple scan requests
+// either out-of-order or over overlapping key spans and shows how the batch
+// responses can contain partial responses.
+func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _ := startNoSplitMergeServer(t)
 	ctx := context.TODO()
@@ -526,103 +527,239 @@ func TestMultiRangeBoundedBatchScanUnsortedOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, key := range []string{"a1", "a2", "a3", "b1", "b2", "b3", "b4", "b5", "c1", "c2", "d1", "f1", "f2", "f3"} {
+	for _, key := range []string{"a1", "a2", "a3", "b1", "b2", "b3", "c1", "c2", "c3"} {
 		if err := db.Put(ctx, key, "value"); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	bound := 6
-	b := &kv.Batch{}
-	b.Header.MaxSpanRequestKeys = int64(bound)
-	// Two non-overlapping requests out of order.
-	spans := [][]string{{"b3", "c2"}, {"a", "b3"}}
-	for _, span := range spans {
-		b.Scan(span[0], span[1])
+	for _, tc := range []struct {
+		name         string
+		bound        int64
+		spans        [][]string
+		expResults   [][]string
+		expSatisfied []int
+	}{
+		{
+			name:  "unsorted, non-overlapping, neither satisfied",
+			bound: 6,
+			spans: [][]string{
+				{"b1", "d"}, {"a", "b1"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3"},
+			},
+		},
+		{
+			name:  "unsorted, non-overlapping, first satisfied",
+			bound: 6,
+			spans: [][]string{
+				{"b1", "c"}, {"a", "b1"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3"},
+			},
+			expSatisfied: []int{0},
+		},
+		{
+			name:  "unsorted, non-overlapping, second satisfied",
+			bound: 6,
+			spans: [][]string{
+				{"b1", "d"}, {"a", "b"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3"},
+			},
+			expSatisfied: []int{1},
+		},
+		{
+			name:  "unsorted, non-overlapping, both satisfied",
+			bound: 6,
+			spans: [][]string{
+				{"b1", "c"}, {"a", "b"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3"},
+			},
+			expSatisfied: []int{0, 1},
+		},
+		{
+			name:  "sorted, overlapping, neither satisfied",
+			bound: 7,
+			spans: [][]string{
+				{"a", "d"}, {"b", "g"},
+			},
+			expResults: [][]string{
+				{"a1", "a2", "a3", "b1", "b2", "b3"}, {"b1"},
+			},
+		},
+		{
+			name:  "sorted, overlapping, first satisfied",
+			bound: 7,
+			spans: [][]string{
+				{"a", "c"}, {"b", "g"},
+			},
+			expResults: [][]string{
+				{"a1", "a2", "a3", "b1", "b2", "b3"}, {"b1"},
+			},
+			expSatisfied: []int{0},
+		},
+		{
+			name:  "sorted, overlapping, second satisfied",
+			bound: 9,
+			spans: [][]string{
+				{"a", "d"}, {"b", "c"},
+			},
+			expResults: [][]string{
+				{"a1", "a2", "a3", "b1", "b2", "b3"}, {"b1", "b2", "b3"},
+			},
+			expSatisfied: []int{1},
+		},
+		{
+			name:  "sorted, overlapping, both satisfied",
+			bound: 9,
+			spans: [][]string{
+				{"a", "c"}, {"b", "c"},
+			},
+			expResults: [][]string{
+				{"a1", "a2", "a3", "b1", "b2", "b3"}, {"b1", "b2", "b3"},
+			},
+			expSatisfied: []int{0, 1},
+		},
+		{
+			name:  "unsorted, overlapping, neither satisfied",
+			bound: 7,
+			spans: [][]string{
+				{"b", "g"}, {"a", "d"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3", "b1"},
+			},
+		},
+		{
+			name:  "unsorted, overlapping, first satisfied",
+			bound: 7,
+			spans: [][]string{
+				{"b", "c"}, {"a", "d"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3", "b1"},
+			},
+			expSatisfied: []int{0},
+		},
+		{
+			name:  "unsorted, overlapping, second satisfied",
+			bound: 7,
+			spans: [][]string{
+				{"b", "g"}, {"a", "b2"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3", "b1"},
+			},
+			expSatisfied: []int{1},
+		},
+		{
+			name:  "unsorted, overlapping, both satisfied",
+			bound: 7,
+			spans: [][]string{
+				{"b", "c"}, {"a", "b2"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3", "b1"},
+			},
+			expSatisfied: []int{0, 1},
+		},
+		{
+			name:  "unsorted, overlapping, unreached",
+			bound: 7,
+			spans: [][]string{
+				{"b", "g"}, {"c", "f"}, {"a", "d"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {}, {"a1", "a2", "a3", "b1"},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &kv.Batch{}
+			b.Header.MaxSpanRequestKeys = tc.bound
+			for _, span := range tc.spans {
+				b.Scan(span[0], span[1])
+			}
+			if err := db.Run(ctx, b); err != nil {
+				t.Fatal(err)
+			}
+
+			expSatisfied := make(map[int]struct{})
+			for _, exp := range tc.expSatisfied {
+				expSatisfied[exp] = struct{}{}
+			}
+			opts := checkOptions{mode: Strict}
+			checkScanResults(t, tc.spans, b.Results, tc.expResults, expSatisfied, opts)
+		})
 	}
-	if err := db.Run(ctx, b); err != nil {
-		t.Fatal(err)
-	}
-	// See incomplete results for the two requests.
-	expResults := [][]string{
-		{"b3", "b4", "b5"},
-		{"a1", "a2", "a3"},
-	}
-	checkScanResults(t, spans, b.Results, expResults, nil /* satisfied */, checkOptions{mode: Strict})
 }
 
-// TestMultiRangeBoundedBatchScanSortedOverlapping runs two overlapping
-// ordered (by start key) scan requests, and shows how the batch response can
-// contain two partial responses.
-func TestMultiRangeBoundedBatchScanSortedOverlapping(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s, _ := startNoSplitMergeServer(t)
-	ctx := context.TODO()
-	defer s.Stopper().Stop(ctx)
-
-	db := s.DB()
-	if err := setupMultipleRanges(ctx, db, "a", "b", "c", "d", "e", "f"); err != nil {
-		t.Fatal(err)
-	}
-
-	for _, key := range []string{"a1", "a2", "a3", "b1", "b2", "c1", "c2", "d1", "f1", "f2", "f3"} {
-		if err := db.Put(ctx, key, "value"); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	bound := 6
-	b := &kv.Batch{}
-	b.Header.MaxSpanRequestKeys = int64(bound)
-	// Two ordered overlapping requests.
-	spans := [][]string{{"a", "d"}, {"b", "g"}}
-	for _, span := range spans {
-		b.Scan(span[0], span[1])
-	}
-	if err := db.Run(ctx, b); err != nil {
-		t.Fatal(err)
-	}
-	// See incomplete results for the two requests.
-	expResults := [][]string{
-		{"a1", "a2", "a3", "b1", "b2"},
-		{"b1"},
-	}
-	checkScanResults(t, spans, b.Results, expResults, nil /* satisfied */, checkOptions{mode: Strict})
-}
-
-// check ResumeSpan in the DelRange results.
-func checkResumeSpanDelRangeResults(
-	t *testing.T, spans [][]string, results []kv.Result, expResults [][]string, expCount int,
+// checks the results of a DelRange.
+func checkDelRangeResults(
+	t *testing.T,
+	spans [][]string,
+	results []kv.Result,
+	expResults [][]string,
+	expSatisfied map[int]struct{},
 ) {
+	checkDelRangeSpanResults(t, results, expResults)
+	checkResumeSpanDelRangeResults(t, spans, results, expResults, expSatisfied)
+}
+
+// checks the keys returned from a DelRange.
+func checkDelRangeSpanResults(t *testing.T, results []kv.Result, expResults [][]string) {
+	t.Helper()
+	require.Equal(t, len(expResults), len(results))
 	for i, res := range results {
+		require.Equal(t, len(expResults[i]), len(res.Keys))
+		for j, key := range res.Keys {
+			require.Equal(t, expResults[i][j], string(key))
+		}
+	}
+}
+
+// checks the ResumeSpan in the DelRange results.
+func checkResumeSpanDelRangeResults(
+	t *testing.T,
+	spans [][]string,
+	results []kv.Result,
+	expResults [][]string,
+	expSatisfied map[int]struct{},
+) {
+	t.Helper()
+	for i, res := range results {
+		keyLen := len(res.Keys)
+		// Check that satisfied requests don't have resume spans.
+		if _, satisfied := expSatisfied[i]; satisfied {
+			require.Nil(t, res.ResumeSpan)
+			continue
+		}
+
 		// Check ResumeSpan when request has been processed.
-		rowLen := len(res.Keys)
-		if rowLen > 0 {
-			// The key can be empty once the entire span has been deleted.
-			if rowLen == len(expResults[i]) {
-				if res.ResumeSpan == nil {
-					// Done.
-					continue
-				}
-			}
-			// The next start key is always greater than the last key seen.
-			if key, expKey := string(res.ResumeSpan.Key), expResults[i][rowLen-1]; key <= expKey {
-				t.Errorf("%s: expected resume key %d, %d to be %q; got %q", errInfo(), i, expCount, expKey, key)
-			}
+		require.NotNil(t, res.ResumeSpan)
+		require.Equal(t, roachpb.RESUME_KEY_LIMIT, res.ResumeReason)
+
+		// The key can be empty once the entire span has been deleted.
+		if keyLen == 0 {
+			// The request was not processed; the resume span key >= first seen key.
+			require.LessOrEqual(t, spans[i][0], string(res.ResumeSpan.Key), "ResumeSpan.Key")
 		} else {
-			// The request was not processed; the resume span key <= first seen key.
-			if key, expKey := string(res.ResumeSpan.Key), expResults[i][0]; key > expKey {
-				t.Errorf("%s: expected resume key %d, %d to be %q; got %q", errInfo(), i, expCount, expKey, key)
-			}
+			// The next start key is always greater than the last key seen.
+			lastRes := expResults[i][keyLen-1]
+			require.Less(t, lastRes, string(res.ResumeSpan.Key), "ResumeSpan.Key")
 		}
 		// The EndKey is untouched.
-		if key, expKey := string(res.ResumeSpan.EndKey), spans[i][1]; key != expKey {
-			t.Errorf("%s: expected resume endkey %d, %d to be %q; got %q", errInfo(), i, expCount, expKey, key)
-		}
+		require.Equal(t, spans[i][1], string(res.ResumeSpan.EndKey), "ResumeSpan.EndKey")
 	}
 }
 
-// Tests a batch of bounded DelRange() requests.
+// Tests multiple delete range requests across many ranges with multiple bounds.
 func TestMultiRangeBoundedBatchDelRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _ := startNoSplitMergeServer(t)
@@ -634,63 +771,244 @@ func TestMultiRangeBoundedBatchDelRange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// These are the expected results if there is no bound.
-	expResults := [][]string{
+	expResultsWithoutBound := [][]string{
 		{"a1", "a2", "a3", "b1", "b2"},
 		{"c1", "c2", "d1"},
 		{"g1", "g2"},
 	}
-	maxExpCount := 0
-	for _, res := range expResults {
-		maxExpCount += len(res)
-	}
 
 	for bound := 1; bound <= 20; bound++ {
-		// Initialize all keys.
-		for _, key := range []string{"a1", "a2", "a3", "b1", "b2", "c1", "c2", "d1", "f1", "f2", "f3", "g1", "g2", "h1"} {
-			if err := db.Put(ctx, key, "value"); err != nil {
-				t.Fatal(err)
-			}
-		}
-
-		b := &kv.Batch{}
-		b.Header.MaxSpanRequestKeys = int64(bound)
-		spans := [][]string{{"a", "c"}, {"c", "f"}, {"g", "h"}}
-		for _, span := range spans {
-			b.DelRange(span[0], span[1], true /* returnKeys */)
-		}
-		if err := db.Run(ctx, b); err != nil {
-			t.Fatal(err)
-		}
-
-		if len(expResults) != len(b.Results) {
-			t.Fatalf("bound: %d, only got %d results, wanted %d", bound, len(expResults), len(b.Results))
-		}
-		expCount := maxExpCount
-		if bound < maxExpCount {
-			expCount = bound
-		}
-		rem := expCount
-		for i, res := range b.Results {
-			// Verify that the KeyValue slice contains the given keys.
-			rem -= len(res.Keys)
-			for j, key := range res.Keys {
-				if expKey := expResults[i][j]; string(key) != expKey {
-					t.Errorf("%s: expected scan key %d, %d to be %q; got %q", errInfo(), i, j, expKey, key)
+		t.Run(fmt.Sprintf("bound=%d", bound), func(t *testing.T) {
+			for _, key := range []string{"a1", "a2", "a3", "b1", "b2", "c1", "c2", "d1", "f1", "f2", "f3", "g1", "g2", "h1"} {
+				if err := db.Put(ctx, key, "value"); err != nil {
+					t.Fatal(err)
 				}
 			}
-		}
-		if rem != 0 {
-			t.Errorf("expected %d keys, got %d", bound, expCount-rem)
-		}
-		checkResumeSpanDelRangeResults(t, spans, b.Results, expResults, expCount)
-	}
 
+			b := &kv.Batch{}
+			b.Header.MaxSpanRequestKeys = int64(bound)
+			spans := [][]string{{"a", "c"}, {"c", "e"}, {"g", "h"}}
+			for _, span := range spans {
+				b.DelRange(span[0], span[1], true /* returnKeys */)
+			}
+			if err := db.Run(ctx, b); err != nil {
+				t.Fatal(err)
+			}
+
+			require.Equal(t, len(expResultsWithoutBound), len(b.Results))
+
+			expResults := make([][]string, len(expResultsWithoutBound))
+			expSatisfied := make(map[int]struct{})
+			var count int
+		Loop:
+			for i, expRes := range expResultsWithoutBound {
+				for _, key := range expRes {
+					if count == bound {
+						break Loop
+					}
+					expResults[i] = append(expResults[i], key)
+					count++
+				}
+				// NB: only works because requests are sorted and non-overlapping.
+				expSatisfied[i] = struct{}{}
+			}
+
+			checkDelRangeResults(t, spans, b.Results, expResults, expSatisfied)
+		})
+	}
 }
 
-// Test that a bounded DelRange() request that gets terminated at a range
-// boundary uses the range boundary as the start key in the response
-// ResumeSpan.
+// TestMultiRangeBoundedBatchScanPartialResponses runs multiple delete range
+// requests either out-of-order or over overlapping key spans and shows how the
+// batch responses can contain partial responses.
+func TestMultiRangeBoundedBatchDelRangePartialResponses(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, _ := startNoSplitMergeServer(t)
+	ctx := context.TODO()
+	defer s.Stopper().Stop(ctx)
+
+	db := s.DB()
+	if err := setupMultipleRanges(ctx, db, "a", "b", "c", "d", "e", "f"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name         string
+		bound        int64
+		spans        [][]string
+		expResults   [][]string
+		expSatisfied []int
+	}{
+		{
+			name:  "unsorted, non-overlapping, neither satisfied",
+			bound: 6,
+			spans: [][]string{
+				{"b1", "d"}, {"a", "b1"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3"},
+			},
+		},
+		{
+			name:  "unsorted, non-overlapping, first satisfied",
+			bound: 6,
+			spans: [][]string{
+				{"b1", "c"}, {"a", "b1"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3"},
+			},
+			expSatisfied: []int{0},
+		},
+		{
+			name:  "unsorted, non-overlapping, second satisfied",
+			bound: 6,
+			spans: [][]string{
+				{"b1", "d"}, {"a", "b"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3"},
+			},
+			expSatisfied: []int{1},
+		},
+		{
+			name:  "unsorted, non-overlapping, both satisfied",
+			bound: 6,
+			spans: [][]string{
+				{"b1", "c"}, {"a", "b"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3"},
+			},
+			expSatisfied: []int{0, 1},
+		},
+		{
+			// NOTE: the first request will have already deleted the keys, so
+			// the second request has no keys to delete.
+			name:  "sorted, overlapping, neither satisfied",
+			bound: 7,
+			spans: [][]string{
+				{"a", "d"}, {"b", "g"},
+			},
+			expResults: [][]string{
+				{"a1", "a2", "a3", "b1", "b2", "b3", "c1"}, {},
+			},
+		},
+		{
+			name:  "sorted, overlapping, first satisfied",
+			bound: 7,
+			spans: [][]string{
+				{"a", "c"}, {"b", "g"},
+			},
+			expResults: [][]string{
+				{"a1", "a2", "a3", "b1", "b2", "b3"}, {"c1"},
+			},
+			expSatisfied: []int{0},
+		},
+		{
+			name:  "sorted, overlapping, second satisfied",
+			bound: 7,
+			spans: [][]string{
+				{"a", "d"}, {"b", "c"},
+			},
+			expResults: [][]string{
+				{"a1", "a2", "a3", "b1", "b2", "b3", "c1"}, {},
+			},
+			expSatisfied: []int{1},
+		},
+		{
+			name:  "sorted, overlapping, both satisfied",
+			bound: 7,
+			spans: [][]string{
+				{"a", "c"}, {"b", "c"},
+			},
+			expResults: [][]string{
+				{"a1", "a2", "a3", "b1", "b2", "b3"}, {},
+			},
+			expSatisfied: []int{0, 1},
+		},
+		{
+			name:  "unsorted, overlapping, neither satisfied",
+			bound: 7,
+			spans: [][]string{
+				{"b", "g"}, {"a", "d"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3", "c1"}, {"a1", "a2", "a3"},
+			},
+		},
+		{
+			name:  "unsorted, overlapping, first satisfied",
+			bound: 7,
+			spans: [][]string{
+				{"b", "c"}, {"a", "d"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3", "c1"},
+			},
+			expSatisfied: []int{0},
+		},
+		{
+			name:  "unsorted, overlapping, second satisfied",
+			bound: 7,
+			spans: [][]string{
+				{"b", "g"}, {"a", "b2"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3", "c1"}, {"a1", "a2", "a3"},
+			},
+			expSatisfied: []int{1},
+		},
+		{
+			name:  "unsorted, overlapping, both satisfied",
+			bound: 7,
+			spans: [][]string{
+				{"b", "c"}, {"a", "b2"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3"},
+			},
+			expSatisfied: []int{0, 1},
+		},
+		{
+			name:  "unsorted, overlapping, unreached",
+			bound: 6,
+			spans: [][]string{
+				{"b", "g"}, {"c", "f"}, {"a", "d"},
+			},
+			expResults: [][]string{
+				{"b1", "b2", "b3"}, {}, {"a1", "a2", "a3"},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Re-write all keys before each subtest.
+			for _, key := range []string{"a1", "a2", "a3", "b1", "b2", "b3", "c1", "c2", "c3", "d1", "d2", "d3"} {
+				if err := db.Put(ctx, key, "value"); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			b := &kv.Batch{}
+			b.Header.MaxSpanRequestKeys = tc.bound
+			for _, span := range tc.spans {
+				b.DelRange(span[0], span[1], true /* returnKeys */)
+			}
+			if err := db.Run(ctx, b); err != nil {
+				t.Fatal(err)
+			}
+
+			expSatisfied := make(map[int]struct{})
+			for _, exp := range tc.expSatisfied {
+				expSatisfied[exp] = struct{}{}
+			}
+			checkDelRangeResults(t, tc.spans, b.Results, tc.expResults, expSatisfied)
+		})
+	}
+}
+
+// Test that a bounded range delete request that gets terminated at a range
+// boundary uses the range boundary as the start key in the response ResumeSpan.
 func TestMultiRangeBoundedBatchDelRangeBoundary(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _ := startNoSplitMergeServer(t)
@@ -701,7 +1019,6 @@ func TestMultiRangeBoundedBatchDelRangeBoundary(t *testing.T) {
 	if err := setupMultipleRanges(ctx, db, "a", "b"); err != nil {
 		t.Fatal(err)
 	}
-	// Check that a
 	for _, key := range []string{"a1", "a2", "a3", "b1", "b2"} {
 		if err := db.Put(ctx, key, "value"); err != nil {
 			t.Fatal(err)
@@ -732,71 +1049,6 @@ func TestMultiRangeBoundedBatchDelRangeBoundary(t *testing.T) {
 	}
 	if string(b.Results[0].ResumeSpan.Key) != "b2" || string(b.Results[0].ResumeSpan.EndKey) != "c" {
 		t.Fatalf("received ResumeSpan %+v", b.Results[0].ResumeSpan)
-	}
-}
-
-// Tests a batch of bounded DelRange() requests deleting key ranges that
-// overlap.
-func TestMultiRangeBoundedBatchDelRangeOverlappingKeys(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s, _ := startNoSplitMergeServer(t)
-	ctx := context.TODO()
-	defer s.Stopper().Stop(ctx)
-
-	db := s.DB()
-	if err := setupMultipleRanges(ctx, db, "a", "b", "c", "d", "e", "f"); err != nil {
-		t.Fatal(err)
-	}
-
-	expResults := [][]string{
-		{"a1", "a2", "a3", "b1", "b2"},
-		{"b3", "c1", "c2"},
-		{"d1", "f1", "f2"},
-		{"f3"},
-	}
-	maxExpCount := 0
-	for _, res := range expResults {
-		maxExpCount += len(res)
-	}
-
-	for bound := 1; bound <= 20; bound++ {
-		for _, key := range []string{"a1", "a2", "a3", "b1", "b2", "b3", "c1", "c2", "d1", "f1", "f2", "f3"} {
-			if err := db.Put(ctx, key, "value"); err != nil {
-				t.Fatal(err)
-			}
-		}
-
-		b := &kv.Batch{}
-		b.Header.MaxSpanRequestKeys = int64(bound)
-		spans := [][]string{{"a", "b3"}, {"b", "d"}, {"c", "f2a"}, {"f1a", "g"}}
-		for _, span := range spans {
-			b.DelRange(span[0], span[1], true /* returnKeys */)
-		}
-		if err := db.Run(ctx, b); err != nil {
-			t.Fatal(err)
-		}
-
-		if len(expResults) != len(b.Results) {
-			t.Fatalf("bound: %d, only got %d results, wanted %d", bound, len(expResults), len(b.Results))
-		}
-		expCount := maxExpCount
-		if bound < maxExpCount {
-			expCount = bound
-		}
-		rem := expCount
-		for i, res := range b.Results {
-			// Verify that the KeyValue slice contains the given keys.
-			rem -= len(res.Keys)
-			for j, key := range res.Keys {
-				if expKey := expResults[i][j]; string(key) != expKey {
-					t.Errorf("%s: expected scan key %d, %d to be %q; got %q", errInfo(), i, j, expKey, key)
-				}
-			}
-		}
-		if rem != 0 {
-			t.Errorf("expected %d keys, got %d", bound, expCount-rem)
-		}
-		checkResumeSpanDelRangeResults(t, spans, b.Results, expResults, expCount)
 	}
 }
 
@@ -2631,98 +2883,6 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 	}
 }
 
-type pushExpectation int
-
-const (
-	// expectPusheeTxnRecovery means we're expecting transaction recovery to be
-	// performed (after finding a STAGING txn record).
-	expectPusheeTxnRecovery pushExpectation = iota
-	// expectPusheeTxnRecordNotFound means we're expecting the push to not find the
-	// pushee txn record.
-	expectPusheeTxnRecordNotFound
-	// dontExpectAnything means we're not going to check the state in which the
-	// pusher found the pushee's txn record.
-	dontExpectAnything
-)
-
-type expectedTxnResolution int
-
-const (
-	expectAborted expectedTxnResolution = iota
-	expectCommitted
-)
-
-// checkPushResult pushes the specified txn and checks that the pushee's
-// resolution is the expected one.
-func checkPushResult(
-	ctx context.Context,
-	db *kv.DB,
-	txn roachpb.Transaction,
-	expResolution expectedTxnResolution,
-	pushExpectation pushExpectation,
-) error {
-	pushReq := roachpb.PushTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
-			Key: txn.Key,
-		},
-		PusheeTxn: txn.TxnMeta,
-		PushTo:    hlc.Timestamp{},
-		PushType:  roachpb.PUSH_ABORT,
-		// We're going to Force the push in order to not wait for the pushee to
-		// expire.
-		Force: true,
-	}
-	ba := roachpb.BatchRequest{}
-	ba.Add(&pushReq)
-
-	recCtx, collectRec, cancel := tracing.ContextWithRecordingSpan(ctx, "test trace")
-	defer cancel()
-
-	resp, pErr := db.NonTransactionalSender().Send(recCtx, ba)
-	if pErr != nil {
-		return pErr.GoError()
-	}
-
-	var statusErr error
-	pusheeStatus := resp.Responses[0].GetPushTxn().PusheeTxn.Status
-	switch pusheeStatus {
-	case roachpb.ABORTED:
-		if expResolution != expectAborted {
-			statusErr = errors.Errorf("transaction unexpectedly aborted")
-		}
-	case roachpb.COMMITTED:
-		if expResolution != expectCommitted {
-			statusErr = errors.Errorf("transaction unexpectedly committed")
-		}
-	default:
-		return errors.Errorf("unexpected txn status: %s", pusheeStatus)
-	}
-
-	// Verify that we're not fooling ourselves and that checking for the implicit
-	// commit actually caused the txn recovery procedure to run.
-	recording := collectRec()
-	var resolutionErr error
-	switch pushExpectation {
-	case expectPusheeTxnRecovery:
-		expMsg := fmt.Sprintf("recovered txn %s", txn.ID.Short())
-		if _, ok := recording.FindLogMessage(expMsg); !ok {
-			resolutionErr = errors.Errorf(
-				"recovery didn't run as expected (missing \"%s\"). recording: %s",
-				expMsg, recording)
-		}
-	case expectPusheeTxnRecordNotFound:
-		expMsg := "pushee txn record not found"
-		if _, ok := recording.FindLogMessage(expMsg); !ok {
-			resolutionErr = errors.Errorf(
-				"push didn't run as expected (missing \"%s\"). recording: %s",
-				expMsg, recording)
-		}
-	case dontExpectAnything:
-	}
-
-	return errors.CombineErrors(statusErr, resolutionErr)
-}
-
 // Test that, even though at the kvserver level requests are not idempotent
 // across an EndTxn, a TxnCoordSender retry of the final batch after a refresh
 // still works fine. We check that a transaction is not considered implicitly
@@ -2772,7 +2932,7 @@ func TestTxnCoordSenderRetriesAcrossEndTxn(t *testing.T) {
 		// WriteTooOldError on the first attempt.
 		sidePushedOnFirstAttempt    side
 		sideRejectedOnSecondAttempt side
-		txnRecExpectation           pushExpectation
+		txnRecExpectation           kvclientutils.PushExpectation
 	}{
 		{
 			// On the first attempt, the left side succeeds in laying down an intent,
@@ -2799,7 +2959,7 @@ func TestTxnCoordSenderRetriesAcrossEndTxn(t *testing.T) {
 			// EndTxn), but fails. The 2nd attempt of the right side will no longer
 			// contain an EndTxn, as explained above. So we expect the txn record to
 			// not exist.
-			txnRecExpectation: expectPusheeTxnRecordNotFound,
+			txnRecExpectation: kvclientutils.ExpectPusheeTxnRecordNotFound,
 		},
 		{
 			// On the first attempt, the right side succeed in writing a STAGING txn
@@ -2818,7 +2978,7 @@ func TestTxnCoordSenderRetriesAcrossEndTxn(t *testing.T) {
 			sideRejectedOnSecondAttempt: right,
 			// The first attempt of the right side writes a STAGING txn record, so we
 			// expect to perform txn recovery.
-			txnRecExpectation: expectPusheeTxnRecovery,
+			txnRecExpectation: kvclientutils.ExpectPusheeTxnRecovery,
 		},
 	}
 
@@ -2899,7 +3059,9 @@ func TestTxnCoordSenderRetriesAcrossEndTxn(t *testing.T) {
 			})
 
 			require.Error(t, txn.CommitInBatch(ctx, b), "injected")
-			require.NoError(t, checkPushResult(ctx, db, *origTxn, expectAborted, tc.txnRecExpectation))
+			err = kvclientutils.CheckPushResult(
+				ctx, db, *origTxn, kvclientutils.ExpectAborted, tc.txnRecExpectation)
+			require.NoError(t, err)
 		})
 	}
 }

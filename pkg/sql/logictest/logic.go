@@ -36,6 +36,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -414,6 +415,9 @@ type testClusterConfig struct {
 	// to be the binary version.
 	binaryVersion  roachpb.Version
 	disableUpgrade bool
+	// If true, a sql tenant server will be started and pointed at a node in the
+	// cluster. Connections on behalf of the logic test will go to that tenant.
+	useTenant bool
 }
 
 // logicTestConfigs contains all possible cluster configs. A test file can
@@ -446,10 +450,10 @@ var logicTestConfigs = []testClusterConfig{
 		disableUpgrade:      true,
 	},
 	{
-		name:              "local-vec",
+		name:              "local-vec-auto",
 		numNodes:          1,
 		overrideAutoStats: "false",
-		overrideVectorize: "on",
+		overrideVectorize: "201auto",
 	},
 	{
 		name:                "fakedist",
@@ -476,20 +480,20 @@ var logicTestConfigs = []testClusterConfig{
 		overrideVectorize:   "off",
 	},
 	{
-		name:                "fakedist-vec",
+		name:                "fakedist-vec-auto",
 		numNodes:            3,
 		useFakeSpanResolver: true,
 		overrideDistSQLMode: "on",
 		overrideAutoStats:   "false",
-		overrideVectorize:   "on",
+		overrideVectorize:   "201auto",
 	},
 	{
-		name:                "fakedist-vec-disk",
+		name:                "fakedist-vec-auto-disk",
 		numNodes:            3,
 		useFakeSpanResolver: true,
 		overrideDistSQLMode: "on",
 		overrideAutoStats:   "false",
-		overrideVectorize:   "on",
+		overrideVectorize:   "201auto",
 		sqlExecUseDisk:      true,
 		skipShort:           true,
 	},
@@ -518,18 +522,18 @@ var logicTestConfigs = []testClusterConfig{
 		overrideAutoStats:   "false",
 	},
 	{
-		name:                "5node-vec",
+		name:                "5node-vec-auto",
 		numNodes:            5,
 		overrideDistSQLMode: "on",
 		overrideAutoStats:   "false",
-		overrideVectorize:   "on",
+		overrideVectorize:   "201auto",
 	},
 	{
-		name:                "5node-vec-disk",
+		name:                "5node-vec-disk-auto",
 		numNodes:            5,
 		overrideDistSQLMode: "on",
 		overrideAutoStats:   "false",
-		overrideVectorize:   "on",
+		overrideVectorize:   "201auto",
 		sqlExecUseDisk:      true,
 		skipShort:           true,
 	},
@@ -549,6 +553,11 @@ var logicTestConfigs = []testClusterConfig{
 		sqlExecUseDisk:      true,
 		skipShort:           true,
 	},
+	{
+		name:      "3node-tenant",
+		numNodes:  3,
+		useTenant: true,
+	},
 }
 
 func parseTestConfig(names []string) []logicTestConfigIdx {
@@ -564,14 +573,16 @@ func parseTestConfig(names []string) []logicTestConfigIdx {
 }
 
 var (
+	// defaultConfigName is a special alias for the default configs.
+	defaultConfigName  = "default-configs"
 	defaultConfigNames = []string{
 		"local",
 		"local-vec-off",
-		"local-vec",
+		"local-vec-auto",
 		"fakedist",
 		"fakedist-vec-off",
-		"fakedist-vec",
-		"fakedist-vec-disk",
+		"fakedist-vec-auto",
+		"fakedist-vec-auto-disk",
 		"fakedist-metadata",
 		"fakedist-disk",
 	}
@@ -579,8 +590,8 @@ var (
 	fiveNodeDefaultConfigName  = "5node-default-configs"
 	fiveNodeDefaultConfigNames = []string{
 		"5node",
-		"5node-vec",
-		"5node-vec-disk",
+		"5node-vec-auto",
+		"5node-vec-disk-auto",
 		"5node-metadata",
 		"5node-disk",
 	}
@@ -939,6 +950,9 @@ type logicTest struct {
 	// the index of the node (within the cluster) against which we run the test
 	// statements.
 	nodeIdx int
+	// If this test uses a SQL tenant server, this is its address. In this case,
+	// all clients are created against this tenant.
+	tenantAddr string
 	// map of built clients. Needs to be persisted so that we can
 	// re-use them and close them all on exit.
 	clients map[string]*gosql.DB
@@ -981,6 +995,12 @@ type logicTest struct {
 
 	curPath   string
 	curLineNo int
+
+	// randomizedVectorizedBatchSize stores the randomized batch size for
+	// vectorized engine if it is not turned off. The batch size will randomly be
+	// set to 1 with 25% probability, {2, 3} with 25% probability or default batch
+	// size with 50% probability.
+	randomizedVectorizedBatchSize int
 }
 
 func (t *logicTest) t() *testing.T {
@@ -1082,7 +1102,10 @@ func (t *logicTest) setUser(user string) func() {
 		return func() {}
 	}
 
-	addr := t.cluster.Server(t.nodeIdx).ServingSQLAddr()
+	addr := t.tenantAddr
+	if addr == "" {
+		addr = t.cluster.Server(t.nodeIdx).ServingSQLAddr()
+	}
 	pgURL, cleanupFunc := sqlutils.PGUrl(t.rootT, addr, "TestLogic", url.User(user))
 	pgURL.Path = "test"
 
@@ -1092,7 +1115,7 @@ func (t *logicTest) setUser(user string) func() {
 	}
 
 	connector := pq.ConnectorWithNoticeHandler(base, func(notice *pq.Error) {
-		t.noticeBuffer = append(t.noticeBuffer, "NOTICE: "+notice.Message)
+		t.noticeBuffer = append(t.noticeBuffer, notice.Severity+": "+notice.Message)
 		if notice.Detail != "" {
 			t.noticeBuffer = append(t.noticeBuffer, "DETAIL: "+notice.Detail)
 		}
@@ -1206,6 +1229,14 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 		t.cluster.Server(t.nodeIdx).SetDistSQLSpanResolver(fakeResolver)
 	}
 
+	if cfg.useTenant {
+		var err error
+		t.tenantAddr, err = t.cluster.Server(t.nodeIdx).StartTenant()
+		if err != nil {
+			t.rootT.Fatal(err)
+		}
+	}
+
 	if _, err := t.cluster.ServerConn(0).Exec(
 		"SET CLUSTER SETTING sql.stats.automatic_collection.min_stale_rows = $1::int", 5,
 	); err != nil {
@@ -1247,18 +1278,21 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 		); err != nil {
 			t.Fatal(err)
 		}
-	} else {
-		// vectorize is set to 'auto', and we override the vectorize row count
-		// threshold so that all logic tests when run through the vectorized engine
-		// do not pay attention to whether there are stats on the tables. This will
-		// force execution of all queries consisting only of streaming operators to
-		// go through the vectorized engine.
-		if _, err := t.cluster.ServerConn(0).Exec(
-			"SET CLUSTER SETTING sql.defaults.vectorize_row_count_threshold = 0",
-		); err != nil {
-			t.Fatal(err)
-		}
+	}
 
+	// Always override the vectorize row count threshold. This runs all supported
+	// queries (relative to the mode) through the vectorized execution engine.
+	if _, err := t.cluster.ServerConn(0).Exec(
+		"SET CLUSTER SETTING sql.defaults.vectorize_row_count_threshold = 0",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := t.cluster.ServerConn(0).Exec(
+		fmt.Sprintf("SET CLUSTER SETTING sql.testing.vectorize.batch_size to %d",
+			t.randomizedVectorizedBatchSize),
+	); err != nil {
+		t.Fatal(err)
 	}
 
 	if cfg.overrideAutoStats != "" {
@@ -1348,10 +1382,14 @@ func readTestFileConfigs(t *testing.T, path string) []logicTestConfigIdx {
 			for _, configName := range fields[2:] {
 				idx, ok := findLogicTestConfig(configName)
 				if !ok {
-					if configName != fiveNodeDefaultConfigName {
+					switch configName {
+					case defaultConfigName:
+						configs = append(configs, defaultConfig...)
+					case fiveNodeDefaultConfigName:
+						configs = append(configs, fiveNodeDefaultConfig...)
+					default:
 						t.Fatalf("%s: unknown config name %s", path, configName)
 					}
-					configs = append(configs, fiveNodeDefaultConfig...)
 				} else {
 					configs = append(configs, idx)
 				}
@@ -2149,6 +2187,19 @@ func (t *logicTest) execQuery(query logicQuery) error {
 	rows, err := t.db.Query(query.sql)
 	if err == nil {
 		sqlutils.VerifyStatementPrettyRoundtrip(t.t(), query.sql)
+
+		// If expecting an error, then read all result rows, since some errors are
+		// only triggered after initial rows are returned.
+		if query.expectErr != "" {
+			// Break early if error is detected, and be sure to test for error in case
+			// where Next returns false.
+			for rows.Next() {
+				if rows.Err() != nil {
+					break
+				}
+			}
+			err = rows.Err()
+		}
 	}
 	if _, err := t.verifyError(query.sql, query.pos, query.expectErr, query.expectErrCode, err); err != nil {
 		return err
@@ -2478,6 +2529,21 @@ func RunLogicTest(t *testing.T, globs ...string) {
 		}
 	}
 
+	// Determining whether or not to randomize vectorized batch size.
+	rng, _ := randutil.NewPseudoRand()
+	randVal := rng.Float64()
+	randomizedVectorizedBatchSize := coldata.BatchSize()
+	if randVal < 0.25 {
+		randomizedVectorizedBatchSize = 1
+	} else if randVal < 0.375 {
+		randomizedVectorizedBatchSize = 2
+	} else if randVal < 0.5 {
+		randomizedVectorizedBatchSize = 3
+	}
+	if randomizedVectorizedBatchSize != coldata.BatchSize() {
+		t.Log(fmt.Sprintf("randomize batchSize to %d", randomizedVectorizedBatchSize))
+	}
+
 	// The tests below are likely to run concurrently; `log` is shared
 	// between all the goroutines and thus all tests, so it doesn't make
 	// sense to try to use separate `log.Scope` instances for each test.
@@ -2520,10 +2586,11 @@ func RunLogicTest(t *testing.T, globs ...string) {
 					}
 					rng, _ := randutil.NewPseudoRand()
 					lt := logicTest{
-						rootT:           t,
-						verbose:         verbose,
-						perErrorSummary: make(map[string][]string),
-						rng:             rng,
+						rootT:                         t,
+						verbose:                       verbose,
+						perErrorSummary:               make(map[string][]string),
+						rng:                           rng,
+						randomizedVectorizedBatchSize: randomizedVectorizedBatchSize,
 					}
 					if *printErrorSummary {
 						defer lt.printErrorSummary()
@@ -2680,7 +2747,7 @@ func (t *logicTest) Error(args ...interface{}) {
 	if *showSQL {
 		t.outf("\t-- FAIL")
 	}
-	log.Error(context.Background(), "\n", fmt.Sprint(args...))
+	log.Errorf(context.Background(), "\n%s", fmt.Sprint(args...))
 	t.t().Error("\n", fmt.Sprint(args...))
 	t.failures++
 }
@@ -2705,7 +2772,7 @@ func (t *logicTest) Fatal(args ...interface{}) {
 	if *showSQL {
 		fmt.Println()
 	}
-	log.Error(context.Background(), args...)
+	log.Errorf(context.Background(), "%s", fmt.Sprint(args...))
 	t.t().Logf("\n%s:%d: error while processing", t.curPath, t.curLineNo)
 	t.t().Fatal(args...)
 }
@@ -2716,7 +2783,7 @@ func (t *logicTest) Fatalf(format string, args ...interface{}) {
 	if *showSQL {
 		fmt.Println()
 	}
-	log.Error(context.Background(), args...)
+	log.Errorf(context.Background(), format, args...)
 	t.t().Logf("\n%s:%d: error while processing", t.curPath, t.curLineNo)
 	t.t().Fatalf(format, args...)
 }

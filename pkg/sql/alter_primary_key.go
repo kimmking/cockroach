@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -142,7 +143,8 @@ func (p *planner) AlterPrimaryKey(
 	if alterPKNode.Sharded != nil {
 		shardCol, newColumn, err := setupShardedIndex(
 			ctx,
-			p.EvalContext().Settings,
+			p.EvalContext(),
+			&p.semaCtx,
 			p.SessionData().HashShardedIndexesEnabled,
 			&alterPKNode.Columns,
 			alterPKNode.Sharded.ShardBuckets,
@@ -316,8 +318,9 @@ func (p *planner) AlterPrimaryKey(
 
 	// Send a notice to users about the async cleanup jobs.
 	// TODO(knz): Mention the job ID in the client notice.
-	p.SendClientNotice(ctx,
-		pgerror.Noticef(
+	p.SendClientNotice(
+		ctx,
+		pgnotice.Newf(
 			"primary key changes are finalized asynchronously; "+
 				"further schema changes on this table may be restricted until the job completes"),
 	)

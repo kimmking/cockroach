@@ -94,6 +94,7 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 		tbNames, err := phyAccessor.GetObjectNames(
 			ctx,
 			p.txn,
+			p.ExecCfg().Codec,
 			dbDesc,
 			schema,
 			tree.DatabaseListFlags{
@@ -106,8 +107,14 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 		}
 		lookupFlags.Required = false
 		for i := range tbNames {
-			objDesc, err := phyAccessor.GetObjectDesc(ctx, p.txn, p.ExecCfg().Settings,
-				&tbNames[i], tree.ObjectLookupFlags{CommonLookupFlags: lookupFlags})
+			objDesc, err := phyAccessor.GetObjectDesc(
+				ctx,
+				p.txn,
+				p.ExecCfg().Settings,
+				p.ExecCfg().Codec,
+				&tbNames[i],
+				tree.ObjectLookupFlags{CommonLookupFlags: lookupFlags},
+			)
 			if err != nil {
 				return err
 			}
@@ -116,7 +123,7 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 			}
 			tbDesc := objDesc.TableDesc()
 			for _, dependedOn := range tbDesc.DependedOnBy {
-				dependentDesc, err := sqlbase.GetTableDescFromID(ctx, p.txn, dependedOn.ID)
+				dependentDesc, err := sqlbase.GetTableDescFromID(ctx, p.txn, p.ExecCfg().Codec, dependedOn.ID)
 				if err != nil {
 					return err
 				}
@@ -151,11 +158,9 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 							dependentDesc.ID,
 							err,
 						)
-						msg := fmt.Sprintf(
+						return sqlbase.NewDependentObjectErrorf(
 							"cannot rename database because a relation depends on relation %q",
-							tbTableName.String(),
-						)
-						return sqlbase.NewDependentObjectError(msg)
+							tbTableName.String())
 					}
 				} else {
 					dependentDescTableName := tree.MakeTableNameWithSchema(
@@ -165,7 +170,7 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 					)
 					dependentDescQualifiedString = dependentDescTableName.String()
 				}
-				msg := fmt.Sprintf(
+				depErr := sqlbase.NewDependentObjectErrorf(
 					"cannot rename database because relation %q depends on relation %q",
 					dependentDescQualifiedString,
 					tbTableName.String(),
@@ -185,12 +190,12 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 							dbDesc.Name,
 						)
 					}
-					return sqlbase.NewDependentObjectErrorWithHint(msg, hint)
+					return errors.WithHint(depErr, hint)
 				}
 
 				// Otherwise, we default to the view error message.
-				hint := fmt.Sprintf("you can drop %q instead", dependentDescQualifiedString)
-				return sqlbase.NewDependentObjectErrorWithHint(msg, hint)
+				return errors.WithHintf(depErr,
+					"you can drop %q instead", dependentDescQualifiedString)
 			}
 		}
 	}
@@ -238,7 +243,7 @@ func isAllowedDependentDescInRenameDatabase(
 		if err != nil {
 			return false, "", err
 		}
-		typedExpr, err := tree.TypeCheck(parsedExpr, nil, &column.Type)
+		typedExpr, err := tree.TypeCheck(parsedExpr, nil, column.Type)
 		if err != nil {
 			return false, "", err
 		}

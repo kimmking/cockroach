@@ -138,11 +138,12 @@ func storedLeaseExpiration(expiration hlc.Timestamp) tree.DTimestamp {
 // LeaseStore implements the operations for acquiring and releasing leases and
 // publishing a new version of a descriptor. Exported only for testing.
 type LeaseStore struct {
-	nodeIDContainer  *base.NodeIDContainer
+	nodeIDContainer  *base.SQLIDContainer
 	db               *kv.DB
 	clock            *hlc.Clock
 	internalExecutor sqlutil.InternalExecutor
 	settings         *cluster.Settings
+	codec            keys.SQLCodec
 
 	// group is used for all calls made to acquireNodeLease to prevent
 	// concurrent lease acquisitions from the store.
@@ -198,14 +199,14 @@ func (s LeaseStore) acquire(
 			expiration = minExpiration.Add(int64(time.Millisecond), 0)
 		}
 
-		tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
+		tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, s.codec, tableID)
 		if err != nil {
 			return err
 		}
 		if err := FilterTableState(tableDesc); err != nil {
 			return err
 		}
-		if err := tableDesc.MaybeFillInDescriptor(ctx, txn); err != nil {
+		if err := tableDesc.MaybeFillInDescriptor(ctx, txn, s.codec); err != nil {
 			return err
 		}
 		// Once the descriptor is set it is immutable and care must be taken
@@ -228,7 +229,7 @@ func (s LeaseStore) acquire(
 			return err
 		}
 
-		nodeID := s.nodeIDContainer.Get()
+		nodeID := s.nodeIDContainer.SQLInstanceID()
 		if nodeID == 0 {
 			panic("zero nodeID")
 		}
@@ -270,7 +271,7 @@ func (s LeaseStore) release(ctx context.Context, stopper *stop.Stopper, lease *s
 	// NodeUnavailableErrors.
 	for r := retry.Start(retryOptions); r.Next(); {
 		log.VEventf(ctx, 2, "LeaseStore releasing lease %+v", lease)
-		nodeID := s.nodeIDContainer.Get()
+		nodeID := s.nodeIDContainer.SQLInstanceID()
 		if nodeID == 0 {
 			panic("zero nodeID")
 		}
@@ -317,7 +318,7 @@ func (s LeaseStore) WaitForOneVersion(
 		// Get the current version of the table descriptor non-transactionally.
 		//
 		// TODO(pmattis): Do an inconsistent read here?
-		tableDesc, err = sqlbase.GetTableDescFromID(ctx, s.db, tableID)
+		tableDesc, err = sqlbase.GetTableDescFromID(ctx, s.db, s.codec, tableID)
 		if err != nil {
 			return 0, err
 		}
@@ -391,7 +392,7 @@ func (s LeaseStore) PublishMultiple(
 				// Re-read the current versions of the table descriptor, this time
 				// transactionally.
 				var err error
-				descsToUpdate[id], err = sqlbase.GetMutableTableDescFromID(ctx, txn, id)
+				descsToUpdate[id], err = sqlbase.GetMutableTableDescFromID(ctx, txn, s.codec, id)
 				if err != nil {
 					return err
 				}
@@ -435,7 +436,7 @@ func (s LeaseStore) PublishMultiple(
 
 			b := txn.NewBatch()
 			for tableID, tableDesc := range tableDescs {
-				if err := writeDescToBatch(ctx, false /* kvTrace */, s.settings, b, tableID, tableDesc.TableDesc()); err != nil {
+				if err := writeDescToBatch(ctx, false /* kvTrace */, s.settings, b, s.codec, tableID, tableDesc.TableDesc()); err != nil {
 					return err
 				}
 			}
@@ -568,7 +569,7 @@ func (s LeaseStore) getForExpiration(
 ) (*tableVersionState, error) {
 	var table *tableVersionState
 	err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		descKey := sqlbase.MakeDescMetadataKey(id)
+		descKey := sqlbase.MakeDescMetadataKey(s.codec, id)
 		prevTimestamp := expiration.Prev()
 		txn.SetFixedTimestamp(ctx, prevTimestamp)
 		var desc sqlbase.Descriptor
@@ -583,7 +584,7 @@ func (s LeaseStore) getForExpiration(
 		if prevTimestamp.LessEq(tableDesc.ModificationTime) {
 			return errors.AssertionFailedf("unable to read table= (%d, %s)", id, expiration)
 		}
-		if err := tableDesc.MaybeFillInDescriptor(ctx, txn); err != nil {
+		if err := tableDesc.MaybeFillInDescriptor(ctx, txn, s.codec); err != nil {
 			return err
 		}
 		// Create a tableVersionState with the table and without a lease.
@@ -1426,11 +1427,12 @@ const leaseConcurrencyLimit = 5
 // stopper is used to run async tasks. Can be nil in tests.
 func NewLeaseManager(
 	ambientCtx log.AmbientContext,
-	nodeIDContainer *base.NodeIDContainer,
+	nodeIDContainer *base.SQLIDContainer,
 	db *kv.DB,
 	clock *hlc.Clock,
 	internalExecutor sqlutil.InternalExecutor,
 	settings *cluster.Settings,
+	codec keys.SQLCodec,
 	testingKnobs LeaseManagerTestingKnobs,
 	stopper *stop.Stopper,
 	cfg *base.LeaseManagerConfig,
@@ -1442,6 +1444,7 @@ func NewLeaseManager(
 			clock:               clock,
 			internalExecutor:    internalExecutor,
 			settings:            settings,
+			codec:               codec,
 			group:               &singleflight.Group{},
 			leaseDuration:       cfg.TableDescriptorLeaseDuration,
 			leaseJitterFraction: cfg.TableDescriptorLeaseJitterFraction,
@@ -1461,11 +1464,6 @@ func NewLeaseManager(
 
 	lm.draining.Store(false)
 	return lm
-}
-
-// SetInternalExecutor has to be called if a nil execCfg was passed to NewLeaseManager.
-func (m *LeaseManager) SetInternalExecutor(executor sqlutil.InternalExecutor) {
-	m.internalExecutor = executor
 }
 
 func nameMatchesTable(
@@ -1627,7 +1625,7 @@ func (m *LeaseManager) resolveName(
 		txn.SetFixedTimestamp(ctx, timestamp)
 		var found bool
 		var err error
-		found, id, err = sqlbase.LookupObjectID(ctx, txn, dbID, schemaID, tableName)
+		found, id, err = sqlbase.LookupObjectID(ctx, txn, m.codec, dbID, schemaID, tableName)
 		if err != nil {
 			return err
 		}
@@ -1734,7 +1732,12 @@ func (m *LeaseManager) isDraining() bool {
 
 // SetDraining (when called with 'true') removes all inactive leases. Any leases
 // that are active will be removed once the lease's reference count drops to 0.
-func (m *LeaseManager) SetDraining(drain bool) {
+//
+// The reporter callback, if non-nil, is called on a best effort basis
+// to report work that needed to be done and which may or may not have
+// been done by the time this call returns. See the explanation in
+// pkg/server/drain.go for details.
+func (m *LeaseManager) SetDraining(drain bool, reporter func(int, string)) {
 	m.draining.Store(drain)
 	if !drain {
 		return
@@ -1748,6 +1751,10 @@ func (m *LeaseManager) SetDraining(drain bool) {
 		t.mu.Unlock()
 		for _, l := range leases {
 			releaseLease(l, m)
+		}
+		if reporter != nil {
+			// Report progress through the Drain RPC.
+			reporter(len(leases), "table leases")
 		}
 	}
 }
@@ -1769,7 +1776,7 @@ func (m *LeaseManager) findTableState(tableID sqlbase.ID, create bool) *tableSta
 func (m *LeaseManager) RefreshLeases(s *stop.Stopper, db *kv.DB, g *gossip.Gossip) {
 	ctx := context.TODO()
 	s.RunWorker(ctx, func(ctx context.Context) {
-		descKeyPrefix := keys.MakeTablePrefix(uint32(sqlbase.DescriptorTable.ID))
+		descKeyPrefix := m.codec.TablePrefix(uint32(sqlbase.DescriptorTable.ID))
 		cfgFilter := gossip.MakeSystemConfigDeltaFilter(descKeyPrefix)
 		gossipUpdateC := g.RegisterSystemConfigChannel()
 		for {
@@ -1799,7 +1806,7 @@ func (m *LeaseManager) RefreshLeases(s *stop.Stopper, db *kv.DB, g *gossip.Gossi
 						// Note that we don't need to "fill in" the descriptor here. Nobody
 						// actually reads the table, but it's necessary for the call to
 						// ValidateTable().
-						if err := table.MaybeFillInDescriptor(ctx, nil); err != nil {
+						if err := table.MaybeFillInDescriptor(ctx, nil, m.codec); err != nil {
 							log.Warningf(ctx, "%s: unable to fill in table descriptor %v", kv.Key, table)
 							return
 						}
@@ -1916,7 +1923,9 @@ func (m *LeaseManager) DeleteOrphanedLeases(timeThreshold int64) {
 	if m.testingKnobs.DisableDeleteOrphanedLeases {
 		return
 	}
-	nodeID := m.LeaseStore.nodeIDContainer.Get()
+	// TODO(asubiotto): clear up the nodeID naming here and in the table below,
+	// tracked as https://github.com/cockroachdb/cockroach/issues/48271.
+	nodeID := m.LeaseStore.nodeIDContainer.SQLInstanceID()
 	if nodeID == 0 {
 		panic("zero nodeID")
 	}

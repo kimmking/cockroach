@@ -141,9 +141,7 @@ func createTestStoreWithOpts(
 		nodeDesc.NodeID, rpcContext, server, stopper, metric.NewRegistry(), storeCfg.DefaultZoneConfig,
 	)
 	storeCfg.ScanMaxIdleTime = 1 * time.Second
-	stores := kvserver.NewStores(
-		ac, storeCfg.Clock,
-		clusterversion.TestingBinaryVersion, clusterversion.TestingBinaryMinSupportedVersion)
+	stores := kvserver.NewStores(ac, storeCfg.Clock)
 
 	if err := storeCfg.Gossip.SetNodeDescriptor(nodeDesc); err != nil {
 		t.Fatal(err)
@@ -177,8 +175,9 @@ func createTestStoreWithOpts(
 	// TODO(bdarnell): arrange to have the transport closed.
 	ctx := context.Background()
 	if !opts.dontBootstrap {
+		require.NoError(t, kvserver.WriteClusterVersion(ctx, eng, clusterversion.TestingClusterVersion))
 		if err := kvserver.InitEngine(
-			ctx, eng, roachpb.StoreIdent{NodeID: 1, StoreID: 1}, clusterversion.TestingClusterVersion,
+			ctx, eng, roachpb.StoreIdent{NodeID: 1, StoreID: 1},
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -188,7 +187,9 @@ func createTestStoreWithOpts(
 		var kvs []roachpb.KeyValue
 		var splits []roachpb.RKey
 		bootstrapVersion := clusterversion.TestingClusterVersion
-		kvs, tableSplits := sqlbase.MakeMetadataSchema(storeCfg.DefaultZoneConfig, storeCfg.DefaultSystemZoneConfig).GetInitialValues(bootstrapVersion)
+		kvs, tableSplits := sqlbase.MakeMetadataSchema(
+			keys.SystemSQLCodec, storeCfg.DefaultZoneConfig, storeCfg.DefaultSystemZoneConfig,
+		).GetInitialValues(bootstrapVersion)
 		if !opts.dontCreateSystemRanges {
 			splits = config.StaticSplits()
 			splits = append(splits, tableSplits...)
@@ -870,7 +871,7 @@ func (m *multiTestContext) addStore(idx int) {
 	m.populateDB(idx, cfg.Settings, stopper)
 	nlActive, nlRenewal := cfg.NodeLivenessDurations()
 	m.nodeLivenesses[idx] = kvserver.NewNodeLiveness(
-		ambient, m.clocks[idx], m.dbs[idx], m.engines, m.gossips[idx],
+		ambient, m.clocks[idx], m.dbs[idx], m.gossips[idx],
 		nlActive, nlRenewal, cfg.Settings, metric.TestSampleInterval,
 	)
 	m.populateStorePool(idx, cfg, m.nodeLivenesses[idx])
@@ -880,10 +881,11 @@ func (m *multiTestContext) addStore(idx int) {
 
 	ctx := context.Background()
 	if needBootstrap {
+		require.NoError(m.t, kvserver.WriteClusterVersion(ctx, eng, clusterversion.TestingClusterVersion))
 		if err := kvserver.InitEngine(ctx, eng, roachpb.StoreIdent{
 			NodeID:  roachpb.NodeID(idx + 1),
 			StoreID: roachpb.StoreID(idx + 1),
-		}, clusterversion.TestingClusterVersion); err != nil {
+		}); err != nil {
 			m.t.Fatal(err)
 		}
 	}
@@ -891,7 +893,9 @@ func (m *multiTestContext) addStore(idx int) {
 		// Bootstrap the initial range on the first engine.
 		var splits []roachpb.RKey
 		bootstrapVersion := clusterversion.TestingClusterVersion
-		kvs, tableSplits := sqlbase.MakeMetadataSchema(cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig).GetInitialValues(bootstrapVersion)
+		kvs, tableSplits := sqlbase.MakeMetadataSchema(
+			keys.SystemSQLCodec, cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig,
+		).GetInitialValues(bootstrapVersion)
 		if !m.startWithSingleRange {
 			splits = config.StaticSplits()
 			splits = append(splits, tableSplits...)
@@ -914,9 +918,7 @@ func (m *multiTestContext) addStore(idx int) {
 		m.t.Fatal(err)
 	}
 
-	sender := kvserver.NewStores(ambient, clock,
-		clusterversion.TestingBinaryVersion, clusterversion.TestingBinaryMinSupportedVersion,
-	)
+	sender := kvserver.NewStores(ambient, clock)
 	sender.AddStore(store)
 	perReplicaServer := kvserver.MakeServer(&roachpb.NodeDescriptor{NodeID: nodeID}, sender)
 	kvserver.RegisterPerReplicaServer(grpcServer, perReplicaServer)
@@ -972,10 +974,10 @@ func (m *multiTestContext) addStore(idx int) {
 	}{
 		ch: make(chan struct{}),
 	}
-	m.nodeLivenesses[idx].StartHeartbeat(ctx, stopper, func(ctx context.Context) {
+	m.nodeLivenesses[idx].StartHeartbeat(ctx, stopper, m.engines[idx:idx+1], func(ctx context.Context) {
 		now := clock.Now()
 		if err := store.WriteLastUpTimestamp(ctx, now); err != nil {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
 		ran.Do(func() {
 			close(ran.ch)
@@ -1050,7 +1052,7 @@ func (m *multiTestContext) restartStoreWithoutHeartbeat(i int) {
 	m.populateDB(i, m.storeConfig.Settings, stopper)
 	nlActive, nlRenewal := cfg.NodeLivenessDurations()
 	m.nodeLivenesses[i] = kvserver.NewNodeLiveness(
-		log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer}, m.clocks[i], m.dbs[i], m.engines,
+		log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer}, m.clocks[i], m.dbs[i],
 		m.gossips[i], nlActive, nlRenewal, cfg.Settings, metric.TestSampleInterval,
 	)
 	m.populateStorePool(i, cfg, m.nodeLivenesses[i])
@@ -1069,10 +1071,10 @@ func (m *multiTestContext) restartStoreWithoutHeartbeat(i int) {
 	m.transport.GetCircuitBreaker(m.idents[i].NodeID, rpc.DefaultClass).Reset()
 	m.transport.GetCircuitBreaker(m.idents[i].NodeID, rpc.SystemClass).Reset()
 	m.mu.Unlock()
-	cfg.NodeLiveness.StartHeartbeat(ctx, stopper, func(ctx context.Context) {
+	cfg.NodeLiveness.StartHeartbeat(ctx, stopper, m.engines[i:i+1], func(ctx context.Context) {
 		now := m.clocks[i].Now()
 		if err := store.WriteLastUpTimestamp(ctx, now); err != nil {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
 	})
 }
@@ -1198,7 +1200,7 @@ func (m *multiTestContext) changeReplicas(
 		// is lost. We could make a this into a roachpb.Error but it seems overkill
 		// for this one usage.
 		if testutils.IsError(err, "snapshot failed: .*|descriptor changed") {
-			log.Info(ctx, err)
+			log.Infof(ctx, "%v", err)
 			continue
 		}
 		return 0, err

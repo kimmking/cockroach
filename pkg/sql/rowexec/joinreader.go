@@ -82,7 +82,7 @@ type joinReader struct {
 	shouldLimitBatches bool
 
 	input      execinfra.RowSource
-	inputTypes []types.T
+	inputTypes []*types.T
 	// Column indexes in the input stream specifying the columns which match with
 	// the index columns. These are the equality columns of the join.
 	lookupCols []uint32
@@ -205,7 +205,7 @@ func newJoinReader(
 
 	var fetcher row.Fetcher
 	_, _, err = initRowFetcher(
-		&fetcher, &jr.desc, int(spec.IndexIdx), jr.colIdxMap, false, /* reverse */
+		flowCtx, &fetcher, &jr.desc, int(spec.IndexIdx), jr.colIdxMap, false, /* reverse */
 		neededRightCols, false /* isCheck */, &jr.alloc, spec.Visibility, spec.LockingStrength,
 	)
 	if err != nil {
@@ -219,48 +219,34 @@ func newJoinReader(
 		jr.fetcher = &fetcher
 	}
 
-	jr.spanBuilder = span.MakeBuilder(&jr.desc, jr.index)
+	jr.spanBuilder = span.MakeBuilder(flowCtx.Codec(), &jr.desc, jr.index)
 	jr.spanBuilder.SetNeededColumns(jr.neededRightCols())
 
-	// Initialize memory monitors and row container for looked up rows.
-	st := flowCtx.Cfg.Settings
 	ctx := flowCtx.EvalCtx.Ctx()
-	if execinfra.SettingUseTempStorageJoins.Get(&st.SV) {
-		// Limit the memory use by creating a child monitor with a hard limit.
-		// joinReader will overflow to disk if this limit is not enough.
-		limit := execinfra.GetWorkMemLimit(flowCtx.Cfg)
-		if flowCtx.Cfg.TestingKnobs.ForceDiskSpill {
-			limit = 1
-		}
-		jr.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx.Cfg, "joiner-limited")
-		jr.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.Cfg.DiskMonitor, "joinreader-disk")
-		drc := rowcontainer.NewDiskBackedIndexedRowContainer(
-			nil, /* ordering */
-			jr.desc.ColumnTypesWithMutations(returnMutations),
-			jr.EvalCtx,
-			jr.FlowCtx.Cfg.TempStorage,
-			jr.MemMonitor,
-			jr.diskMonitor,
-			0, /* rowCapacity */
-		)
-		if limit < mon.DefaultPoolAllocationSize {
-			// The memory limit is too low for caching, most likely to force disk
-			// spilling for testing.
-			drc.DisableCache = true
-		}
-		jr.lookedUpRows = drc
-	} else {
-		jr.MemMonitor = execinfra.NewMonitor(ctx, flowCtx.EvalCtx.Mon, "joinreader-mem")
-		rc := rowcontainer.MemRowContainer{}
-		rc.InitWithMon(
-			nil, /* ordering */
-			jr.desc.ColumnTypesWithMutations(returnMutations),
-			jr.EvalCtx,
-			jr.MemMonitor,
-			0, /* rowCapacity */
-		)
-		jr.lookedUpRows = &rc
+	// Limit the memory use by creating a child monitor with a hard limit.
+	// joinReader will overflow to disk if this limit is not enough.
+	limit := execinfra.GetWorkMemLimit(flowCtx.Cfg)
+	if flowCtx.Cfg.TestingKnobs.ForceDiskSpill {
+		limit = 1
 	}
+	// Initialize memory monitors and row container for looked up rows.
+	jr.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx.Cfg, "joiner-limited")
+	jr.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.Cfg.DiskMonitor, "joinreader-disk")
+	drc := rowcontainer.NewDiskBackedIndexedRowContainer(
+		nil, /* ordering */
+		jr.desc.ColumnTypesWithMutations(returnMutations),
+		jr.EvalCtx,
+		jr.FlowCtx.Cfg.TempStorage,
+		jr.MemMonitor,
+		jr.diskMonitor,
+		0, /* rowCapacity */
+	)
+	if limit < mon.DefaultPoolAllocationSize {
+		// The memory limit is too low for caching, most likely to force disk
+		// spilling for testing.
+		drc.DisableCache = true
+	}
+	jr.lookedUpRows = drc
 
 	// TODO(radu): verify the input types match the index key types
 	return jr, nil

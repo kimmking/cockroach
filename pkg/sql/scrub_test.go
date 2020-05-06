@@ -54,7 +54,7 @@ INSERT INTO t."tEst" VALUES (10, 20);
 
 	// Construct datums for our row values (k, v).
 	values := []tree.Datum{tree.NewDInt(10), tree.NewDInt(20)}
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "tEst")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "tEst")
 	secondaryIndex := &tableDesc.Indexes[0]
 
 	colIDtoRowIndex := make(map[sqlbase.ColumnID]int)
@@ -64,7 +64,7 @@ INSERT INTO t."tEst" VALUES (10, 20);
 	// Construct the secondary index key that is currently in the
 	// database.
 	secondaryIndexKey, err := sqlbase.EncodeSecondaryIndex(
-		tableDesc, secondaryIndex, colIDtoRowIndex, values, true /* includeEmpty */)
+		keys.SystemSQLCodec, tableDesc, secondaryIndex, colIDtoRowIndex, values, true /* includeEmpty */)
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
@@ -122,7 +122,7 @@ CREATE INDEX secondary ON t.test (v);
 		t.Fatalf("unexpected error: %s", err)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	secondaryIndexDesc := &tableDesc.Indexes[0]
 
 	colIDtoRowIndex := make(map[sqlbase.ColumnID]int)
@@ -132,7 +132,7 @@ CREATE INDEX secondary ON t.test (v);
 	// Construct datums and secondary k/v for our row values (k, v).
 	values := []tree.Datum{tree.NewDInt(10), tree.NewDInt(314)}
 	secondaryIndex, err := sqlbase.EncodeSecondaryIndex(
-		tableDesc, secondaryIndexDesc, colIDtoRowIndex, values, true /* includeEmpty */)
+		keys.SystemSQLCodec, tableDesc, secondaryIndexDesc, colIDtoRowIndex, values, true /* includeEmpty */)
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
@@ -215,7 +215,7 @@ INSERT INTO t.test VALUES (10, 20, 1337);
 		t.Fatalf("unexpected error: %s", err)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	secondaryIndexDesc := &tableDesc.Indexes[0]
 
 	colIDtoRowIndex := make(map[sqlbase.ColumnID]int)
@@ -226,7 +226,7 @@ INSERT INTO t.test VALUES (10, 20, 1337);
 	// Generate the existing secondary index key.
 	values := []tree.Datum{tree.NewDInt(10), tree.NewDInt(20), tree.NewDInt(1337)}
 	secondaryIndex, err := sqlbase.EncodeSecondaryIndex(
-		tableDesc, secondaryIndexDesc, colIDtoRowIndex, values, true /* includeEmpty */)
+		keys.SystemSQLCodec, tableDesc, secondaryIndexDesc, colIDtoRowIndex, values, true /* includeEmpty */)
 
 	if len(secondaryIndex) != 1 {
 		t.Fatalf("expected 1 index entry, got %d. got %#v", len(secondaryIndex), secondaryIndex)
@@ -243,7 +243,7 @@ INSERT INTO t.test VALUES (10, 20, 1337);
 	// Generate a secondary index k/v that has a different value.
 	values = []tree.Datum{tree.NewDInt(10), tree.NewDInt(20), tree.NewDInt(314)}
 	secondaryIndex, err = sqlbase.EncodeSecondaryIndex(
-		tableDesc, secondaryIndexDesc, colIDtoRowIndex, values, true /* includeEmpty */)
+		keys.SystemSQLCodec, tableDesc, secondaryIndexDesc, colIDtoRowIndex, values, true /* includeEmpty */)
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
@@ -334,7 +334,7 @@ INSERT INTO t.test VALUES (10, 2);
 		t.Fatalf("unexpected error: %s", err)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	colIDtoRowIndex := make(map[sqlbase.ColumnID]int)
 	colIDtoRowIndex[tableDesc.Columns[0].ID] = 0
@@ -342,7 +342,8 @@ INSERT INTO t.test VALUES (10, 2);
 
 	// Create the primary index key.
 	values := []tree.Datum{tree.NewDInt(10), tree.NewDInt(2)}
-	primaryIndexKeyPrefix := sqlbase.MakeIndexKeyPrefix(tableDesc, tableDesc.PrimaryIndex.ID)
+	primaryIndexKeyPrefix := sqlbase.MakeIndexKeyPrefix(
+		keys.SystemSQLCodec, tableDesc, tableDesc.PrimaryIndex.ID)
 	primaryIndexKey, _, err := sqlbase.EncodeIndexKey(
 		tableDesc, &tableDesc.PrimaryIndex, colIDtoRowIndex, values, primaryIndexKeyPrefix)
 	if err != nil {
@@ -431,7 +432,7 @@ func TestScrubFKConstraintFKMissing(t *testing.T) {
 		INSERT INTO t.child VALUES (10, 314);
 	`)
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "child")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "child")
 
 	// Construct datums for the child row values (child_id, parent_id).
 	values := []tree.Datum{tree.NewDInt(10), tree.NewDInt(314)}
@@ -444,7 +445,7 @@ func TestScrubFKConstraintFKMissing(t *testing.T) {
 	// Construct the secondary index key entry as it exists in the
 	// database.
 	secondaryIndexKey, err := sqlbase.EncodeSecondaryIndex(
-		tableDesc, secondaryIndex, colIDtoRowIndex, values, true /* includeEmpty */)
+		keys.SystemSQLCodec, tableDesc, secondaryIndex, colIDtoRowIndex, values, true /* includeEmpty */)
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
@@ -464,7 +465,7 @@ func TestScrubFKConstraintFKMissing(t *testing.T) {
 
 	// Construct the new secondary index key that will be inserted.
 	secondaryIndexKey, err = sqlbase.EncodeSecondaryIndex(
-		tableDesc, secondaryIndex, colIDtoRowIndex, values, true /* includeEmpty */)
+		keys.SystemSQLCodec, tableDesc, secondaryIndex, colIDtoRowIndex, values, true /* includeEmpty */)
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
@@ -568,7 +569,7 @@ INSERT INTO t.test VALUES (217, 314);
 		t.Fatalf("unexpected error: %s", err)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Construct datums for our row values (k, v).
 	values := []tree.Datum{tree.NewDInt(217), tree.NewDInt(314)}
@@ -578,7 +579,8 @@ INSERT INTO t.test VALUES (217, 314);
 	colIDtoRowIndex[tableDesc.Columns[1].ID] = 1
 
 	// Create the primary index key
-	primaryIndexKeyPrefix := sqlbase.MakeIndexKeyPrefix(tableDesc, tableDesc.PrimaryIndex.ID)
+	primaryIndexKeyPrefix := sqlbase.MakeIndexKeyPrefix(
+		keys.SystemSQLCodec, tableDesc, tableDesc.PrimaryIndex.ID)
 	primaryIndexKey, _, err := sqlbase.EncodeIndexKey(
 		tableDesc, &tableDesc.PrimaryIndex, colIDtoRowIndex, values, primaryIndexKeyPrefix)
 	if err != nil {
@@ -648,7 +650,7 @@ INSERT INTO t.test VALUES (217, 314, 1337);
 		t.Fatalf("unexpected error: %s", err)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Construct datums for our row values (k, v, b).
 	values := []tree.Datum{tree.NewDInt(217), tree.NewDInt(314), tree.NewDInt(1337)}
@@ -659,7 +661,8 @@ INSERT INTO t.test VALUES (217, 314, 1337);
 	colIDtoRowIndex[tableDesc.Columns[2].ID] = 2
 
 	// Create the primary index key
-	primaryIndexKeyPrefix := sqlbase.MakeIndexKeyPrefix(tableDesc, tableDesc.PrimaryIndex.ID)
+	primaryIndexKeyPrefix := sqlbase.MakeIndexKeyPrefix(
+		keys.SystemSQLCodec, tableDesc, tableDesc.PrimaryIndex.ID)
 	primaryIndexKey, _, err := sqlbase.EncodeIndexKey(
 		tableDesc, &tableDesc.PrimaryIndex, colIDtoRowIndex, values, primaryIndexKeyPrefix)
 	if err != nil {
@@ -745,14 +748,14 @@ CREATE TABLE t.test (
 		t.Fatalf("unexpected error: %s", err)
 	}
 
-	oldTableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	oldTableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Drop the first column family.
 	if _, err := db.Exec(`ALTER TABLE t.test DROP COLUMN v1`); err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Construct datums for our row values (k, v1).
 	values := []tree.Datum{tree.NewDInt(217), tree.NewDInt(314)}
@@ -762,7 +765,8 @@ CREATE TABLE t.test (
 	colIDtoRowIndex[tableDesc.Columns[1].ID] = 1
 
 	// Create the primary index key
-	primaryIndexKeyPrefix := sqlbase.MakeIndexKeyPrefix(tableDesc, tableDesc.PrimaryIndex.ID)
+	primaryIndexKeyPrefix := sqlbase.MakeIndexKeyPrefix(
+		keys.SystemSQLCodec, tableDesc, tableDesc.PrimaryIndex.ID)
 	primaryIndexKey, _, err := sqlbase.EncodeIndexKey(
 		tableDesc, &tableDesc.PrimaryIndex, colIDtoRowIndex, values, primaryIndexKeyPrefix)
 	if err != nil {
@@ -854,7 +858,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v1 INT, v2 INT);
 `); err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Construct datums for our row values (k, v1, v2).
 	values := []tree.Datum{tree.NewDInt(217), tree.NewDInt(314), tree.NewDInt(1337)}
@@ -865,7 +869,8 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v1 INT, v2 INT);
 	colIDtoRowIndex[tableDesc.Columns[2].ID] = 2
 
 	// Create the primary index key
-	primaryIndexKeyPrefix := sqlbase.MakeIndexKeyPrefix(tableDesc, tableDesc.PrimaryIndex.ID)
+	primaryIndexKeyPrefix := sqlbase.MakeIndexKeyPrefix(
+		keys.SystemSQLCodec, tableDesc, tableDesc.PrimaryIndex.ID)
 	primaryIndexKey, _, err := sqlbase.EncodeIndexKey(
 		tableDesc, &tableDesc.PrimaryIndex, colIDtoRowIndex, values, primaryIndexKeyPrefix)
 	if err != nil {

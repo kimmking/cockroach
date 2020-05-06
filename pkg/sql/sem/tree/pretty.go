@@ -621,9 +621,16 @@ func (node *With) docRow(p *PrettyCfg) pretty.TableRow {
 	}
 	d := make([]pretty.Doc, len(node.CTEList))
 	for i, cte := range node.CTEList {
+		asString := "AS"
+		if cte.Mtr.Set {
+			if !cte.Mtr.Materialize {
+				asString += " NOT"
+			}
+			asString += " MATERIALIZED"
+		}
 		d[i] = p.nestUnder(
 			p.Doc(&cte.Name),
-			p.bracketKeyword("AS", " (", p.Doc(cte.Stmt), ")", ""),
+			p.bracketKeyword(asString, " (", p.Doc(cte.Stmt), ")", ""),
 		)
 	}
 	kw := "WITH"
@@ -979,10 +986,12 @@ func (node *CastExpr) doc(p *PrettyCfg) pretty.Doc {
 		}
 		fallthrough
 	case CastShort:
-		switch node.Type.Family() {
-		case types.JsonFamily:
-			if sv, ok := node.Expr.(*StrVal); ok && p.JSONFmt {
-				return p.jsonCast(sv, "::", node.Type)
+		if typ, ok := GetStaticallyKnownType(node.Type); ok {
+			switch typ.Family() {
+			case types.JsonFamily:
+				if sv, ok := node.Expr.(*StrVal); ok && p.JSONFmt {
+					return p.jsonCast(sv, "::", typ)
+				}
 			}
 		}
 		return pretty.Fold(pretty.Concat,
@@ -991,15 +1000,15 @@ func (node *CastExpr) doc(p *PrettyCfg) pretty.Doc {
 			typ,
 		)
 	default:
-		if node.Type.Family() == types.CollatedStringFamily {
+		if nTyp, ok := GetStaticallyKnownType(node.Type); ok && nTyp.Family() == types.CollatedStringFamily {
 			// COLLATE clause needs to go after CAST expression, so create
 			// equivalent string type without the locale to get name of string
 			// type without the COLLATE.
 			strTyp := types.MakeScalar(
 				types.StringFamily,
-				node.Type.Oid(),
-				node.Type.Precision(),
-				node.Type.Width(),
+				nTyp.Oid(),
+				nTyp.Precision(),
+				nTyp.Width(),
 				"", /* locale */
 			)
 			typ = pretty.Text(strTyp.SQLString())
@@ -1020,11 +1029,11 @@ func (node *CastExpr) doc(p *PrettyCfg) pretty.Doc {
 			),
 		)
 
-		if node.Type.Family() == types.CollatedStringFamily {
+		if nTyp, ok := GetStaticallyKnownType(node.Type); ok && nTyp.Family() == types.CollatedStringFamily {
 			ret = pretty.Fold(pretty.ConcatSpace,
 				ret,
 				pretty.Keyword("COLLATE"),
-				pretty.Text(node.Type.Locale()))
+				pretty.Text(nTyp.Locale()))
 		}
 		return ret
 	}
@@ -1229,6 +1238,9 @@ func (node *CreateView) doc(p *PrettyCfg) pretty.Doc {
 	//     SELECT ...
 	//
 	title := pretty.Keyword("CREATE")
+	if node.Replace {
+		title = pretty.ConcatSpace(title, pretty.Keyword("OR REPLACE"))
+	}
 	if node.Temporary {
 		title = pretty.ConcatSpace(title, pretty.Keyword("TEMPORARY"))
 	}
@@ -1542,6 +1554,20 @@ func (node *FamilyTableDef) doc(p *PrettyCfg) pretty.Doc {
 		d = pretty.ConcatSpace(d, p.Doc(&node.Name))
 	}
 	return pretty.ConcatSpace(d, p.bracket("(", p.Doc(&node.Columns), ")"))
+}
+
+func (node *LikeTableDef) doc(p *PrettyCfg) pretty.Doc {
+	d := pretty.Keyword("LIKE")
+	d = pretty.ConcatSpace(d, p.Doc(&node.Name))
+	for _, opt := range node.Options {
+		word := "INCLUDING"
+		if opt.Excluded {
+			word = "EXCLUDING"
+		}
+		d = pretty.ConcatSpace(d, pretty.Keyword(word))
+		d = pretty.ConcatSpace(d, pretty.Keyword(opt.Opt.String()))
+	}
+	return d
 }
 
 func (node *IndexElem) doc(p *PrettyCfg) pretty.Doc {
@@ -2135,10 +2161,12 @@ func (node *Execute) docTable(p *PrettyCfg) []pretty.TableRow {
 
 func (node *AnnotateTypeExpr) doc(p *PrettyCfg) pretty.Doc {
 	if node.SyntaxMode == AnnotateShort {
-		switch node.Type.Family() {
-		case types.JsonFamily:
-			if sv, ok := node.Expr.(*StrVal); ok && p.JSONFmt {
-				return p.jsonCast(sv, ":::", node.Type)
+		if typ, ok := GetStaticallyKnownType(node.Type); ok {
+			switch typ.Family() {
+			case types.JsonFamily:
+				if sv, ok := node.Expr.(*StrVal); ok && p.JSONFmt {
+					return p.jsonCast(sv, ":::", typ)
+				}
 			}
 		}
 	}

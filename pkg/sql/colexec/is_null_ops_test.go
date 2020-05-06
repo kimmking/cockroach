@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -82,34 +83,15 @@ func TestIsNullProjOp(t *testing.T) {
 
 	for _, c := range testCases {
 		t.Run(c.desc, func(t *testing.T) {
-			opConstructor := func(input []Operator) (Operator, error) {
+			opConstructor := func(input []colexecbase.Operator) (colexecbase.Operator, error) {
 				projExpr := "IS NULL"
 				if c.negate {
 					projExpr = "IS NOT NULL"
 				}
-				spec := &execinfrapb.ProcessorSpec{
-					Input: []execinfrapb.InputSyncSpec{{ColumnTypes: []types.T{*types.Int}}},
-					Core: execinfrapb.ProcessorCoreUnion{
-						Noop: &execinfrapb.NoopCoreSpec{},
-					},
-					Post: execinfrapb.PostProcessSpec{
-						RenderExprs: []execinfrapb.Expression{
-							{Expr: "@1"},
-							{Expr: fmt.Sprintf("@1 %s", projExpr)},
-						},
-					},
-				}
-				args := NewColOperatorArgs{
-					Spec:                spec,
-					Inputs:              input,
-					StreamingMemAccount: testMemAcc,
-				}
-				args.TestingKnobs.UseStreamingMemAccountForBuffering = true
-				result, err := NewColOperator(ctx, flowCtx, args)
-				if err != nil {
-					return nil, err
-				}
-				return result.Op, nil
+				return createTestProjectingOperator(
+					ctx, flowCtx, input[0], []*types.T{types.Int},
+					fmt.Sprintf("@1 %s", projExpr), false, /* canFallbackToRowexec */
+				)
 			}
 			runTests(t, []tuples{c.inputTuples}, c.outputTuples, orderedVerifier, opConstructor)
 		})
@@ -175,13 +157,13 @@ func TestIsNullSelOp(t *testing.T) {
 
 	for _, c := range testCases {
 		t.Run(c.desc, func(t *testing.T) {
-			opConstructor := func(input []Operator) (Operator, error) {
+			opConstructor := func(input []colexecbase.Operator) (colexecbase.Operator, error) {
 				selExpr := "IS NULL"
 				if c.negate {
 					selExpr = "IS NOT NULL"
 				}
 				spec := &execinfrapb.ProcessorSpec{
-					Input: []execinfrapb.InputSyncSpec{{ColumnTypes: []types.T{*types.Int}}},
+					Input: []execinfrapb.InputSyncSpec{{ColumnTypes: []*types.T{types.Int}}},
 					Core: execinfrapb.ProcessorCoreUnion{
 						Noop: &execinfrapb.NoopCoreSpec{},
 					},

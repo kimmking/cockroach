@@ -35,7 +35,7 @@ type distinct struct {
 	execinfra.ProcessorBase
 
 	input            execinfra.RowSource
-	types            []types.T
+	types            []*types.T
 	haveLastGroupKey bool
 	lastGroupKey     sqlbase.EncDatumRow
 	arena            stringarena.Arena
@@ -166,7 +166,7 @@ func (d *distinct) matchLastGroupKey(row sqlbase.EncDatumRow) (bool, error) {
 	}
 	for _, colIdx := range d.orderedCols {
 		res, err := d.lastGroupKey[colIdx].Compare(
-			&d.types[colIdx], &d.datumAlloc, d.EvalCtx, &row[colIdx],
+			d.types[colIdx], &d.datumAlloc, d.EvalCtx, &row[colIdx],
 		)
 		if res != 0 || err != nil {
 			return false, err
@@ -196,7 +196,7 @@ func (d *distinct) encode(appendTo []byte, row sqlbase.EncDatumRow) ([]byte, err
 			continue
 		}
 
-		appendTo, err = datum.Fingerprint(&d.types[i], &d.datumAlloc, appendTo)
+		appendTo, err = datum.Fingerprint(d.types[i], &d.datumAlloc, appendTo)
 		if err != nil {
 			return nil, err
 		}
@@ -275,8 +275,15 @@ func (d *distinct) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadata) {
 		// Check whether row is distinct.
 		if _, ok := d.seen[string(encoding)]; ok {
 			if d.errorOnDup != "" {
-				// Row is a duplicate input to an Upsert operation, so raise an error.
-				err = pgerror.Newf(pgcode.CardinalityViolation, d.errorOnDup)
+				// Row is a duplicate input to an Upsert operation, so raise
+				// an error.
+				//
+				// TODO(knz): errorOnDup could be passed via log.Safe() if
+				// there was a guarantee that it does not contain PII. Or
+				// better yet, the caller would construct an `error` object to
+				// return here instead of a string.
+				// See: https://github.com/cockroachdb/cockroach/issues/48166
+				err = pgerror.Newf(pgcode.CardinalityViolation, "%s", d.errorOnDup)
 				d.MoveToDraining(err)
 				break
 			}
@@ -321,7 +328,9 @@ func (d *sortedDistinct) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetad
 		if matched {
 			if d.errorOnDup != "" {
 				// Row is a duplicate input to an Upsert operation, so raise an error.
-				err = pgerror.Newf(pgcode.CardinalityViolation, d.errorOnDup)
+				// TODO(knz): errorOnDup could be passed via log.Safe() if
+				// there was a guarantee that it does not contain PII.
+				err = pgerror.Newf(pgcode.CardinalityViolation, "%s", d.errorOnDup)
 				d.MoveToDraining(err)
 				break
 			}

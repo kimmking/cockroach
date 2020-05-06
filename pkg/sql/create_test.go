@@ -20,7 +20,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -51,7 +50,7 @@ func TestDatabaseDescriptor(t *testing.T) {
 	}
 
 	// Database name.
-	nameKey := sqlbase.NewDatabaseKey("test").Key()
+	nameKey := sqlbase.NewDatabaseKey("test").Key(keys.SystemSQLCodec)
 	if gr, err := kvDB.Get(ctx, nameKey); err != nil {
 		t.Fatal(err)
 	} else if gr.Exists() {
@@ -59,7 +58,7 @@ func TestDatabaseDescriptor(t *testing.T) {
 	}
 
 	// Write a descriptor key that will interfere with database creation.
-	dbDescKey := sqlbase.MakeDescMetadataKey(sqlbase.ID(expectedCounter))
+	dbDescKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(expectedCounter))
 	dbDesc := &sqlbase.Descriptor{
 		Union: &sqlbase.Descriptor_Database{
 			Database: &sqlbase.DatabaseDescriptor{
@@ -88,11 +87,13 @@ func TestDatabaseDescriptor(t *testing.T) {
 		t.Fatalf("expected descriptor ID == %d, got %d", expectedCounter, actual)
 	}
 
-	start := roachpb.Key(keys.MakeTablePrefix(uint32(keys.NamespaceTableID)))
+	start := keys.SystemSQLCodec.TablePrefix(uint32(keys.NamespaceTableID))
 	if kvs, err := kvDB.Scan(ctx, start, start.PrefixEnd(), 0 /* maxRows */); err != nil {
 		t.Fatal(err)
 	} else {
-		descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(ctx, kvDB, &s.(*server.TestServer).Cfg.DefaultZoneConfig, &s.(*server.TestServer).Cfg.DefaultSystemZoneConfig)
+		descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(
+			ctx, kvDB, keys.SystemSQLCodec, &s.(*server.TestServer).Cfg.DefaultZoneConfig, &s.(*server.TestServer).Cfg.DefaultSystemZoneConfig,
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -112,7 +113,7 @@ func TestDatabaseDescriptor(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbDescKey = sqlbase.MakeDescMetadataKey(sqlbase.ID(expectedCounter))
+	dbDescKey = sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(expectedCounter))
 	if _, err := sqlDB.Exec(`CREATE DATABASE test`); err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +230,7 @@ func verifyTables(
 		count++
 		tableName := fmt.Sprintf("table_%d", id)
 		kvDB := tc.Servers[count%tc.NumServers()].DB()
-		tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", tableName)
+		tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", tableName)
 		if tableDesc.ID < descIDStart {
 			t.Fatalf(
 				"table %s's ID %d is too small. Expected >= %d",
@@ -261,7 +262,7 @@ func verifyTables(
 		if _, ok := tableIDs[id]; ok {
 			continue
 		}
-		descKey := sqlbase.MakeDescMetadataKey(id)
+		descKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, id)
 		desc := &sqlbase.Descriptor{}
 		if err := kvDB.GetProto(context.TODO(), descKey, desc); err != nil {
 			t.Fatal(err)

@@ -258,7 +258,7 @@ func (m *managerImpl) HandleWriterIntentError(
 		intent := &t.Intents[i]
 		added, err := m.lt.AddDiscoveredLock(intent, g.ltg)
 		if err != nil {
-			log.Fatal(ctx, errors.HandleAsAssertionFailure(err))
+			log.Fatalf(ctx, "%v", errors.HandleAsAssertionFailure(err))
 		}
 		if !added {
 			wait = true
@@ -303,16 +303,16 @@ func (m *managerImpl) HandleTransactionPushError(
 }
 
 // OnLockAcquired implements the LockManager interface.
-func (m *managerImpl) OnLockAcquired(ctx context.Context, up *roachpb.LockUpdate) {
-	if err := m.lt.AcquireLock(&up.Txn, up.Key, lock.Exclusive, up.Durability); err != nil {
-		log.Fatal(ctx, errors.HandleAsAssertionFailure(err))
+func (m *managerImpl) OnLockAcquired(ctx context.Context, acq *roachpb.LockAcquisition) {
+	if err := m.lt.AcquireLock(&acq.Txn, acq.Key, lock.Exclusive, acq.Durability); err != nil {
+		log.Fatalf(ctx, "%v", errors.HandleAsAssertionFailure(err))
 	}
 }
 
 // OnLockUpdated implements the LockManager interface.
 func (m *managerImpl) OnLockUpdated(ctx context.Context, up *roachpb.LockUpdate) {
 	if err := m.lt.UpdateLocks(up); err != nil {
-		log.Fatal(ctx, errors.HandleAsAssertionFailure(err))
+		log.Fatalf(ctx, "%v", errors.HandleAsAssertionFailure(err))
 	}
 }
 

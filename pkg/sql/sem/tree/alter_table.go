@@ -15,7 +15,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // AlterTable represents an ALTER TABLE statement.
@@ -161,6 +160,26 @@ func (node *AlterTable) HoistAddColumnConstraints() {
 				)
 			}
 			d.CheckExprs = nil
+			if d.HasFKConstraint() {
+				var targetCol NameList
+				if d.References.Col != "" {
+					targetCol = append(targetCol, d.References.Col)
+				}
+				fk := &ForeignKeyConstraintTableDef{
+					Table:    *d.References.Table,
+					FromCols: NameList{d.Name},
+					ToCols:   targetCol,
+					Name:     d.References.ConstraintName,
+					Actions:  d.References.Actions,
+					Match:    d.References.Match,
+				}
+				constraint := &AlterTableAddConstraint{
+					ConstraintDef:      fk,
+					ValidationBehavior: ValidationDefault,
+				}
+				normalizedCmds = append(normalizedCmds, constraint)
+				d.References.Table = nil
+			}
 		}
 	}
 	node.Cmds = normalizedCmds
@@ -200,7 +219,7 @@ func (node *AlterTableAddConstraint) Format(ctx *FmtCtx) {
 type AlterTableAlterColumnType struct {
 	Collation string
 	Column    Name
-	ToType    *types.T
+	ToType    ResolvableTypeReference
 	Using     Expr
 }
 

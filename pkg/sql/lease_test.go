@@ -34,6 +34,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -195,8 +197,9 @@ func (t *leaseTest) mustPublish(ctx context.Context, nodeID uint32, descID sqlba
 func (t *leaseTest) node(nodeID uint32) *sql.LeaseManager {
 	mgr := t.nodes[nodeID]
 	if mgr == nil {
-		nc := &base.NodeIDContainer{}
-		nc.Set(context.TODO(), roachpb.NodeID(nodeID))
+		var c base.NodeIDContainer
+		c.Set(context.Background(), roachpb.NodeID(nodeID))
+		nc := base.NewSQLIDContainer(0, &c, true /* exposed*/)
 		// Hack the ExecutorConfig that we pass to the LeaseManager to have a
 		// different node id.
 		cfgCpy := t.server.ExecutorConfig().(sql.ExecutorConfig)
@@ -208,6 +211,7 @@ func (t *leaseTest) node(nodeID uint32) *sql.LeaseManager {
 			cfgCpy.Clock,
 			cfgCpy.InternalExecutor,
 			cfgCpy.Settings,
+			cfgCpy.Codec,
 			t.leaseManagerTestingKnobs,
 			t.server.Stopper(),
 			t.cfg,
@@ -480,8 +484,8 @@ func TestLeaseManagerDrain(testingT *testing.T) {
 		// starts draining.
 		l1RemovalTracker := leaseRemovalTracker.TrackRemoval(l1)
 
-		t.nodes[1].SetDraining(true)
-		t.nodes[2].SetDraining(true)
+		t.nodes[1].SetDraining(true, nil /* reporter */)
+		t.nodes[2].SetDraining(true, nil /* reporter */)
 
 		// Leases cannot be acquired when in draining mode.
 		if _, _, err := t.acquire(1, descID); !testutils.IsError(err, "cannot acquire lease when draining") {
@@ -504,7 +508,7 @@ func TestLeaseManagerDrain(testingT *testing.T) {
 	{
 		// Check that leases with a refcount of 0 are correctly kept in the
 		// store once the drain mode has been exited.
-		t.nodes[1].SetDraining(false)
+		t.nodes[1].SetDraining(false, nil /* reporter */)
 		l1, _ := t.mustAcquire(1, descID)
 		t.mustRelease(1, l1, nil)
 		t.expectLeases(descID, "/1/1")
@@ -528,7 +532,7 @@ func TestCantLeaseDeletedTable(testingT *testing.T) {
 			},
 		},
 		// Disable GC job.
-		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func() { select {} }},
+		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ int64) error { select {} }},
 	}
 
 	t := newLeaseTest(testingT, params)
@@ -556,7 +560,7 @@ CREATE TABLE test.t(a INT PRIMARY KEY);
 	}
 
 	// Make sure we can't get a lease on the descriptor.
-	tableDesc := sqlbase.GetTableDescriptor(t.kvDB, "test", "t")
+	tableDesc := sqlbase.GetTableDescriptor(t.kvDB, keys.SystemSQLCodec, "test", "t")
 	// try to acquire at a bogus version to make sure we don't get back a lease we
 	// already had.
 	_, _, err = t.acquireMinVersion(1, tableDesc.ID, tableDesc.Version+1)
@@ -566,7 +570,7 @@ CREATE TABLE test.t(a INT PRIMARY KEY);
 }
 
 func isDeleted(tableID sqlbase.ID, cfg *config.SystemConfig) bool {
-	descKey := sqlbase.MakeDescMetadataKey(tableID)
+	descKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, tableID)
 	val := cfg.GetValue(descKey)
 	if val == nil {
 		return false
@@ -619,7 +623,7 @@ func TestLeasesOnDeletedTableAreReleasedImmediately(t *testing.T) {
 			},
 		},
 		// Disable GC job.
-		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func() { select {} }},
+		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ int64) error { select {} }},
 	}
 	s, db, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
@@ -633,7 +637,7 @@ CREATE TABLE test.t(a INT PRIMARY KEY);
 		t.Fatal(err)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 	ctx := context.TODO()
 
 	lease1, _, err := acquire(ctx, s.(*server.TestServer), tableDesc.ID)
@@ -732,7 +736,7 @@ CREATE TABLE t.foo (v INT);
 		t.Fatalf("CREATE TABLE has acquired a lease: got %d, expected 0", atomic.LoadInt32(&fooAcquiredCount))
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "foo")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "foo")
 	atomic.StoreInt64(&tableID, int64(tableDesc.ID))
 
 	if _, err := sqlDB.Exec(`
@@ -859,7 +863,7 @@ CREATE TABLE t.foo (v INT);
 		t.Fatalf("CREATE TABLE has acquired a descriptor")
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "foo")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "foo")
 	atomic.StoreInt64(&tableID, int64(tableDesc.ID))
 
 	tx, err := sqlDB.Begin()
@@ -924,7 +928,7 @@ INSERT INTO t.kv VALUES ('a', 'b');
 `); err != nil {
 		t.Fatal(err)
 	}
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
 
 	// A read-write transaction that uses the old version of the descriptor.
 	txReadWrite, err := sqlDB.Begin()
@@ -1084,7 +1088,7 @@ INSERT INTO t.kv VALUES ('a', 'b');
 		t.Fatal(err)
 	}
 
-	tableSpan := tableDesc.TableSpan()
+	tableSpan := tableDesc.TableSpan(keys.SystemSQLCodec)
 	tests.CheckKeyCount(t, kvDB, tableSpan, 4)
 
 	// Allow async schema change waiting for GC to complete (when dropping an
@@ -1094,7 +1098,7 @@ INSERT INTO t.kv VALUES ('a', 'b');
 	}
 
 	testutils.SucceedsSoon(t, func() error {
-		if tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv"); len(tableDesc.GCMutations) != 0 {
+		if tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv"); len(tableDesc.GCMutations) != 0 {
 			return errors.Errorf("%d gc mutations remaining", len(tableDesc.GCMutations))
 		}
 		return nil
@@ -1142,7 +1146,7 @@ COMMIT;
 		t.Fatal(err)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
 
 	tx, err := sqlDB.Begin()
 	if err != nil {
@@ -1204,7 +1208,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(t.kvDB, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(t.kvDB, keys.SystemSQLCodec, "t", "test")
 	dbID := tableDesc.ParentID
 	tableName := tableDesc.Name
 	leaseManager := t.node(1)
@@ -1288,8 +1292,8 @@ CREATE TABLE t.test2 ();
 		t.Fatal(err)
 	}
 
-	test1Desc := sqlbase.GetTableDescriptor(t.kvDB, "t", "test1")
-	test2Desc := sqlbase.GetTableDescriptor(t.kvDB, "t", "test2")
+	test1Desc := sqlbase.GetTableDescriptor(t.kvDB, keys.SystemSQLCodec, "t", "test1")
+	test2Desc := sqlbase.GetTableDescriptor(t.kvDB, keys.SystemSQLCodec, "t", "test2")
 	dbID := test2Desc.ParentID
 
 	// Acquire a lease on test1 by name.
@@ -1422,7 +1426,7 @@ CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
 	if tableDesc.Version != 1 {
 		t.Fatalf("invalid version %d", tableDesc.Version)
 	}
@@ -1443,7 +1447,7 @@ CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR);
 	}
 
 	// The first schema change will succeed and increment the version.
-	tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "kv")
+	tableDesc = sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
 	if tableDesc.Version != 2 {
 		t.Fatalf("invalid version %d", tableDesc.Version)
 	}
@@ -1473,7 +1477,7 @@ CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR);
 	// the table descriptor. If the schema change transaction
 	// doesn't rollback the transaction this descriptor read will
 	// hang.
-	tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "kv")
+	tableDesc = sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
 	if tableDesc.Version != 2 {
 		t.Fatalf("invalid version %d", tableDesc.Version)
 	}
@@ -1484,7 +1488,7 @@ CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR);
 	}
 
 	wg.Wait()
-	tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "kv")
+	tableDesc = sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
 	if tableDesc.Version != 3 {
 		t.Fatalf("invalid version %d", tableDesc.Version)
 	}
@@ -1525,7 +1529,7 @@ INSERT INTO t.kv VALUES ('a', 'b');
 		t.Fatal(err)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
 	if tableDesc.Version != 1 {
 		t.Fatalf("invalid version %d", tableDesc.Version)
 	}
@@ -1664,7 +1668,7 @@ CREATE TABLE t.test0 (k CHAR PRIMARY KEY, v CHAR);
 			txn.SetFixedTimestamp(ctx, table.ModificationTime)
 
 			// Look up the descriptor.
-			descKey := sqlbase.MakeDescMetadataKey(descID)
+			descKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, descID)
 			dbDesc := &sqlbase.Descriptor{}
 			ts, err := txn.GetProtoTs(ctx, descKey, dbDesc)
 			if err != nil {
@@ -1745,8 +1749,8 @@ CREATE TABLE t.test2 ();
 		t.Fatal(err)
 	}
 
-	test1Desc := sqlbase.GetTableDescriptor(t.kvDB, "t", "test2")
-	test2Desc := sqlbase.GetTableDescriptor(t.kvDB, "t", "test2")
+	test1Desc := sqlbase.GetTableDescriptor(t.kvDB, keys.SystemSQLCodec, "t", "test2")
+	test2Desc := sqlbase.GetTableDescriptor(t.kvDB, keys.SystemSQLCodec, "t", "test2")
 	dbID := test2Desc.ParentID
 
 	atomic.StoreInt32(&testAcquisitionBlockCount, 0)
@@ -1942,8 +1946,8 @@ CREATE TABLE t.after (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	beforeDesc := sqlbase.GetTableDescriptor(t.kvDB, "t", "before")
-	afterDesc := sqlbase.GetTableDescriptor(t.kvDB, "t", "after")
+	beforeDesc := sqlbase.GetTableDescriptor(t.kvDB, keys.SystemSQLCodec, "t", "before")
+	afterDesc := sqlbase.GetTableDescriptor(t.kvDB, keys.SystemSQLCodec, "t", "after")
 	dbID := beforeDesc.ParentID
 
 	// Acquire a lease on "before" by name.
@@ -2082,4 +2086,75 @@ func TestLeaseAcquisitionByNameDoesntBlock(t *testing.T) {
 
 	// Wait for the schema change to finish.
 	require.NoError(t, <-schemaCh)
+}
+
+// TestIntentOnSystemConfigDoesNotPreventSchemaChange tests that failures to
+// gossip the system config due to intents are rectified when later intents
+// are aborted.
+func TestIntentOnSystemConfigDoesNotPreventSchemaChange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(ctx)
+
+	db := tc.ServerConn(0)
+	tdb := sqlutils.MakeSQLRunner(db)
+	tdb.Exec(t, "CREATE TABLE foo (i INT PRIMARY KEY)")
+
+	connA, err := db.Conn(ctx)
+	require.NoError(t, err)
+	connB, err := db.Conn(ctx)
+	require.NoError(t, err)
+
+	txA, err := connA.BeginTx(ctx, &gosql.TxOptions{})
+	require.NoError(t, err)
+	txB, err := connB.BeginTx(ctx, &gosql.TxOptions{})
+	require.NoError(t, err)
+
+	// Lay down an intent on the system config span.
+	_, err = txA.Exec("CREATE TABLE bar (i INT PRIMARY KEY)")
+	require.NoError(t, err)
+
+	_, err = txB.Exec("ALTER TABLE foo ADD COLUMN j INT NOT NULL DEFAULT 2")
+	require.NoError(t, err)
+
+	getFooVersion := func() (version int) {
+		tx, err := db.Begin()
+		require.NoError(t, err)
+		// Prevent this transaction from blocking on intents.
+		_, err = tx.Exec("SET TRANSACTION PRIORITY HIGH")
+		require.NoError(t, err)
+		require.NoError(t, tx.QueryRow(
+			"SELECT version FROM crdb_internal.tables WHERE name = 'foo'").
+			Scan(&version))
+		require.NoError(t, tx.Commit())
+		return version
+	}
+
+	// Fire off the commit. In order to return, the table descriptor will need
+	// to make it through several versions. We wait until the version has been
+	// incremented once before we rollback txA.
+	origVersion := getFooVersion()
+	errCh := make(chan error)
+	go func() { errCh <- txB.Commit() }()
+	testutils.SucceedsSoon(t, func() error {
+		if got := getFooVersion(); got <= origVersion {
+			return fmt.Errorf("got %d, expected greater", got)
+		}
+		return nil
+	})
+
+	// Roll back txA which had left an intent on the system config span which
+	// prevented the leaseholders of origVersion of foo from being notified.
+	// Ensure that those leaseholders are notified in a timely manner.
+	require.NoError(t, txA.Rollback())
+
+	const extremelyLongTime = 10 * time.Second
+	select {
+	case <-time.After(extremelyLongTime):
+		t.Fatalf("schema change did not complete in %v", extremelyLongTime)
+	case err := <-errCh:
+		require.NoError(t, err)
+	}
 }

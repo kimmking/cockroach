@@ -481,7 +481,7 @@ func TestQueryProgress(t *testing.T) {
 	var queryRunningAtomic, scannedBatchesAtomic int64
 	stalled, unblock := make(chan struct{}), make(chan struct{})
 
-	tableKey := roachpb.Key(keys.MakeTablePrefix(keys.MinNonPredefinedUserDescID + 1))
+	tableKey := keys.SystemSQLCodec.TablePrefix(keys.MinNonPredefinedUserDescID + 1)
 	tableSpan := roachpb.Span{Key: tableKey, EndKey: tableKey.PrefixEnd()}
 
 	// Install a store filter which, if queryRunningAtomic is 1, will count scan
@@ -715,13 +715,13 @@ func TestErrorDuringPrepareInExplicitTransactionPropagates(t *testing.T) {
 		}
 		if req, ok := ba.GetArg(roachpb.Get); ok {
 			get := req.(*roachpb.GetRequest)
-			_, tableID, err := keys.DecodeTablePrefix(get.Key)
+			_, tableID, err := keys.SystemSQLCodec.DecodeTablePrefix(get.Key)
 			if err != nil || tableID != keys.NamespaceTableID {
 				err = nil
 				return nil
 			}
-			return roachpb.NewError(roachpb.NewTransactionRetryWithProtoRefreshError(
-				"boom", ba.Txn.ID, *ba.Txn))
+			return roachpb.NewErrorWithTxn(
+				roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN, "boom"), ba.Txn)
 		}
 		return nil
 	})
@@ -729,7 +729,8 @@ func TestErrorDuringPrepareInExplicitTransactionPropagates(t *testing.T) {
 	// Plan a query will get a restart error during planning.
 	_, err = tx.Prepare("show_columns", "SELECT NULL FROM [SHOW COLUMNS FROM bar] LIMIT 1")
 	require.Regexp(t,
-		"restart transaction: TransactionRetryWithProtoRefreshError: boom", err)
+		`restart transaction: TransactionRetryWithProtoRefreshError: TransactionRetryError: retry txn \(RETRY_REASON_UNKNOWN - boom\)`,
+		err)
 	pgErr, ok := err.(pgx.PgError)
 	require.True(t, ok)
 	require.Equal(t, pgcode.SerializationFailure, pgErr.Code)

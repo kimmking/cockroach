@@ -222,7 +222,8 @@ func (p *planner) MemberOfWithAdminOption(
 	roleMembersCache := p.execCfg.RoleMemberCache
 
 	// Lookup table version.
-	objDesc, err := p.PhysicalSchemaAccessor().GetObjectDesc(ctx, p.txn, p.ExecCfg().Settings, &roleMembersTableName,
+	objDesc, err := p.PhysicalSchemaAccessor().GetObjectDesc(
+		ctx, p.txn, p.ExecCfg().Settings, p.ExecCfg().Codec, &roleMembersTableName,
 		p.ObjectLookupFlags(true /*required*/, false /*requireMutable*/))
 	if err != nil {
 		return nil, err
@@ -378,3 +379,21 @@ func (p *planner) HasRoleOption(ctx context.Context, roleOption roleoption.Optio
 	return pgerror.Newf(pgcode.InsufficientPrivilege,
 		"user %s does not have %s privilege", user, roleOption.String())
 }
+
+// ConnAuditingClusterSettingName is the name of the cluster setting
+// for the cluster setting that enables pgwire-level connection audit
+// logs.
+//
+// This name is defined here because it is needed in the telemetry
+// counts in SetClusterSetting() and importing pgwire here would
+// create a circular dependency.
+const ConnAuditingClusterSettingName = "server.auth_log.sql_connections.enabled"
+
+// AuthAuditingClusterSettingName is the name of the cluster setting
+// for the cluster setting that enables pgwire-level authentication audit
+// logs.
+//
+// This name is defined here because it is needed in the telemetry
+// counts in SetClusterSetting() and importing pgwire here would
+// create a circular dependency.
+const AuthAuditingClusterSettingName = "server.auth_log.sql_sessions.enabled"

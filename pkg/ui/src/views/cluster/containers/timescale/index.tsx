@@ -10,7 +10,7 @@
 
 import _ from "lodash";
 import moment from "moment";
-import { queryByName, queryToObj, queryToString } from "oss/src/util/query";
+import { queryByName, queryToObj, queryToString } from "src/util/query";
 import React from "react";
 import { connect } from "react-redux";
 import { RouteComponentProps, withRouter } from "react-router-dom";
@@ -18,11 +18,13 @@ import { refreshNodes } from "src/redux/apiReducers";
 import { AdminUIState } from "src/redux/state";
 import * as timewindow from "src/redux/timewindow";
 import { INodeStatus } from "src/util/proto";
+import { trackTimeFrameChange } from "src/util/analytics";
 import Dropdown, { ArrowDirection, DropdownOption } from "src/views/shared/components/dropdown";
 import TimeFrameControls from "../../components/controls";
 import RangeSelect, { DateTypes } from "../../components/range";
 import "./timescale.styl";
 import { Divider } from "antd";
+import classNames from "classnames";
 
 interface TimeScaleDropdownProps extends RouteComponentProps {
   currentScale: timewindow.TimeScale;
@@ -63,6 +65,10 @@ export const getTimeLabel = (currentWindow?: timewindow.TimeWindow, windowSize?:
 // TimeScaleDropdown is the dropdown that allows users to select the time range
 // for graphs.
 class TimeScaleDropdown extends React.Component<TimeScaleDropdownProps, {}> {
+  state = {
+    is_opened: false,
+  };
+
   changeSettings = (newTimescaleKey: DropdownOption) => {
     const newSettings = timewindow.availableTimeScales[newTimescaleKey.value];
     newSettings.windowEnd = null;
@@ -82,14 +88,17 @@ class TimeScaleDropdown extends React.Component<TimeScaleDropdownProps, {}> {
 
     switch (direction) {
       case ArrowDirection.RIGHT:
+        trackTimeFrameChange("next frame");
         if (windowEnd) {
           windowEnd = windowEnd.add(seconds, "seconds");
         }
         break;
       case ArrowDirection.LEFT:
+        trackTimeFrameChange("previous frame");
         windowEnd = windowEnd.subtract(seconds, "seconds");
         break;
       case ArrowDirection.CENTER:
+        trackTimeFrameChange("now");
         windowEnd = moment.utc();
         break;
       default:
@@ -259,6 +268,14 @@ class TimeScaleDropdown extends React.Component<TimeScaleDropdownProps, {}> {
     return disabledArrows;
   }
 
+  onOpened = () => {
+    this.setState({ is_opened: true });
+  }
+
+  onClosed = () => {
+    this.setState({ is_opened: false });
+  }
+
   render() {
     const { useTimeRange, currentScale, currentWindow } = this.props;
     return (
@@ -269,9 +286,12 @@ class TimeScaleDropdown extends React.Component<TimeScaleDropdownProps, {}> {
           options={[]}
           selected={currentScale.key}
           onChange={this.changeSettings}
+          className={classNames({ "dropdown__focused": this.state.is_opened })}
           isTimeRange
           content={
             <RangeSelect
+              onOpened={this.onOpened}
+              onClosed={this.onClosed}
               value={currentWindow}
               useTimeRange={useTimeRange}
               selected={this.getTimeRangeTitle()}

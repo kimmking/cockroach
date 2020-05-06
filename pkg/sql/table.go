@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -233,7 +234,7 @@ func (tc *TableCollection) getMutableTableDescriptor(
 	}
 
 	phyAccessor := UncachedPhysicalAccessor{}
-	obj, err := phyAccessor.GetObjectDesc(ctx, txn, tc.settings, tn, flags)
+	obj, err := phyAccessor.GetObjectDesc(ctx, txn, tc.settings, tc.codec(), tn, flags)
 	if obj == nil {
 		return nil, err
 	}
@@ -262,7 +263,7 @@ func (tc *TableCollection) resolveSchemaID(
 	}
 
 	// Next, try lookup the result from KV, storing and returning the value.
-	exists, schemaID, err := resolveSchemaID(ctx, txn, dbID, schemaName)
+	exists, schemaID, err := resolveSchemaID(ctx, txn, tc.codec(), dbID, schemaName)
 	if err != nil || !exists {
 		return exists, schemaID, err
 	}
@@ -294,7 +295,7 @@ func (tc *TableCollection) getTableVersion(
 
 	readTableFromStore := func() (*sqlbase.ImmutableTableDescriptor, error) {
 		phyAccessor := UncachedPhysicalAccessor{}
-		obj, err := phyAccessor.GetObjectDesc(ctx, txn, tc.settings, tn, flags)
+		obj, err := phyAccessor.GetObjectDesc(ctx, txn, tc.settings, tc.codec(), tn, flags)
 		if obj == nil {
 			return nil, err
 		}
@@ -335,7 +336,7 @@ func (tc *TableCollection) getTableVersion(
 	// system.users. For now we're sticking to disabling caching of
 	// all system descriptors except the role-members-table.
 	avoidCache := flags.AvoidCached || testDisableTableLeases ||
-		(tn.Catalog() == sqlbase.SystemDB.Name && tn.TableName.String() != sqlbase.RoleMembersTable.Name)
+		(tn.Catalog() == sqlbase.SystemDB.Name && tn.ObjectName.String() != sqlbase.RoleMembersTable.Name)
 
 	if refuseFurtherLookup, table, err := tc.getUncommittedTable(
 		dbID,
@@ -409,7 +410,7 @@ func (tc *TableCollection) getTableVersionByID(
 	log.VEventf(ctx, 2, "planner getting table on table ID %d", tableID)
 
 	if flags.AvoidCached || testDisableTableLeases {
-		table, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
+		table, err := sqlbase.GetTableDescFromID(ctx, txn, tc.codec(), tableID)
 		if err != nil {
 			return nil, err
 		}
@@ -478,7 +479,7 @@ func (tc *TableCollection) getMutableTableVersionByID(
 		log.VEventf(ctx, 2, "found uncommitted table %d", tableID)
 		return table, nil
 	}
-	return sqlbase.GetMutableTableDescFromID(ctx, txn, tableID)
+	return sqlbase.GetMutableTableDescFromID(ctx, txn, tc.codec(), tableID)
 }
 
 // releaseTableLeases releases the leases for the tables with ids in
@@ -505,7 +506,7 @@ func (tc *TableCollection) releaseTableLeases(ctx context.Context, tables []IDVe
 		if !shouldRelease(l.ID) {
 			filteredLeases = append(filteredLeases, l)
 		} else if err := tc.leaseMgr.Release(l); err != nil {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
 	}
 	tc.leasedTables = filteredLeases
@@ -516,7 +517,7 @@ func (tc *TableCollection) releaseLeases(ctx context.Context) {
 		log.VEventf(ctx, 2, "releasing %d tables", len(tc.leasedTables))
 		for _, table := range tc.leasedTables {
 			if err := tc.leaseMgr.Release(table); err != nil {
-				log.Warning(ctx, err)
+				log.Warningf(ctx, "%v", err)
 			}
 		}
 		tc.leasedTables = tc.leasedTables[:0]
@@ -604,6 +605,15 @@ func (tc *TableCollection) getTablesWithNewVersion() []IDVersion {
 	return tables
 }
 
+func (tc *TableCollection) getNewTables() (newTables []*ImmutableTableDescriptor) {
+	for _, table := range tc.uncommittedTables {
+		if mut := table.MutableTableDescriptor; mut.IsNewTable() {
+			newTables = append(newTables, table.ImmutableTableDescriptor)
+		}
+	}
+	return newTables
+}
+
 type dbAction bool
 
 const (
@@ -663,7 +673,7 @@ func (tc *TableCollection) getUncommittedTable(
 		// transaction has already committed and this transaction is seeing the
 		// effect of it.
 		for _, drain := range mutTbl.DrainingNames {
-			if drain.Name == string(tn.TableName) &&
+			if drain.Name == string(tn.ObjectName) &&
 				drain.ParentID == dbID &&
 				drain.ParentSchemaID == schemaID {
 				// Table name has gone away.
@@ -721,7 +731,7 @@ func (tc *TableCollection) getAllDescriptors(
 	ctx context.Context, txn *kv.Txn,
 ) ([]sqlbase.DescriptorProto, error) {
 	if tc.allDescriptors == nil {
-		descs, err := GetAllDescriptors(ctx, txn)
+		descs, err := GetAllDescriptors(ctx, txn, tc.codec())
 		if err != nil {
 			return nil, err
 		}
@@ -738,11 +748,11 @@ func (tc *TableCollection) getAllDatabaseDescriptors(
 	ctx context.Context, txn *kv.Txn,
 ) ([]*sqlbase.DatabaseDescriptor, error) {
 	if tc.allDatabaseDescriptors == nil {
-		dbDescIDs, err := GetAllDatabaseDescriptorIDs(ctx, txn)
+		dbDescIDs, err := GetAllDatabaseDescriptorIDs(ctx, txn, tc.codec())
 		if err != nil {
 			return nil, err
 		}
-		dbDescs, err := getDatabaseDescriptorsFromIDs(ctx, txn, dbDescIDs)
+		dbDescs, err := getDatabaseDescriptorsFromIDs(ctx, txn, tc.codec(), dbDescIDs)
 		if err != nil {
 			return nil, err
 		}
@@ -756,11 +766,11 @@ func (tc *TableCollection) getAllDatabaseDescriptors(
 // database. It attempts to perform this operation in a single request,
 // rather than making a round trip for each ID.
 func getDatabaseDescriptorsFromIDs(
-	ctx context.Context, txn *kv.Txn, ids []sqlbase.ID,
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, ids []sqlbase.ID,
 ) ([]*sqlbase.DatabaseDescriptor, error) {
 	b := txn.NewBatch()
 	for _, id := range ids {
-		key := sqlbase.MakeDescMetadataKey(id)
+		key := sqlbase.MakeDescMetadataKey(codec, id)
 		b.Get(key)
 	}
 	if err := txn.Run(ctx, b); err != nil {
@@ -806,7 +816,7 @@ func (tc *TableCollection) getSchemasForDatabase(
 	}
 	if _, ok := tc.allSchemasForDatabase[dbID]; !ok {
 		var err error
-		tc.allSchemasForDatabase[dbID], err = schema.GetForDatabase(ctx, txn, dbID)
+		tc.allSchemasForDatabase[dbID], err = schema.GetForDatabase(ctx, txn, tc.codec(), dbID)
 		if err != nil {
 			return nil, err
 		}
@@ -847,13 +857,17 @@ func (tc *TableCollection) validatePrimaryKeys() error {
 	for i := range modifiedTables {
 		table := tc.getUncommittedTableByID(modifiedTables[i].id).MutableTableDescriptor
 		if !table.HasPrimaryKey() {
-			return errors.Errorf(
+			return unimplemented.NewWithIssuef(48026,
 				"primary key of table %s dropped without subsequent addition of new primary key",
 				table.Name,
 			)
 		}
 	}
 	return nil
+}
+
+func (tc *TableCollection) codec() keys.SQLCodec {
+	return tc.leaseMgr.codec
 }
 
 // MigrationSchemaChangeRequiredContext flags a schema change as necessary to
@@ -946,7 +960,7 @@ func (p *planner) createOrUpdateSchemaChangeJob(
 	if jobExists {
 		spanList = job.Details().(jobspb.SchemaChangeDetails).ResumeSpanList
 	}
-	span := tableDesc.PrimaryIndexSpan()
+	span := tableDesc.PrimaryIndexSpan(p.ExecCfg().Codec)
 	for i := len(tableDesc.ClusterVersion.Mutations) + len(spanList); i < len(tableDesc.Mutations); i++ {
 		spanList = append(spanList,
 			jobspb.ResumeSpanList{
@@ -1119,5 +1133,13 @@ func (p *planner) writeTableDescToBatch(
 		return err
 	}
 
-	return writeDescToBatch(ctx, p.extendedEvalCtx.Tracing.KVTracingEnabled(), p.execCfg.Settings, b, tableDesc.GetID(), tableDesc.TableDesc())
+	return writeDescToBatch(
+		ctx,
+		p.extendedEvalCtx.Tracing.KVTracingEnabled(),
+		p.ExecCfg().Settings,
+		b,
+		p.ExecCfg().Codec,
+		tableDesc.GetID(),
+		tableDesc.TableDesc(),
+	)
 }

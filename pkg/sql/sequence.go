@@ -12,6 +12,7 @@ package sql
 
 import (
 	"context"
+	"fmt"
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -46,10 +47,10 @@ func (p *planner) IncrementSequence(ctx context.Context, seqName *tree.TableName
 	seqOpts := descriptor.SequenceOpts
 	var val int64
 	if seqOpts.Virtual {
-		rowid := builtins.GenerateUniqueInt(p.EvalContext().NodeID)
+		rowid := builtins.GenerateUniqueInt(p.EvalContext().NodeID.SQLInstanceID())
 		val = int64(rowid)
 	} else {
-		seqValueKey := keys.MakeSequenceKey(uint32(descriptor.ID))
+		seqValueKey := p.ExecCfg().Codec.SequenceKey(uint32(descriptor.ID))
 		val, err = kv.IncrementValRetryable(
 			ctx, p.txn.DB(), seqValueKey, seqOpts.Increment)
 		if err != nil {
@@ -134,7 +135,7 @@ func (p *planner) SetSequenceValue(
 			`cannot set the value of virtual sequence %q`, tree.ErrString(seqName))
 	}
 
-	seqValueKey, newVal, err := MakeSequenceKeyVal(descriptor.TableDesc(), newVal, isCalled)
+	seqValueKey, newVal, err := MakeSequenceKeyVal(p.ExecCfg().Codec, descriptor.TableDesc(), newVal, isCalled)
 	if err != nil {
 		return err
 	}
@@ -148,7 +149,7 @@ func (p *planner) SetSequenceValue(
 // MakeSequenceKeyVal returns the key and value of a sequence being set
 // with newVal.
 func MakeSequenceKeyVal(
-	sequence *TableDescriptor, newVal int64, isCalled bool,
+	codec keys.SQLCodec, sequence *TableDescriptor, newVal int64, isCalled bool,
 ) ([]byte, int64, error) {
 	opts := sequence.SequenceOpts
 	if newVal > opts.MaxValue || newVal < opts.MinValue {
@@ -162,18 +163,18 @@ func MakeSequenceKeyVal(
 		newVal = newVal - sequence.SequenceOpts.Increment
 	}
 
-	seqValueKey := keys.MakeSequenceKey(uint32(sequence.ID))
+	seqValueKey := codec.SequenceKey(uint32(sequence.ID))
 	return seqValueKey, newVal, nil
 }
 
 // GetSequenceValue returns the current value of the sequence.
 func (p *planner) GetSequenceValue(
-	ctx context.Context, desc *sqlbase.ImmutableTableDescriptor,
+	ctx context.Context, codec keys.SQLCodec, desc *sqlbase.ImmutableTableDescriptor,
 ) (int64, error) {
 	if desc.SequenceOpts == nil {
 		return 0, errors.New("descriptor is not a sequence")
 	}
-	keyValue, err := p.txn.Get(ctx, keys.MakeSequenceKey(uint32(desc.ID)))
+	keyValue, err := p.txn.Get(ctx, codec.SequenceKey(uint32(desc.ID)))
 	if err != nil {
 		return 0, err
 	}
@@ -473,9 +474,10 @@ func (p *planner) dropSequencesOwnedByCol(
 		if err != nil {
 			return err
 		}
-		// TODO (lucy): Have more consistent/informative names for dependent jobs.
+		jobDesc := fmt.Sprintf("removing sequence %q dependent on column %q which is being dropped",
+			seqDesc.Name, col.ColName())
 		if err := p.dropSequenceImpl(
-			ctx, seqDesc, true /* queueJob */, "dropping dependent sequence", tree.DropRestrict,
+			ctx, seqDesc, true /* queueJob */, jobDesc, tree.DropRestrict,
 		); err != nil {
 			return err
 		}
@@ -535,9 +537,10 @@ func (p *planner) removeSequenceDependencies(
 				seqDesc.DependedOnBy[refTableIdx+1:]...)
 		}
 
-		// TODO (lucy): Have more consistent/informative names for dependent jobs.
+		jobDesc := fmt.Sprintf("removing sequence %q dependent on column %q which is being dropped",
+			seqDesc.Name, col.ColName())
 		if err := p.writeSchemaChange(
-			ctx, seqDesc, sqlbase.InvalidMutationID, "removing sequence dependency",
+			ctx, seqDesc, sqlbase.InvalidMutationID, jobDesc,
 		); err != nil {
 			return err
 		}

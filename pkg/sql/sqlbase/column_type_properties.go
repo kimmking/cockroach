@@ -129,11 +129,11 @@ func LimitValueWidth(typ *types.T, inVal tree.Datum, name *string) (outVal tree.
 		}
 	case types.TimestampFamily:
 		if in, ok := inVal.(*tree.DTimestamp); ok {
-			return in.Round(tree.TimeFamilyPrecisionToRoundDuration(typ.Precision())), nil
+			return in.Round(tree.TimeFamilyPrecisionToRoundDuration(typ.Precision()))
 		}
 	case types.TimestampTZFamily:
 		if in, ok := inVal.(*tree.DTimestampTZ); ok {
-			return in.Round(tree.TimeFamilyPrecisionToRoundDuration(typ.Precision())), nil
+			return in.Round(tree.TimeFamilyPrecisionToRoundDuration(typ.Precision()))
 		}
 	case types.TimeTZFamily:
 		if in, ok := inVal.(*tree.DTimeTZ); ok {
@@ -163,7 +163,7 @@ func CheckDatumTypeFitsColumnType(col *ColumnDescriptor, typ *types.T) error {
 	if typ.Family() == types.UnknownFamily {
 		return nil
 	}
-	if !typ.Equivalent(&col.Type) {
+	if !typ.Equivalent(col.Type) {
 		return pgerror.Newf(pgcode.DatatypeMismatch,
 			"value type %s doesn't match type %s of column %q",
 			typ.String(), col.Type.String(), tree.ErrNameString(col.Name))

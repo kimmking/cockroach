@@ -27,6 +27,10 @@
 </span></td></tr>
 <tr><td><a name="array_agg"></a><code>array_agg(arg1: <a href="uuid.html">uuid</a>) &rarr; <a href="uuid.html">uuid</a>[]</code></td><td><span class="funcdesc"><p>Aggregates the selected values into an array.</p>
 </span></td></tr>
+<tr><td><a name="array_agg"></a><code>array_agg(arg1: geography) &rarr; geography[]</code></td><td><span class="funcdesc"><p>Aggregates the selected values into an array.</p>
+</span></td></tr>
+<tr><td><a name="array_agg"></a><code>array_agg(arg1: geometry) &rarr; geometry[]</code></td><td><span class="funcdesc"><p>Aggregates the selected values into an array.</p>
+</span></td></tr>
 <tr><td><a name="array_agg"></a><code>array_agg(arg1: oid) &rarr; oid[]</code></td><td><span class="funcdesc"><p>Aggregates the selected values into an array.</p>
 </span></td></tr>
 <tr><td><a name="array_agg"></a><code>array_agg(arg1: timetz) &rarr; timetz[]</code></td><td><span class="funcdesc"><p>Aggregates the selected values into an array.</p>
@@ -43,7 +47,11 @@
 </span></td></tr>
 <tr><td><a name="bit_and"></a><code>bit_and(arg1: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the bitwise AND of all non-null input values, or null if none.</p>
 </span></td></tr>
+<tr><td><a name="bit_and"></a><code>bit_and(arg1: varbit) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates the bitwise AND of all non-null input values, or null if none.</p>
+</span></td></tr>
 <tr><td><a name="bit_or"></a><code>bit_or(arg1: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the bitwise OR of all non-null input values, or null if none.</p>
+</span></td></tr>
+<tr><td><a name="bit_or"></a><code>bit_or(arg1: varbit) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates the bitwise OR of all non-null input values, or null if none.</p>
 </span></td></tr>
 <tr><td><a name="bool_and"></a><code>bool_and(arg1: <a href="bool.html">bool</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Calculates the boolean value of <code>AND</code>ing all selected values.</p>
 </span></td></tr>
@@ -97,6 +105,10 @@
 </span></td></tr>
 <tr><td><a name="max"></a><code>max(arg1: <a href="uuid.html">uuid</a>) &rarr; <a href="uuid.html">uuid</a></code></td><td><span class="funcdesc"><p>Identifies the maximum selected value.</p>
 </span></td></tr>
+<tr><td><a name="max"></a><code>max(arg1: geography) &rarr; geography</code></td><td><span class="funcdesc"><p>Identifies the maximum selected value.</p>
+</span></td></tr>
+<tr><td><a name="max"></a><code>max(arg1: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Identifies the maximum selected value.</p>
+</span></td></tr>
 <tr><td><a name="max"></a><code>max(arg1: jsonb) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Identifies the maximum selected value.</p>
 </span></td></tr>
 <tr><td><a name="max"></a><code>max(arg1: oid) &rarr; oid</code></td><td><span class="funcdesc"><p>Identifies the maximum selected value.</p>
@@ -130,6 +142,10 @@
 <tr><td><a name="min"></a><code>min(arg1: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Identifies the minimum selected value.</p>
 </span></td></tr>
 <tr><td><a name="min"></a><code>min(arg1: <a href="uuid.html">uuid</a>) &rarr; <a href="uuid.html">uuid</a></code></td><td><span class="funcdesc"><p>Identifies the minimum selected value.</p>
+</span></td></tr>
+<tr><td><a name="min"></a><code>min(arg1: geography) &rarr; geography</code></td><td><span class="funcdesc"><p>Identifies the minimum selected value.</p>
+</span></td></tr>
+<tr><td><a name="min"></a><code>min(arg1: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Identifies the minimum selected value.</p>
 </span></td></tr>
 <tr><td><a name="min"></a><code>min(arg1: jsonb) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Identifies the minimum selected value.</p>
 </span></td></tr>

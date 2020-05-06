@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -740,7 +739,6 @@ func (j *Job) insert(ctx context.Context, id int64, lease *jobspb.Lease) error {
 }
 
 func (j *Job) adopt(ctx context.Context, oldLease *jobspb.Lease) error {
-	log.Infof(ctx, "job %d: adopting", *j.ID())
 	return j.Update(ctx, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
 		if !md.Payload.Lease.Equal(oldLease) {
 			return errors.Errorf("current lease %v did not match expected lease %v",
@@ -848,6 +846,8 @@ func (sj *StartableJob) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	jobCompletedOk := false
+
 	var r tree.Datums // stores a row if we've received one.
 	for {
 		// Alternate between receiving rows and sending them. Nil channels block.
@@ -870,6 +870,9 @@ func (sj *StartableJob) Run(ctx context.Context) error {
 			}
 		case toClient <- r:
 			r = nil
+			if jobCompletedOk {
+				return nil
+			}
 		case <-ctx.Done():
 			// Launch a goroutine to continue consuming results from the job.
 			if resultsFromJob != nil {
@@ -889,6 +892,11 @@ func (sj *StartableJob) Run(ctx context.Context) error {
 			return ctx.Err()
 		case err := <-errCh:
 			// The job has completed, return its final error.
+			if err == nil && r != nil {
+				// We still have data to send to the client.
+				jobCompletedOk = true
+				continue
+			}
 			return err
 		}
 	}

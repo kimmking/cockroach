@@ -1649,14 +1649,14 @@ func execChangeReplicasTxn(
 			},
 		})
 		if err := txn.Run(ctx, b); err != nil {
-			log.Event(ctx, err.Error())
+			log.Eventf(ctx, "%v", err)
 			return err
 		}
 
 		returnDesc = crt.Desc
 		return nil
 	}); err != nil {
-		log.Event(ctx, err.Error())
+		log.Eventf(ctx, "%v", err)
 		// NB: desc may not be the descriptor we actually compared against, but
 		// either way this gives a good idea of what happened which is all it's
 		// supposed to do.
@@ -1740,11 +1740,8 @@ func execChangeReplicasTxn(
 // three SSTs from them for direct ingestion: one for the replicated range-ID
 // local keys, one for the range local keys, and one for the user keys. The
 // reason it creates three separate SSTs is to prevent overlaps with the
-// memtable and existing SSTs in RocksDB. These SST files are created lazily,
-// so in the case where the keyspace is empty, no file will be created. Each
-// of the SSTs has a range deletion tombstone written to it to delete the
-// existing data in the range, however if the keyspace is empty, then the
-// tombstone will be omitted.
+// memtable and existing SSTs in RocksDB. Each of the SSTs also has a range
+// deletion tombstone to delete the existing data in the range.
 //
 // Applying the snapshot: After the recipient has received the message
 // indicating it has all the data, it hands it all to
@@ -2026,7 +2023,7 @@ func (s *Store) AdminRelocateRange(
 	// about them.
 	newDesc, err := maybeLeaveAtomicChangeReplicasAndRemoveLearners(ctx, s, &rangeDesc)
 	if err != nil {
-		log.Warning(ctx, err)
+		log.Warningf(ctx, "%v", err)
 		return err
 	}
 	rangeDesc = *newDesc
@@ -2120,7 +2117,7 @@ func (s *Store) AdminRelocateRange(
 						return returnErr
 					}
 					if every.ShouldLog() {
-						log.Info(ctx, returnErr)
+						log.Infof(ctx, "%v", returnErr)
 					}
 					success = false
 					break

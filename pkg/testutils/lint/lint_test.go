@@ -221,6 +221,8 @@ func TestLint(t *testing.T) {
 			stream.GrepNot(`_string\.go`),
 			stream.GrepNot(`_generated\.go`),
 			stream.GrepNot(`/embedded.go`),
+			stream.GrepNot(`geo/geographiclib/geodesic\.c$`),
+			stream.GrepNot(`geo/geographiclib/geodesic\.h$`),
 		), func(filename string) {
 			isCCL := strings.Contains(filename, "ccl/")
 			var expHeader *regexp.Regexp
@@ -305,10 +307,13 @@ func TestLint(t *testing.T) {
 		}
 	})
 
-	// TestTabsInOptgen verifies tabs aren't used in optgen (.opt) files.
-	t.Run("TestTabsInOptgen", func(t *testing.T) {
+	t.Run("TestOptfmt", func(t *testing.T) {
 		t.Parallel()
-		cmd, stderr, filter, err := dirCmd(pkgDir, "git", "grep", "-nE", "^ *\t", "--", "*.opt")
+		if pkgSpecified {
+			t.Skip("PKG specified")
+		}
+
+		cmd, stderr, filter, err := dirCmd(pkgDir, "git", "ls-files", "*.opt", ":!*/testdata/*")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -317,10 +322,22 @@ func TestLint(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := stream.ForEach(filter, func(s string) {
-			t.Errorf(`%s <- tab detected, use spaces instead`, s)
-		}); err != nil {
+		var buf bytes.Buffer
+		if err := stream.ForEach(
+			stream.Sequence(
+				filter,
+				stream.Map(func(s string) string {
+					return filepath.Join(pkgDir, s)
+				}),
+				stream.Xargs("optfmt", "-l"),
+			), func(s string) {
+				fmt.Fprintln(&buf, s)
+			}); err != nil {
 			t.Error(err)
+		}
+		errs := buf.String()
+		if len(errs) > 0 {
+			t.Errorf("\n%s", errs)
 		}
 
 		if err := cmd.Wait(); err != nil {
@@ -838,6 +855,7 @@ func TestLint(t *testing.T) {
 			`\.Marshal\(`,
 			"--",
 			"*.go",
+			":!sql/*.pb.go",
 			":!util/protoutil/marshal.go",
 			":!util/protoutil/marshaler.go",
 			":!settings/settings_test.go",
@@ -852,7 +870,7 @@ func TestLint(t *testing.T) {
 
 		if err := stream.ForEach(stream.Sequence(
 			filter,
-			stream.GrepNot(`(json|yaml|protoutil|xml|\.Field)\.Marshal\(`),
+			stream.GrepNot(`(json|yaml|protoutil|xml|\.Field|ewkb|wkb|wkt)\.Marshal\(`),
 		), func(s string) {
 			t.Errorf("\n%s <- forbidden; use 'protoutil.Marshal' instead", s)
 		}); err != nil {
@@ -890,7 +908,7 @@ func TestLint(t *testing.T) {
 
 		if err := stream.ForEach(stream.Sequence(
 			filter,
-			stream.GrepNot(`(json|jsonpb|yaml|xml|protoutil|toml|Codec)\.Unmarshal\(`),
+			stream.GrepNot(`(json|jsonpb|yaml|xml|protoutil|toml|Codec|ewkb|wkb)\.Unmarshal\(`),
 		), func(s string) {
 			t.Errorf("\n%s <- forbidden; use 'protoutil.Unmarshal' instead", s)
 		}); err != nil {
@@ -916,8 +934,9 @@ func TestLint(t *testing.T) {
 			"*.go",
 			":!*.pb.go",
 			":!*.pb.gw.go",
+			":!sql/pgwire/pgerror/severity.go",
 			":!sql/pgwire/pgerror/with_candidate_code.go",
-			":!sql/colexec/execerror/error.go",
+			":!sql/colexecbase/colexecerror/error.go",
 			":!util/protoutil/jsonpb_marshal.go",
 			":!util/protoutil/marshal.go",
 			":!util/protoutil/marshaler.go",
@@ -1341,6 +1360,7 @@ func TestLint(t *testing.T) {
 				filter,
 				stream.GrepNot("sql/.*exported func .* returns unexported type sql.planNode"),
 				stream.GrepNot("pkg/sql/types/types.go.* var Uuid should be UUID"),
+				stream.GrepNot("pkg/sql/oidext/oidext.go.*don't use underscores in Go names; const T_"),
 			), func(s string) {
 				t.Errorf("\n%s", s)
 			}); err != nil {
@@ -1412,10 +1432,12 @@ func TestLint(t *testing.T) {
 			"-nE",
 			fmt.Sprintf(`panic\(.*\)`),
 			"--",
-			"sql/colexec",
-			"sql/colflow",
-			"sql/colcontainer",
-			":!sql/colexec/execerror/error.go",
+			// NOTE: if you're adding a new package to the list here because it
+			// uses "panic-catch" error propagation mechanism of the vectorized
+			// engine, don't forget to "register" the newly added package in
+			// sql/colexecbase/colexecerror/error.go file.
+			"sql/col*",
+			":!sql/colexecbase/colexecerror/error.go",
 			":!sql/colexec/execpb/stats.pb.go",
 			":!sql/colflow/vectorized_panic_propagation_test.go",
 		)
@@ -1428,7 +1450,7 @@ func TestLint(t *testing.T) {
 		}
 
 		if err := stream.ForEach(filter, func(s string) {
-			t.Errorf("\n%s <- forbidden; use either execerror.VectorizedInternalPanic() or execerror.NonVectorizedPanic() instead", s)
+			t.Errorf("\n%s <- forbidden; use either colexecerror.InternalError() or colexecerror.ExpectedError() instead", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -1455,9 +1477,10 @@ func TestLint(t *testing.T) {
 			// TODO(yuzefovich): prohibit call to coldata.NewMemBatchNoCols.
 			fmt.Sprintf(`(coldata\.NewMem(Batch|BatchWithSize|Column)|\.AppendCol)\(`),
 			"--",
+			// TODO(yuzefovich): prohibit calling coldata.* methods from other
+			// sql/col* packages.
 			"sql/colexec",
 			"sql/colflow",
-			":!sql/colexec/allocator.go",
 			":!sql/colexec/simple_project.go",
 		)
 		if err != nil {
@@ -1469,7 +1492,7 @@ func TestLint(t *testing.T) {
 		}
 
 		if err := stream.ForEach(filter, func(s string) {
-			t.Errorf("\n%s <- forbidden; use colexec.Allocator object instead", s)
+			t.Errorf("\n%s <- forbidden; use colmem.Allocator object instead", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -1480,6 +1503,109 @@ func TestLint(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("TestVectorizedAppendColumn", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			// We prohibit usage of Allocator.MaybeAppendColumn outside of
+			// vectorTypeEnforcer and batchSchemaPrefixEnforcer.
+			fmt.Sprintf(`(MaybeAppendColumn)\(`),
+			"--",
+			"sql/col*",
+			":!sql/colexec/operator.go",
+			":!sql/colmem/allocator.go",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use colexec.vectorTypeEnforcer "+
+				"or colexec.batchSchemaPrefixEnforcer", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestVectorizedTypeSchemaCopy", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			// We prohibit appending to the type schema and require allocating
+			// a new slice. See the comment in execplan.go file.
+			fmt.Sprintf(`(yps|ypes) = append\(`),
+			"--",
+			"sql/colexec/execplan.go",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; allocate a new []*types.T slice", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestTypesSlice", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			fmt.Sprintf(`\[\]types.T`),
+			"--",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use []*types.T", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
 	// RoachVet is expensive memory-wise and thus should not run with t.Parallel().
 	// RoachVet includes all of the passes of `go vet` plus first-party additions.
 	// See pkg/cmd/roachvet.

@@ -15,8 +15,10 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // TODO(yuzefovich): support rehashing instead of large fixed bucket size.
@@ -105,7 +107,7 @@ type hashTableProbeBuffer struct {
 // The table can then be probed in column batches to find at most one matching
 // row per column batch row.
 type hashTable struct {
-	allocator *Allocator
+	allocator *colmem.Allocator
 
 	// buildScratch contains the scratch buffers required for the build table.
 	buildScratch hashTableBuildBuffer
@@ -129,11 +131,7 @@ type hashTable struct {
 	// table. A key tuple is defined as the elements in each row of vals that
 	// makes up the equality columns. The ID of a key at any index of vals is
 	// index + 1.
-	vals coldata.Batch
-	// valTypes stores the corresponding types of the val columns.
-	valTypes []coltypes.T
-	// keyCols stores the corresponding types of key columns.
-	keyTypes []coltypes.T
+	vals *appendOnlyBufferedBatch
 	// keyCols stores the indices of vals which are key columns.
 	keyCols []uint32
 
@@ -155,17 +153,13 @@ type hashTable struct {
 var _ resetter = &hashTable{}
 
 func newHashTable(
-	allocator *Allocator,
+	allocator *colmem.Allocator,
 	numBuckets uint64,
-	sourceTypes []coltypes.T,
+	sourceTypes []*types.T,
 	eqCols []uint32,
 	allowNullEquality bool,
 	mode hashTableMode,
 ) *hashTable {
-	keyTypes := make([]coltypes.T, len(eqCols))
-	for i, colIdx := range eqCols {
-		keyTypes[i] = sourceTypes[colIdx]
-	}
 	ht := &hashTable{
 		allocator: allocator,
 
@@ -182,13 +176,9 @@ func newHashTable(
 			differs: make([]bool, coldata.BatchSize()),
 		},
 
-		vals:     allocator.NewMemBatchWithSize(sourceTypes, 0 /* initialSize */),
-		valTypes: sourceTypes,
-		keyCols:  eqCols,
-		keyTypes: keyTypes,
-
-		numBuckets: numBuckets,
-
+		vals:              newAppendOnlyBufferedBatch(allocator, sourceTypes, 0 /* initialSize */),
+		keyCols:           eqCols,
+		numBuckets:        numBuckets,
 		allowNullEquality: allowNullEquality,
 		mode:              mode,
 	}
@@ -206,7 +196,7 @@ func newHashTable(
 
 // build executes the entirety of the hash table build phase using the input
 // as the build source. The input is entirely consumed in the process.
-func (ht *hashTable) build(ctx context.Context, input Operator) {
+func (ht *hashTable) build(ctx context.Context, input colexecbase.Operator) {
 	nKeyCols := len(ht.keyCols)
 
 	switch ht.mode {
@@ -217,7 +207,9 @@ func (ht *hashTable) build(ctx context.Context, input Operator) {
 				break
 			}
 
-			ht.loadBatch(batch)
+			ht.allocator.PerformOperation(ht.vals.ColVecs(), func() {
+				ht.vals.append(batch, 0 /* startIdx */, batch.Length())
+			})
 		}
 
 		keyCols := make([]coldata.Vec, nKeyCols)
@@ -227,7 +219,7 @@ func (ht *hashTable) build(ctx context.Context, input Operator) {
 
 		// ht.next is used to store the computed hash value of each key.
 		ht.buildScratch.next = maybeAllocateUint64Array(ht.buildScratch.next, ht.vals.Length()+1)
-		ht.computeBuckets(ctx, ht.buildScratch.next[1:], ht.keyTypes, keyCols, ht.vals.Length(), nil)
+		ht.computeBuckets(ctx, ht.buildScratch.next[1:], keyCols, ht.vals.Length(), nil)
 		ht.buildNextChains(ctx, ht.buildScratch.first, ht.buildScratch.next, 1, ht.vals.Length())
 	case hashTableDistinctMode:
 		for {
@@ -237,14 +229,12 @@ func (ht *hashTable) build(ctx context.Context, input Operator) {
 			}
 
 			srcVecs := batch.ColVecs()
-			targetVecs := ht.vals.ColVecs()
 
 			for i := 0; i < nKeyCols; i++ {
 				ht.probeScratch.keys[i] = srcVecs[ht.keyCols[i]]
 			}
 
-			ht.computeBuckets(
-				ctx, ht.probeScratch.next[1:], ht.keyTypes, ht.probeScratch.keys, batch.Length(), batch.Selection())
+			ht.computeBuckets(ctx, ht.probeScratch.next[1:], ht.probeScratch.keys, batch.Length(), batch.Selection())
 			copy(ht.probeScratch.hashBuffer, ht.probeScratch.next[1:])
 
 			// We should not zero out the entire `first` buffer here since the size of
@@ -261,31 +251,22 @@ func (ht *hashTable) build(ctx context.Context, input Operator) {
 
 			ht.removeDuplicates(batch, ht.probeScratch.keys, ht.probeScratch.first, ht.probeScratch.next, ht.checkProbeForDistinct)
 
-			// We only check duplicates when there is tuple buffered.
-			if ht.vals.Length() > 0 {
+			numBuffered := ht.vals.Length()
+			// We only check duplicates when there is at least one buffered
+			// tuple.
+			if numBuffered > 0 {
 				ht.removeDuplicates(batch, ht.probeScratch.keys, ht.buildScratch.first, ht.buildScratch.next, ht.checkBuildForDistinct)
 			}
 
-			ht.allocator.PerformOperation(targetVecs, func() {
-				for i, typ := range ht.valTypes {
-					targetVecs[i].Append(
-						coldata.SliceArgs{
-							ColType:   typ,
-							Src:       srcVecs[i],
-							Sel:       batch.Selection(),
-							DestIdx:   ht.vals.Length(),
-							SrcEndIdx: batch.Length(),
-						},
-					)
-				}
+			ht.allocator.PerformOperation(ht.vals.ColVecs(), func() {
+				ht.vals.append(batch, 0 /* startIdx */, batch.Length())
 			})
 
 			ht.buildScratch.next = append(ht.buildScratch.next, ht.probeScratch.hashBuffer[:batch.Length()]...)
-			ht.buildNextChains(ctx, ht.buildScratch.first, ht.buildScratch.next, ht.vals.Length()+1, batch.Length())
-			ht.vals.SetLength(ht.vals.Length() + batch.Length())
+			ht.buildNextChains(ctx, ht.buildScratch.first, ht.buildScratch.next, numBuffered+1, batch.Length())
 		}
 	default:
-		execerror.VectorizedInternalPanic(fmt.Sprintf("hashTable in unhandled state"))
+		colexecerror.InternalError(fmt.Sprintf("hashTable in unhandled state"))
 	}
 }
 
@@ -326,17 +307,13 @@ func (ht *hashTable) removeDuplicates(
 // checkCols performs a column by column checkCol on the key columns.
 func (ht *hashTable) checkCols(
 	probeVecs, buildVecs []coldata.Vec,
-	probeKeyTypes []coltypes.T,
 	buildKeyCols []uint32,
 	nToCheck uint64,
 	probeSel []int,
 	buildSel []int,
 ) {
 	for i := range ht.keyCols {
-		probeType := probeKeyTypes[i]
-		buildType := ht.keyTypes[i]
-		ht.checkCol(probeVecs[i], buildVecs[buildKeyCols[i]], probeType, buildType,
-			i, nToCheck, probeSel, buildSel)
+		ht.checkCol(probeVecs[i], buildVecs[buildKeyCols[i]], i, nToCheck, probeSel, buildSel)
 	}
 }
 
@@ -349,42 +326,15 @@ func (ht *hashTable) checkColsForDistinctTuples(
 	for i := range ht.keyCols {
 		probeVec := probeVecs[i]
 		buildVec := buildVecs[ht.keyCols[i]]
-		probeType := ht.keyTypes[i]
 
-		ht.checkColForDistinctTuples(probeVec, buildVec, probeType, nToCheck, probeSel)
+		ht.checkColForDistinctTuples(probeVec, buildVec, nToCheck, probeSel)
 	}
-}
-
-// loadBatch appends a new batch of keys and outputs to the existing keys and
-// output columns.
-func (ht *hashTable) loadBatch(batch coldata.Batch) {
-	batchSize := batch.Length()
-	ht.allocator.PerformOperation(ht.vals.ColVecs(), func() {
-		htSize := ht.vals.Length()
-		for i, typ := range ht.valTypes {
-			ht.vals.ColVec(i).Append(
-				coldata.SliceArgs{
-					ColType:   typ,
-					Src:       batch.ColVec(i),
-					Sel:       batch.Selection(),
-					DestIdx:   htSize,
-					SrcEndIdx: batchSize,
-				},
-			)
-		}
-		ht.vals.SetLength(htSize + batchSize)
-	})
 }
 
 // computeBuckets computes the hash value of each key and stores the result in
 // buckets.
 func (ht *hashTable) computeBuckets(
-	ctx context.Context,
-	buckets []uint64,
-	keyTypes []coltypes.T,
-	keys []coldata.Vec,
-	nKeys int,
-	sel []int,
+	ctx context.Context, buckets []uint64, keys []coldata.Vec, nKeys int, sel []int,
 ) {
 	initHash(buckets, nKeys, defaultInitHashValue)
 
@@ -394,7 +344,7 @@ func (ht *hashTable) computeBuckets(
 	}
 
 	for i := range ht.keyCols {
-		rehash(ctx, buckets, keyTypes[i], keys[i], nKeys, sel, ht.cancelChecker, ht.decimalScratch)
+		rehash(ctx, buckets, keys[i], nKeys, sel, ht.cancelChecker, ht.decimalScratch)
 	}
 
 	finalizeHash(buckets, nKeys, ht.numBuckets)
@@ -465,10 +415,8 @@ func (ht *hashTable) maybeAllocateSameAndVisited() {
 // lookupInitial finds the corresponding hash table buckets for the equality
 // column of the batch and stores the results in groupID. It also initializes
 // toCheck with all indices in the range [0, batchSize).
-func (ht *hashTable) lookupInitial(
-	ctx context.Context, keyTypes []coltypes.T, batchSize int, sel []int,
-) {
-	ht.computeBuckets(ctx, ht.probeScratch.buckets, keyTypes, ht.probeScratch.keys, batchSize, sel)
+func (ht *hashTable) lookupInitial(ctx context.Context, batchSize int, sel []int) {
+	ht.computeBuckets(ctx, ht.probeScratch.buckets, ht.probeScratch.keys, batchSize, sel)
 	for i := 0; i < batchSize; i++ {
 		ht.probeScratch.groupID[i] = ht.buildScratch.first[ht.probeScratch.buckets[i]]
 		ht.probeScratch.toCheck[i] = uint64(i)

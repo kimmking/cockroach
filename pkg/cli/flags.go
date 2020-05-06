@@ -240,7 +240,9 @@ func init() {
 
 	// Every command but start will inherit the following setting.
 	AddPersistentPreRunE(cockroachCmd, func(cmd *cobra.Command, _ []string) error {
-		extraClientFlagInit()
+		if err := extraClientFlagInit(); err != nil {
+			return err
+		}
 		return setDefaultStderrVerbosity(cmd, log.Severity_WARNING)
 	})
 
@@ -358,10 +360,12 @@ func init() {
 		VarFlag(f, &serverCfg.Stores, cliflags.Store)
 		VarFlag(f, &serverCfg.StorageEngine, cliflags.StorageEngine)
 		VarFlag(f, &serverCfg.MaxOffset, cliflags.MaxOffset)
+		StringFlag(f, &serverCfg.ClockDevicePath, cliflags.ClockDevice, "")
 
 		StringFlag(f, &startCtx.listeningURLFile, cliflags.ListeningURLFile, startCtx.listeningURLFile)
 
 		StringFlag(f, &startCtx.pidFile, cliflags.PIDFile, startCtx.pidFile)
+		StringFlag(f, &startCtx.geoLibsDir, cliflags.GeoLibsDir, startCtx.geoLibsDir)
 
 		// Use a separate variable to store the value of ServerInsecure.
 		// We share the default with the ClientInsecure flag.
@@ -388,7 +392,8 @@ func init() {
 		// 'start' will check that the flag is properly defined.
 		VarFlag(f, &serverCfg.JoinList, cliflags.Join)
 		VarFlag(f, clusterNameSetter{&baseCfg.ClusterName}, cliflags.ClusterName)
-		BoolFlag(f, &baseCfg.DisableClusterNameVerification, cliflags.DisableClusterNameVerification, false)
+		BoolFlag(f, &baseCfg.DisableClusterNameVerification,
+			cliflags.DisableClusterNameVerification, baseCfg.DisableClusterNameVerification)
 		if cmd == startSingleNodeCmd {
 			// Even though all server flags are supported for
 			// 'start-single-node', we intend that command to be used by
@@ -438,6 +443,9 @@ func init() {
 		f := cmd.Flags()
 		// All certs commands need the certificate directory.
 		StringFlag(f, &baseCfg.SSLCertsDir, cliflags.CertsDir, baseCfg.SSLCertsDir)
+		// All certs commands get the certificate principal map.
+		StringSlice(f, &cliCtx.certPrincipalMap,
+			cliflags.CertPrincipalMap, cliCtx.certPrincipalMap)
 	}
 
 	for _, cmd := range []*cobra.Command{createCACertCmd, createClientCACertCmd} {
@@ -469,6 +477,7 @@ func init() {
 		debugZipCmd,
 		dumpCmd,
 		genHAProxyCmd,
+		initCmd,
 		quitCmd,
 		sqlShellCmd,
 		/* StartCmds are covered above */
@@ -476,7 +485,6 @@ func init() {
 	clientCmds = append(clientCmds, authCmds...)
 	clientCmds = append(clientCmds, nodeCmds...)
 	clientCmds = append(clientCmds, systemBenchCmds...)
-	clientCmds = append(clientCmds, initCmd)
 	clientCmds = append(clientCmds, nodeLocalCmds...)
 	for _, cmd := range clientCmds {
 		f := cmd.PersistentFlags()
@@ -488,6 +496,9 @@ func init() {
 
 		// Certificate flags.
 		StringFlag(f, &baseCfg.SSLCertsDir, cliflags.CertsDir, baseCfg.SSLCertsDir)
+		// Certificate principal map.
+		StringSlice(f, &cliCtx.certPrincipalMap,
+			cliflags.CertPrincipalMap, cliCtx.certPrincipalMap)
 	}
 
 	// Auth commands.
@@ -545,6 +556,13 @@ func init() {
 		}
 	}
 
+	// Zip command.
+	{
+		f := debugZipCmd.Flags()
+		VarFlag(f, &zipCtx.nodes.inclusive, cliflags.ZipNodes)
+		VarFlag(f, &zipCtx.nodes.exclusive, cliflags.ZipExcludeNodes)
+	}
+
 	// Decommission command.
 	VarFlag(decommissionNodeCmd.Flags(), &nodeCtx.nodeDecommissionWait, cliflags.Wait)
 
@@ -559,6 +577,13 @@ func init() {
 		_ = f.MarkDeprecated(cliflags.Decommission.Name, `use 'cockroach node decommission' then 'cockroach quit' instead`)
 	}
 
+	// Quit and node drain.
+	for _, cmd := range []*cobra.Command{quitCmd, drainNodeCmd} {
+		f := cmd.Flags()
+		DurationFlag(f, &quitCtx.drainWait, cliflags.DrainWait, quitCtx.drainWait)
+	}
+
+	// SQL and demo commands.
 	for _, cmd := range append([]*cobra.Command{sqlShellCmd, demoCmd}, demoCmd.Commands()...) {
 		f := cmd.Flags()
 		VarFlag(f, &sqlCtx.setStmts, cliflags.Set)
@@ -570,6 +595,7 @@ func init() {
 
 	VarFlag(dumpCmd.Flags(), &dumpCtx.dumpMode, cliflags.DumpMode)
 	StringFlag(dumpCmd.Flags(), &dumpCtx.asOf, cliflags.DumpTime, dumpCtx.asOf)
+	BoolFlag(dumpCmd.Flags(), &dumpCtx.dumpAll, cliflags.DumpAll, dumpCtx.dumpAll)
 
 	// Commands that establish a SQL connection.
 	sqlCmds := []*cobra.Command{sqlShellCmd, dumpCmd, demoCmd}
@@ -583,6 +609,20 @@ func init() {
 		if cmd != demoCmd {
 			VarFlag(f, urlParser{cmd, &cliCtx, false /* strictSSL */}, cliflags.URL)
 			StringFlag(f, &cliCtx.sqlConnUser, cliflags.User, cliCtx.sqlConnUser)
+
+			// Even though SQL commands take their connection parameters via
+			// --url / --user (see above), the urlParser{} struct internally
+			// needs the ClientHost and ClientPort flags to be defined -
+			// even if they are invisible - due to the way initialization from
+			// env vars is implemented.
+			//
+			// TODO(knz): if/when env var option initialization is deferred
+			// to parse time, this can be removed.
+			VarFlag(f, addrSetter{&cliCtx.clientConnHost, &cliCtx.clientConnPort}, cliflags.ClientHost)
+			_ = f.MarkHidden(cliflags.ClientHost.Name)
+			StringFlag(f, &cliCtx.clientConnPort, cliflags.ClientPort, cliCtx.clientConnPort)
+			_ = f.MarkHidden(cliflags.ClientPort.Name)
+
 		}
 
 		if cmd == sqlShellCmd {
@@ -590,14 +630,18 @@ func init() {
 		}
 	}
 
-	// Make the other non-SQL client commands also recognize --url in
-	// strict SSL mode.
+	// Make the non-SQL client commands also recognize --url in strict SSL mode
+	// and ensure they can connect to clusters that use a cluster-name.
 	for _, cmd := range clientCmds {
 		if f := flagSetForCmd(cmd).Lookup(cliflags.URL.Name); f != nil {
 			// --url already registered above, nothing to do.
 			continue
 		}
-		VarFlag(cmd.PersistentFlags(), urlParser{cmd, &cliCtx, true /* strictSSL */}, cliflags.URL)
+		f := cmd.PersistentFlags()
+		VarFlag(f, urlParser{cmd, &cliCtx, true /* strictSSL */}, cliflags.URL)
+		VarFlag(f, clusterNameSetter{&baseCfg.ClusterName}, cliflags.ClusterName)
+		BoolFlag(f, &baseCfg.DisableClusterNameVerification,
+			cliflags.DisableClusterNameVerification, baseCfg.DisableClusterNameVerification)
 	}
 
 	// Commands that print tables.
@@ -621,20 +665,21 @@ func init() {
 	demoFlags := demoCmd.PersistentFlags()
 	// We add this command as a persistent flag so you can do stuff like
 	// ./cockroach demo movr --nodes=3.
-	IntFlag(demoFlags, &demoCtx.nodes, cliflags.DemoNodes, 1)
-	BoolFlag(demoFlags, &demoCtx.runWorkload, cliflags.RunDemoWorkload, false)
+	IntFlag(demoFlags, &demoCtx.nodes, cliflags.DemoNodes, demoCtx.nodes)
+	BoolFlag(demoFlags, &demoCtx.runWorkload, cliflags.RunDemoWorkload, demoCtx.runWorkload)
 	VarFlag(demoFlags, &demoCtx.localities, cliflags.DemoNodeLocality)
-	BoolFlag(demoFlags, &demoCtx.geoPartitionedReplicas, cliflags.DemoGeoPartitionedReplicas, false)
+	BoolFlag(demoFlags, &demoCtx.geoPartitionedReplicas, cliflags.DemoGeoPartitionedReplicas, demoCtx.geoPartitionedReplicas)
 	VarFlag(demoFlags, demoNodeSQLMemSizeValue, cliflags.DemoNodeSQLMemSize)
 	VarFlag(demoFlags, demoNodeCacheSizeValue, cliflags.DemoNodeCacheSize)
-	BoolFlag(demoFlags, &demoCtx.insecure, cliflags.ServerInsecure, false)
-	BoolFlag(demoFlags, &demoCtx.disableLicenseAcquisition, cliflags.DemoNoLicense, false)
+	BoolFlag(demoFlags, &demoCtx.insecure, cliflags.ClientInsecure, demoCtx.insecure)
+	BoolFlag(demoFlags, &demoCtx.disableLicenseAcquisition, cliflags.DemoNoLicense, demoCtx.disableLicenseAcquisition)
 	// Mark the --global flag as hidden until we investigate it more.
-	BoolFlag(demoFlags, &demoCtx.simulateLatency, cliflags.Global, false)
+	BoolFlag(demoFlags, &demoCtx.simulateLatency, cliflags.Global, demoCtx.simulateLatency)
 	_ = demoFlags.MarkHidden(cliflags.Global.Name)
 	// The --empty flag is only valid for the top level demo command,
 	// so we use the regular flag set.
-	BoolFlag(demoCmd.Flags(), &demoCtx.useEmptyDatabase, cliflags.UseEmptyDatabase, false)
+	BoolFlag(demoCmd.Flags(), &demoCtx.useEmptyDatabase, cliflags.UseEmptyDatabase, demoCtx.useEmptyDatabase)
+	StringFlag(demoFlags, &demoCtx.geoLibsDir, cliflags.GeoLibsDir, demoCtx.geoLibsDir)
 
 	// sqlfmt command.
 	fmtFlags := sqlfmtCmd.Flags()
@@ -675,9 +720,27 @@ func init() {
 // actually parsed. For example, it will inject the value of
 // $COCKROACH_URL into the urlParser object linked to the --url flag.
 func processEnvVarDefaults() error {
-	for envVar, d := range envVarDefaults {
-		if err := d.flagSet.Set(d.flagName, d.envValue); err != nil {
-			return errors.Wrapf(err, "setting --%s from %s", d.flagName, envVar)
+	for _, d := range envVarDefaults {
+		f := d.flagSet.Lookup(d.flagName)
+		if f == nil {
+			panic(errors.AssertionFailedf("unknown flag: %s", d.flagName))
+		}
+		var err error
+		if url, ok := f.Value.(urlParser); ok {
+			// URLs are a special case: they can emit a warning if there's
+			// excess configuration for certain commands.
+			// Since the env-var initialization is ran for all commands
+			// all the time, regardless of which particular command is
+			// currently active, we want to silence this warning here.
+			//
+			// TODO(knz): rework this code to only pull env var values
+			// for the current command.
+			err = url.setInternal(d.envValue, false /* warn */)
+		} else {
+			err = d.flagSet.Set(d.flagName, d.envValue)
+		}
+		if err != nil {
+			return errors.Wrapf(err, "setting --%s from %s", d.flagName, d.envVar)
 		}
 	}
 	return nil
@@ -687,6 +750,7 @@ func processEnvVarDefaults() error {
 // setting covered by a flag from the value of an environment
 // variable.
 type envVarDefault struct {
+	envVar   string
 	envValue string
 	flagName string
 	flagSet  *pflag.FlagSet
@@ -694,7 +758,7 @@ type envVarDefault struct {
 
 // envVarDefaults records the initializations from environment variables
 // for processing at the end of initialization, before flag parsing.
-var envVarDefaults = map[string]envVarDefault{}
+var envVarDefaults []envVarDefault
 
 // registerEnvVarDefault registers a deferred initialization of a flag
 // from an environment variable.
@@ -707,11 +771,12 @@ func registerEnvVarDefault(f *pflag.FlagSet, flagInfo cliflags.FlagInfo) {
 		// Env var not set. Nothing to do.
 		return
 	}
-	envVarDefaults[flagInfo.EnvVar] = envVarDefault{
+	envVarDefaults = append(envVarDefaults, envVarDefault{
+		envVar:   flagInfo.EnvVar,
 		envValue: value,
 		flagName: flagInfo.Name,
 		flagSet:  f,
-	}
+	})
 }
 
 // extraServerFlagInit configures the server.Config based on the command-line flags.
@@ -824,7 +889,10 @@ func extraServerFlagInit(cmd *cobra.Command) error {
 	return nil
 }
 
-func extraClientFlagInit() {
+func extraClientFlagInit() error {
+	if err := security.SetCertPrincipalMap(cliCtx.certPrincipalMap); err != nil {
+		return err
+	}
 	serverCfg.Addr = net.JoinHostPort(cliCtx.clientConnHost, cliCtx.clientConnPort)
 	serverCfg.AdvertiseAddr = serverCfg.Addr
 	serverCfg.SQLAddr = net.JoinHostPort(cliCtx.clientConnHost, cliCtx.clientConnPort)
@@ -840,6 +908,7 @@ func extraClientFlagInit() {
 	if sqlCtx.debugMode {
 		sqlCtx.echo = true
 	}
+	return nil
 }
 
 func setDefaultStderrVerbosity(cmd *cobra.Command, defaultSeverity log.Severity) error {

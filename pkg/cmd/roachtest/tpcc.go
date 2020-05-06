@@ -238,6 +238,8 @@ func registerTPCC(r *testRegistry) {
 		},
 	})
 	mixedHeadroomSpec := makeClusterSpec(5, cpu(16))
+
+	// TODO(tbg): rewrite and extend this using the harness in versionupgrade.go.
 	r.Add(testSpec{
 		// mixed-headroom is similar to w=headroom, but with an additional node
 		// and on a mixed version cluster. It simulates a real production
@@ -285,14 +287,14 @@ func registerTPCC(r *testRegistry) {
 		},
 	})
 	r.Add(testSpec{
-		Name:       "weekly/tpcc-max",
+		Name:       "weekly/tpcc/headroom",
 		Owner:      OwnerKV,
 		MinVersion: maybeMinVersionForFixturesImport(cloud),
 		Tags:       []string{`weekly`},
 		Cluster:    makeClusterSpec(4, cpu(16)),
 		Timeout:    time.Duration(6*24)*time.Hour + time.Duration(10)*time.Minute,
 		Run: func(ctx context.Context, t *test, c *cluster) {
-			warehouses := 1350
+			warehouses := 1000
 			runTPCC(ctx, t, c, tpccOptions{
 				Warehouses: warehouses,
 				Duration:   6 * 24 * time.Hour,

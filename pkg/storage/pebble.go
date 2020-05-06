@@ -18,6 +18,8 @@ import (
 	"io/ioutil"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -28,11 +30,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/vfs"
-	"github.com/pkg/errors"
 )
 
 // MVCCKeyCompare compares cockroach keys, including the MVCC timestamps.
@@ -92,7 +94,7 @@ var MVCCComparer = &pebble.Comparer{
 		return pebble.DefaultComparer.AbbreviatedKey(key)
 	},
 
-	Format: func(k []byte) fmt.Formatter {
+	FormatKey: func(k []byte) fmt.Formatter {
 		decoded, err := DecodeMVCCKey(k)
 		if err != nil {
 			return mvccKeyFormatter{err: err}
@@ -249,21 +251,34 @@ func (t *pebbleTimeBoundPropCollector) Name() string {
 	return "TimeBoundTblPropCollectorFactory"
 }
 
+var _ pebble.NeedCompacter = &pebbleDeleteRangeCollector{}
+
 // pebbleDeleteRangeCollector marks an sstable for compaction that contains a
 // range tombstone.
-type pebbleDeleteRangeCollector struct{}
+type pebbleDeleteRangeCollector struct {
+	numRangeTombstones int
+}
 
-func (pebbleDeleteRangeCollector) Add(key pebble.InternalKey, value []byte) error {
-	// TODO(peter): track whether a range tombstone is present. Need to extend
-	// the TablePropertyCollector interface.
+func (c *pebbleDeleteRangeCollector) Add(key pebble.InternalKey, value []byte) error {
+	if key.Kind() == pebble.InternalKeyKindRangeDelete {
+		c.numRangeTombstones++
+	}
 	return nil
 }
 
-func (pebbleDeleteRangeCollector) Finish(userProps map[string]string) error {
+// NeedCompact implements the pebble.NeedCompacter interface.
+func (c *pebbleDeleteRangeCollector) NeedCompact() bool {
+	// NB: Mark any file containing range deletions as requiring a
+	// compaction. This ensures that range deletions are quickly compacted out
+	// of existence.
+	return c.numRangeTombstones > 0
+}
+
+func (*pebbleDeleteRangeCollector) Finish(userProps map[string]string) error {
 	return nil
 }
 
-func (pebbleDeleteRangeCollector) Name() string {
+func (*pebbleDeleteRangeCollector) Name() string {
 	// This constant needs to match the one used by the RocksDB version of this
 	// table property collector. DO NOT CHANGE.
 	return "DeleteRangeTblPropCollectorFactory"
@@ -786,7 +801,10 @@ func (p *Pebble) GetEncryptionRegistries() (*EncryptionRegistries, error) {
 		}
 	}
 	if p.fileRegistry != nil {
-		rv.FileRegistry = []byte(p.fileRegistry.getRegistryCopy().String())
+		rv.FileRegistry, err = protoutil.Marshal(p.fileRegistry.getRegistryCopy())
+		if err != nil {
+			return nil, err
+		}
 	}
 	return rv, nil
 }
@@ -806,14 +824,28 @@ func (p *Pebble) GetEnvStats() (*EnvStats, error) {
 		return nil, err
 	}
 	fr := p.fileRegistry.getRegistryCopy()
-	if fr != nil {
-		stats.TotalFiles = uint64(len(fr.Files))
-	}
 	activeKeyID, err := p.statsHandler.GetActiveDataKeyID()
 	if err != nil {
 		return nil, err
 	}
-	for _, entry := range fr.Files {
+
+	m := p.db.Metrics()
+	stats.TotalFiles = 3 /* CURRENT, MANIFEST, OPTIONS */
+	stats.TotalFiles += uint64(m.WAL.Files + m.Table.ZombieCount + m.WAL.ObsoleteFiles)
+	stats.TotalBytes = m.WAL.Size + m.Table.ZombieSize
+	for _, l := range m.Levels {
+		stats.TotalFiles += uint64(l.NumFiles)
+		stats.TotalBytes += l.Size
+	}
+
+	sstSizes := make(map[pebble.FileNum]uint64)
+	for _, ssts := range p.db.SSTables() {
+		for _, sst := range ssts {
+			sstSizes[sst.FileNum] = sst.Size
+		}
+	}
+
+	for filePath, entry := range fr.Files {
 		keyID, err := p.statsHandler.GetKeyIDFromSettings(entry.EncryptionSettings)
 		if err != nil {
 			return nil, err
@@ -821,9 +853,21 @@ func (p *Pebble) GetEnvStats() (*EnvStats, error) {
 		if len(keyID) == 0 {
 			keyID = "plain"
 		}
-		if keyID == activeKeyID {
-			stats.ActiveKeyFiles++
+		if keyID != activeKeyID {
+			continue
 		}
+		stats.ActiveKeyFiles++
+
+		filename := p.fs.PathBase(filePath)
+		numStr := strings.TrimSuffix(filename, ".sst")
+		if len(numStr) == len(filename) {
+			continue // not a sstable
+		}
+		u, err := strconv.ParseUint(numStr, 10, 64)
+		if err != nil {
+			return nil, errors.Wrapf(err, "parsing filename %q", errors.Safe(filename))
+		}
+		stats.ActiveKeyBytes += sstSizes[pebble.FileNum(u)]
 	}
 	return stats, nil
 }
@@ -929,31 +973,14 @@ func (p *Pebble) DeleteFile(filename string) error {
 
 // DeleteDirAndFiles implements the Engine interface.
 func (p *Pebble) DeleteDirAndFiles(dir string) error {
-	// TODO(itsbilal): Implement FS.RemoveAll then call that here instead.
-	files, err := p.fs.List(dir)
+	// NB RemoveAll does not return an error if dir does not exist, but we want
+	// DeleteDirAndFiles to return an error in that case to match the RocksDB
+	// behavior.
+	_, err := p.fs.Stat(dir)
 	if err != nil {
 		return err
 	}
-
-	// Recurse through all files, calling DeleteFile or DeleteDirAndFiles as
-	// appropriate.
-	for _, filename := range files {
-		path := p.fs.PathJoin(dir, filename)
-		stat, err := p.fs.Stat(path)
-		if err != nil {
-			return err
-		}
-
-		if stat.IsDir() {
-			err = p.DeleteDirAndFiles(path)
-		} else {
-			err = p.DeleteFile(path)
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return p.fs.RemoveAll(dir)
 }
 
 // LinkFile implements the FS interface.

@@ -21,6 +21,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -46,6 +47,9 @@ import (
 )
 
 const defaultLeniencySetting = 60 * time.Second
+
+// See https://github.com/cockroachdb/cockroach/issues/47892.
+const multiTenancyIssueNo = 47892
 
 var (
 	nodeLivenessLogLimiter = log.Every(5 * time.Second)
@@ -96,10 +100,11 @@ type NodeLiveness interface {
 type Registry struct {
 	ac         log.AmbientContext
 	stopper    *stop.Stopper
+	nl         NodeLiveness
 	db         *kv.DB
 	ex         sqlutil.InternalExecutor
 	clock      *hlc.Clock
-	nodeID     *base.NodeIDContainer
+	nodeID     *base.SQLIDContainer
 	settings   *cluster.Settings
 	planFn     planHookMaker
 	metrics    Metrics
@@ -174,9 +179,10 @@ func MakeRegistry(
 	ac log.AmbientContext,
 	stopper *stop.Stopper,
 	clock *hlc.Clock,
+	nl NodeLiveness,
 	db *kv.DB,
 	ex sqlutil.InternalExecutor,
-	nodeID *base.NodeIDContainer,
+	nodeID *base.SQLIDContainer,
 	settings *cluster.Settings,
 	histogramWindowInterval time.Duration,
 	planFn planHookMaker,
@@ -186,6 +192,7 @@ func MakeRegistry(
 		ac:                  ac,
 		stopper:             stopper,
 		clock:               clock,
+		nl:                  nl,
 		db:                  db,
 		ex:                  ex,
 		nodeID:              nodeID,
@@ -252,7 +259,7 @@ func (r *Registry) makeCtx() (context.Context, func()) {
 }
 
 func (r *Registry) makeJobID() int64 {
-	return int64(builtins.GenerateUniqueInt(r.nodeID.Get()))
+	return int64(builtins.GenerateUniqueInt(r.nodeID.SQLInstanceID()))
 }
 
 // CreateAndStartJob creates and asynchronously starts a job from record. An
@@ -294,12 +301,15 @@ func (r *Registry) Run(ctx context.Context, ex sqlutil.InternalExecutor, jobs []
 		if i > 0 {
 			buf.WriteString(",")
 		}
-		buf.WriteString(fmt.Sprintf(" (%d)", id))
+		buf.WriteString(fmt.Sprintf(" %d", id))
 	}
 	// Manually retry instead of using SHOW JOBS WHEN COMPLETE so we have greater
-	// control over retries.
+	// control over retries. Also, avoiding SHOW JOBS prevents us from having to
+	// populate the crdb_internal.jobs vtable.
 	query := fmt.Sprintf(
-		"SELECT count(*) FROM [SHOW JOBS VALUES %s] WHERE finished IS NULL", buf.String())
+		`SELECT count(*) FROM system.jobs WHERE id IN (%s)
+       AND (status != 'succeeded' AND status != 'failed' AND status != 'canceled')`,
+		buf.String())
 	for r := retry.StartWithCtx(ctx, retry.Options{
 		InitialBackoff: 10 * time.Millisecond,
 		MaxBackoff:     1 * time.Second,
@@ -457,14 +467,11 @@ const gcInterval = 1 * time.Hour
 // jobs if it observes a failure. Otherwise it starts all the main daemons of
 // registry that poll the jobs table and start/cancel/gc jobs.
 func (r *Registry) Start(
-	ctx context.Context,
-	stopper *stop.Stopper,
-	nl NodeLiveness,
-	cancelInterval, adoptInterval time.Duration,
+	ctx context.Context, stopper *stop.Stopper, cancelInterval, adoptInterval time.Duration,
 ) error {
 	// Calling maybeCancelJobs once at the start ensures we have an up-to-date
 	// liveness epoch before we wait out the first cancelInterval.
-	r.maybeCancelJobs(ctx, nl)
+	r.maybeCancelJobs(ctx, r.nl)
 
 	stopper.RunWorker(context.Background(), func(ctx context.Context) {
 		for {
@@ -472,7 +479,7 @@ func (r *Registry) Start(
 			case <-stopper.ShouldStop():
 				return
 			case <-time.After(cancelInterval):
-				r.maybeCancelJobs(ctx, nl)
+				r.maybeCancelJobs(ctx, r.nl)
 			}
 		}
 	})
@@ -496,7 +503,7 @@ func (r *Registry) Start(
 			r.cancelAll(ctx)
 			return
 		}
-		if err := r.maybeAdoptJob(ctx, nl, randomizeJobOrder); err != nil {
+		if err := r.maybeAdoptJob(ctx, r.nl, randomizeJobOrder); err != nil {
 			log.Errorf(ctx, "error while adopting jobs: %s", err)
 		}
 	}
@@ -558,7 +565,7 @@ func (r *Registry) isOrphaned(ctx context.Context, payload *jobspb.Payload) (boo
 	for _, id := range payload.DescriptorIDs {
 		pendingMutations := false
 		if err := r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			td, err := sqlbase.GetTableDescFromID(ctx, txn, id)
+			td, err := sqlbase.GetTableDescFromID(ctx, txn, keys.TODOSQLCodec, id)
 			if err != nil {
 				return err
 			}
@@ -769,11 +776,17 @@ func (r *Registry) createResumer(job *Job, settings *cluster.Settings) (Resumer,
 
 type retryJobError string
 
+// retryJobErrorSentinel exists so the errors returned from NewRetryJobError can
+// be marked with it, allowing more robust detection of retry errors even if
+// they are wrapped, etc. This was originally introduced to deal with injected
+// retry errors from testing knobs.
+var retryJobErrorSentinel = retryJobError("")
+
 // NewRetryJobError creates a new error that, if returned by a Resumer,
 // indicates to the jobs registry that the job should be restarted in the
 // background.
 func NewRetryJobError(s string) error {
-	return retryJobError(s)
+	return errors.Mark(retryJobError(s), retryJobErrorSentinel)
 }
 
 func (r retryJobError) Error() string {
@@ -817,8 +830,8 @@ func (r *Registry) stepThroughStateMachine(
 		// TODO(spaskob): enforce a limit on retries.
 		// TODO(spaskob,lucy): Add metrics on job retries. Consider having a backoff
 		// mechanism (possibly combined with a retry limit).
-		if e, ok := err.(retryJobError); ok {
-			return errors.Errorf("job %d: %s: restarting in background", *job.ID(), e)
+		if errors.Is(err, retryJobErrorSentinel) {
+			return errors.Errorf("job %d: %s: restarting in background", *job.ID(), err)
 		}
 		if err, ok := errors.Cause(err).(*InvalidStatusError); ok {
 			if err.status != StatusCancelRequested && err.status != StatusPauseRequested {
@@ -868,7 +881,7 @@ func (r *Registry) stepThroughStateMachine(
 			// If the job has failed with any error different than canceled we
 			// mark it as Failed.
 			nextStatus := StatusFailed
-			if errors.Is(errJobCanceled, jobErr) {
+			if errors.Is(jobErr, errJobCanceled) {
 				nextStatus = StatusCanceled
 			}
 			return r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, nextStatus, jobErr)
@@ -878,8 +891,8 @@ func (r *Registry) stepThroughStateMachine(
 			// mark the job as failed because it can be resumed by another node.
 			return errors.Errorf("job %d: node liveness error: restarting in background", *job.ID())
 		}
-		if e, ok := err.(retryJobError); ok {
-			return errors.Errorf("job %d: %s: restarting in background", *job.ID(), e)
+		if errors.Is(err, retryJobErrorSentinel) {
+			return errors.Errorf("job %d: %s: restarting in background", *job.ID(), err)
 		}
 		if err, ok := errors.Cause(err).(*InvalidStatusError); ok {
 			if err.status != StatusPauseRequested {
@@ -964,7 +977,7 @@ func (r *Registry) adoptionDisabled(ctx context.Context) bool {
 	if r.preventAdoptionFile != "" {
 		if _, err := os.Stat(r.preventAdoptionFile); err != nil {
 			if !os.IsNotExist(err) {
-				log.Warning(ctx, "error checking if job adoption is currently disabled", err)
+				log.Warningf(ctx, "error checking if job adoption is currently disabled: %v", err)
 			}
 			return false
 		}
@@ -1017,10 +1030,10 @@ WHERE status IN ($1, $2, $3, $4, $5) ORDER BY created DESC`
 
 			// Don't try to start any more jobs unless we're really live,
 			// otherwise we'd just immediately cancel them.
-			if liveness.NodeID == r.nodeID.Get() {
+			if liveness.NodeID == r.nodeID.DeprecatedNodeID(multiTenancyIssueNo) {
 				if !liveness.IsLive(r.clock.Now().GoTime()) {
 					return errors.Errorf(
-						"trying to adopt jobs on node %d which is not live", r.nodeID.Get())
+						"trying to adopt jobs on node %d which is not live", liveness.NodeID)
 				}
 			}
 		}
@@ -1098,7 +1111,9 @@ WHERE status IN ($1, $2, $3, $4, $5) ORDER BY created DESC`
 		_, runningOnNode := r.mu.jobs[*id]
 		r.mu.Unlock()
 
-		if notLeaseHolder := payload.Lease.NodeID != r.nodeID.Get(); notLeaseHolder {
+		if notLeaseHolder := payload.Lease.NodeID != r.nodeID.DeprecatedNodeID(
+			multiTenancyIssueNo,
+		); notLeaseHolder {
 			// Another node holds the lease on the job, see if we should steal it.
 			if runningOnNode {
 				// If we are currently running a job that another node has the lease on,
@@ -1200,7 +1215,7 @@ WHERE status IN ($1, $2, $3, $4, $5) ORDER BY created DESC`
 }
 
 func (r *Registry) newLease() *jobspb.Lease {
-	nodeID := r.nodeID.Get()
+	nodeID := r.nodeID.DeprecatedNodeID(multiTenancyIssueNo)
 	if nodeID == 0 {
 		panic("jobs.Registry has empty node ID")
 	}

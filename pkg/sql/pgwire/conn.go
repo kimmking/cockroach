@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -213,6 +212,8 @@ func (c *conn) serveImpl(
 	authOpt authOptions,
 	stopper *stop.Stopper,
 ) {
+	defer func() { _ = c.conn.Close() }()
+
 	ctx = logtags.AddTag(ctx, "user", c.sessionArgs.User)
 
 	inTestWithoutSQL := sqlServer == nil
@@ -221,7 +222,6 @@ func (c *conn) serveImpl(
 		authLogger = sqlServer.GetExecutorConfig().AuthLogger
 		sessionStart := timeutil.Now()
 		defer func() {
-			_ = c.conn.Close()
 			if c.authLogEnabled() {
 				authLogger.Logf(ctx, "session terminated; duration: %s", timeutil.Now().Sub(sessionStart))
 			}
@@ -259,9 +259,6 @@ func (c *conn) serveImpl(
 	var sessionAuthLogger *log.SecondaryLogger
 	if !inTestWithoutSQL && c.authLogEnabled() {
 		sessionAuthLogger = authLogger
-		telemetry.Inc(sqltelemetry.LoggedAuthAttempts)
-	} else {
-		telemetry.Inc(sqltelemetry.UnloggedAuthAttempts)
 	}
 
 	// We'll build an authPipe to communicate with the authentication process.
@@ -612,8 +609,6 @@ func (c *conn) bufferParamStatus(param, value string) error {
 
 func (c *conn) bufferNotice(ctx context.Context, noticeErr error) error {
 	c.msgBuilder.initMsg(pgwirebase.ServerMsgNoticeResponse)
-	c.msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFieldSeverity)
-	c.msgBuilder.writeTerminatedString("NOTICE")
 	return writeErrFields(ctx, c.sv, noticeErr, &c.msgBuilder, &c.writerState.buf)
 }
 
@@ -1200,8 +1195,6 @@ func writeErr(
 	// Record telemetry for the error.
 	sqltelemetry.RecordError(ctx, err, sv)
 	msgBuilder.initMsg(pgwirebase.ServerMsgErrorResponse)
-	msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFieldSeverity)
-	msgBuilder.writeTerminatedString("ERROR")
 	return writeErrFields(ctx, sv, err, msgBuilder, w)
 }
 
@@ -1210,6 +1203,9 @@ func writeErrFields(
 ) error {
 	// Now send the error to the client.
 	pgErr := pgerror.Flatten(err)
+
+	msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFieldSeverity)
+	msgBuilder.writeTerminatedString(pgErr.Severity)
 
 	msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFieldSQLState)
 	msgBuilder.writeTerminatedString(pgErr.Code)
@@ -1289,7 +1285,7 @@ func (c *conn) writeRowDescription(
 		typ := pgTypeForParserType(column.Typ)
 		c.msgBuilder.putInt32(0) // Table OID (optional).
 		c.msgBuilder.putInt16(0) // Column attribute ID (optional).
-		c.msgBuilder.putInt32(int32(mapResultOid(typ.oid)))
+		c.msgBuilder.putInt32(int32(typ.oid))
 		c.msgBuilder.putInt16(int16(typ.size))
 		// The type modifier (atttypmod) is used to include various extra information
 		// about the type being sent. -1 is used for values which don't make use of

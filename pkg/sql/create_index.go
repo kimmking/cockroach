@@ -14,14 +14,16 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
@@ -80,7 +82,7 @@ func (p *planner) setupFamilyAndConstraintForShard(
 	if err != nil {
 		return err
 	}
-	info, err := tableDesc.GetConstraintInfo(ctx, nil)
+	info, err := tableDesc.GetConstraintInfo(ctx, nil, p.ExecCfg().Codec)
 	if err != nil {
 		return err
 	}
@@ -114,6 +116,16 @@ func (p *planner) setupFamilyAndConstraintForShard(
 func MakeIndexDescriptor(
 	params runParams, n *tree.CreateIndex, tableDesc *sqlbase.MutableTableDescriptor,
 ) (*sqlbase.IndexDescriptor, error) {
+	// Ensure that the columns we want to index exist before trying to create the
+	// index.
+	if err := validateIndexColumnsExist(tableDesc, n.Columns); err != nil {
+		return nil, err
+	}
+
+	// Ensure that the index name does not exist before trying to create the index.
+	if err := tableDesc.ValidateIndexNameIsUnique(string(n.Name)); err != nil {
+		return nil, err
+	}
 	indexDesc := sqlbase.IndexDescriptor{
 		Name:              string(n.Name),
 		Unique:            n.Unique,
@@ -142,6 +154,18 @@ func MakeIndexDescriptor(
 			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes can't be unique")
 		}
 		indexDesc.Type = sqlbase.IndexDescriptor_INVERTED
+		columnDesc, _, err := tableDesc.FindColumnByName(n.Columns[0].Column)
+		if err != nil {
+			return nil, err
+		}
+		if columnDesc.Type.InternalType.Family == types.GeometryFamily {
+			indexDesc.GeoConfig = *geoindex.DefaultGeometryIndexConfig()
+			telemetry.Inc(sqltelemetry.GeometryInvertedIndexCounter)
+		}
+		if columnDesc.Type.InternalType.Family == types.GeographyFamily {
+			indexDesc.GeoConfig = *geoindex.DefaultGeographyIndexConfig()
+			telemetry.Inc(sqltelemetry.GeographyInvertedIndexCounter)
+		}
 		telemetry.Inc(sqltelemetry.InvertedIndexCounter)
 	}
 
@@ -154,7 +178,8 @@ func MakeIndexDescriptor(
 		}
 		shardCol, newColumn, err := setupShardedIndex(
 			params.ctx,
-			params.EvalContext().Settings,
+			params.EvalContext(),
+			&params.p.semaCtx,
 			params.SessionData().HashShardedIndexesEnabled,
 			&n.Columns,
 			n.Sharded.ShardBuckets,
@@ -179,6 +204,23 @@ func MakeIndexDescriptor(
 	return &indexDesc, nil
 }
 
+// validateIndexColumnsExists validates that the columns for an index exist
+// in the table and are not being dropped prior to attempting to add the index.
+func validateIndexColumnsExist(
+	desc *sqlbase.MutableTableDescriptor, columns tree.IndexElemList,
+) error {
+	for _, column := range columns {
+		_, dropping, err := desc.FindColumnByName(column.Column)
+		if err != nil {
+			return err
+		}
+		if dropping {
+			return sqlbase.NewUndefinedColumnError(string(column.Column))
+		}
+	}
+	return nil
+}
+
 // ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
 // This is because CREATE INDEX performs multiple KV operations on descriptors
 // and expects to see its own writes.
@@ -192,7 +234,8 @@ var hashShardedIndexesDisabledError = pgerror.Newf(pgcode.FeatureNotSupported,
 
 func setupShardedIndex(
 	ctx context.Context,
-	st *cluster.Settings,
+	evalCtx *tree.EvalContext,
+	semaCtx *tree.SemaContext,
 	shardedIndexEnabled bool,
 	columns *tree.IndexElemList,
 	bucketsExpr tree.Expr,
@@ -200,6 +243,7 @@ func setupShardedIndex(
 	indexDesc *sqlbase.IndexDescriptor,
 	isNewTable bool,
 ) (shard *sqlbase.ColumnDescriptor, newColumn bool, err error) {
+	st := evalCtx.Settings
 	if !st.Version.IsActive(ctx, clusterversion.VersionHashShardedIndexes) {
 		return nil, false, invalidClusterForShardedIndexError
 	}
@@ -211,7 +255,7 @@ func setupShardedIndex(
 	for _, c := range *columns {
 		colNames = append(colNames, string(c.Column))
 	}
-	buckets, err := tree.EvalShardBucketCount(bucketsExpr)
+	buckets, err := sqlbase.EvalShardBucketCount(semaCtx, evalCtx, bucketsExpr)
 	if err != nil {
 		return nil, false, err
 	}
@@ -249,6 +293,12 @@ func maybeCreateAndAddShardCol(
 		// TODO(ajwerner): In what ways is existingShardCol allowed to differ from
 		// the newly made shardCol? Should there be some validation of
 		// existingShardCol?
+		if !existingShardCol.Hidden {
+			// The user managed to reverse-engineer our crazy shard column name, so
+			// we'll return an error here rather than try to be tricky.
+			return nil, false, pgerror.Newf(pgcode.DuplicateColumn,
+				"column %s already specified; can't be used for sharding", shardCol.Name)
+		}
 		return existingShardCol, false, nil
 	}
 	columnIsUndefined := sqlbase.IsUndefinedColumnError(err)
@@ -282,7 +332,7 @@ func (n *createIndexNode) startExec(params runParams) error {
 	if n.n.Concurrently {
 		params.p.SendClientNotice(
 			params.ctx,
-			pgerror.Noticef("CONCURRENTLY is not required as all indexes are created concurrently"),
+			pgnotice.Newf("CONCURRENTLY is not required as all indexes are created concurrently"),
 		)
 	}
 
@@ -292,7 +342,7 @@ func (n *createIndexNode) startExec(params runParams) error {
 		params.p.SendClientNotice(
 			params.ctx,
 			errors.WithHint(
-				pgerror.Noticef("creating non-partitioned index on partitioned table may not be performant"),
+				pgnotice.Newf("creating non-partitioned index on partitioned table may not be performant"),
 				"Consider modifying the index such that it is also partitioned.",
 			),
 		)
@@ -361,7 +411,7 @@ func (n *createIndexNode) startExec(params runParams) error {
 		params.p.txn,
 		EventLogCreateIndex,
 		int32(n.tableDesc.ID),
-		int32(params.extendedEvalCtx.NodeID),
+		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
 		struct {
 			TableName  string
 			IndexName  string

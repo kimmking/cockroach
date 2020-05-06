@@ -514,7 +514,7 @@ func (node *ComparisonExpr) memoizeFn() {
 			//   x = ANY(SELECT y FROM t)
 			//   x = ANY(1,2)
 			if len(rightRet.TupleContents()) > 0 {
-				rightRet = &rightRet.TupleContents()[0]
+				rightRet = rightRet.TupleContents()[0]
 			} else {
 				rightRet = leftRet
 			}
@@ -598,12 +598,24 @@ func (node *RangeCond) TypedTo() TypedExpr {
 type IsOfTypeExpr struct {
 	Not   bool
 	Expr  Expr
-	Types []*types.T
+	Types []ResolvableTypeReference
+
+	resolvedTypes []*types.T
 
 	typeAnnotation
 }
 
 func (*IsOfTypeExpr) operatorExpr() {}
+
+// ResolvedTypes returns a slice of resolved types corresponding
+// to the Types slice of unresolved types. It may only be accessed
+// after typechecking.
+func (node *IsOfTypeExpr) ResolvedTypes() []*types.T {
+	if node.resolvedTypes == nil {
+		panic("ResolvedTypes called on an IsOfTypeExpr before typechecking")
+	}
+	return node.resolvedTypes
+}
 
 // Format implements the NodeFormatter interface.
 func (node *IsOfTypeExpr) Format(ctx *FmtCtx) {
@@ -1151,6 +1163,8 @@ func (UnaryOperator) operator() {}
 const (
 	UnaryMinus UnaryOperator = iota
 	UnaryComplement
+	UnarySqrt
+	UnaryCbrt
 
 	NumUnaryOperators
 )
@@ -1160,6 +1174,8 @@ var _ = NumUnaryOperators
 var unaryOpName = [...]string{
 	UnaryMinus:      "-",
 	UnaryComplement: "~",
+	UnarySqrt:       "|/",
+	UnaryCbrt:       "||/",
 }
 
 func (i UnaryOperator) String() string {
@@ -1418,7 +1434,7 @@ const (
 // CastExpr represents a CAST(expr AS type) expression.
 type CastExpr struct {
 	Expr Expr
-	Type *types.T
+	Type ResolvableTypeReference
 
 	typeAnnotation
 	SyntaxMode castSyntaxMode
@@ -1429,7 +1445,7 @@ func (node *CastExpr) Format(ctx *FmtCtx) {
 	switch node.SyntaxMode {
 	case CastPrepend:
 		// This is a special case for things like INTERVAL '1s'. These only work
-		// with string constats; if the underlying expression was changed, we fall
+		// with string constants; if the underlying expression was changed, we fall
 		// back to the short syntax.
 		if _, ok := node.Expr.(*StrVal); ok {
 			ctx.WriteString(node.Type.SQLString())
@@ -1446,19 +1462,19 @@ func (node *CastExpr) Format(ctx *FmtCtx) {
 		ctx.WriteString("CAST(")
 		ctx.FormatNode(node.Expr)
 		ctx.WriteString(" AS ")
-		if node.Type.Family() == types.CollatedStringFamily {
+		if typ, ok := GetStaticallyKnownType(node.Type); ok && typ.Family() == types.CollatedStringFamily {
 			// Need to write closing parentheses before COLLATE clause, so create
 			// equivalent string type without the locale.
 			strTyp := types.MakeScalar(
 				types.StringFamily,
-				node.Type.Oid(),
-				node.Type.Precision(),
-				node.Type.Width(),
+				typ.Oid(),
+				typ.Precision(),
+				typ.Width(),
 				"", /* locale */
 			)
 			ctx.WriteString(strTyp.SQLString())
 			ctx.WriteString(") COLLATE ")
-			lex.EncodeLocaleName(&ctx.Buffer, node.Type.Locale())
+			lex.EncodeLocaleName(&ctx.Buffer, typ.Locale())
 		} else {
 			ctx.WriteString(node.Type.SQLString())
 			ctx.WriteByte(')')
@@ -1467,10 +1483,10 @@ func (node *CastExpr) Format(ctx *FmtCtx) {
 }
 
 // NewTypedCastExpr returns a new CastExpr that is verified to be well-typed.
-func NewTypedCastExpr(expr TypedExpr, typ *types.T) (*CastExpr, error) {
+func NewTypedCastExpr(expr TypedExpr, typ *types.T) *CastExpr {
 	node := &CastExpr{Expr: expr, Type: typ, SyntaxMode: CastShort}
 	node.typ = typ
-	return node, nil
+	return node
 }
 
 type castInfo struct {
@@ -1485,11 +1501,14 @@ var (
 		types.Timestamp, types.TimestampTZ, types.Date, types.Interval, types.Oid, types.VarBit})
 	floatCastTypes = annotateCast(types.Float, []*types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.AnyCollatedString,
 		types.Timestamp, types.TimestampTZ, types.Date, types.Interval})
-	decimalCastTypes = annotateCast(types.Decimal, []*types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.AnyCollatedString,
+	geographyCastTypes = annotateCast(types.Geography, []*types.T{types.Unknown, types.String, types.Geography, types.Geometry})
+	geometryCastTypes  = annotateCast(types.Geometry, []*types.T{types.Unknown, types.String, types.Geography, types.Geometry})
+	decimalCastTypes   = annotateCast(types.Decimal, []*types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.AnyCollatedString,
 		types.Timestamp, types.TimestampTZ, types.Date, types.Interval})
 	stringCastTypes = annotateCast(types.String, []*types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.AnyCollatedString,
 		types.VarBit,
 		types.AnyArray, types.AnyTuple,
+		types.Geometry, types.Geography,
 		types.Bytes, types.Timestamp, types.TimestampTZ, types.Interval, types.Uuid, types.Date, types.Time, types.TimeTZ, types.Oid, types.INet, types.Jsonb})
 	bytesCastTypes = annotateCast(types.Bytes, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Bytes, types.Uuid})
 	dateCastTypes  = annotateCast(types.Date, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Date, types.Timestamp, types.TimestampTZ, types.Int})
@@ -1524,6 +1543,10 @@ func validCastTypes(t *types.T) []castInfo {
 		return bytesCastTypes
 	case types.DateFamily:
 		return dateCastTypes
+	case types.GeographyFamily:
+		return geographyCastTypes
+	case types.GeometryFamily:
+		return geometryCastTypes
 	case types.TimeFamily:
 		return timeCastTypes
 	case types.TimeTZFamily:
@@ -1584,7 +1607,7 @@ const (
 // AnnotateTypeExpr represents a ANNOTATE_TYPE(expr, type) expression.
 type AnnotateTypeExpr struct {
 	Expr Expr
-	Type *types.T
+	Type ResolvableTypeReference
 
 	SyntaxMode annotateSyntaxMode
 }
@@ -1593,11 +1616,13 @@ type AnnotateTypeExpr struct {
 func (node *AnnotateTypeExpr) Format(ctx *FmtCtx) {
 	if ctx.HasFlags(FmtPGAttrdefAdbin) {
 		ctx.FormatNode(node.Expr)
-		switch node.Type.Family() {
-		case types.StringFamily, types.CollatedStringFamily:
-			// Postgres formats strings using a cast afterward. Let's do the same.
-			ctx.WriteString("::")
-			ctx.WriteString(node.Type.SQLString())
+		if typ, ok := GetStaticallyKnownType(node.Type); ok {
+			switch typ.Family() {
+			case types.StringFamily, types.CollatedStringFamily:
+				// Postgres formats strings using a cast afterward. Let's do the same.
+				ctx.WriteString("::")
+				ctx.WriteString(node.Type.SQLString())
+			}
 		}
 		return
 	}
@@ -1685,7 +1710,7 @@ func NewTypedColumnAccessExpr(expr TypedExpr, colName string, colIdx int) *Colum
 		ColName:        colName,
 		ByIndex:        colName == "",
 		ColIndex:       colIdx,
-		typeAnnotation: typeAnnotation{typ: &expr.ResolvedType().TupleContents()[colIdx]},
+		typeAnnotation: typeAnnotation{typ: expr.ResolvedType().TupleContents()[colIdx]},
 	}
 }
 
@@ -1722,6 +1747,8 @@ func (node *DTime) String() string            { return AsString(node) }
 func (node *DTimeTZ) String() string          { return AsString(node) }
 func (node *DDecimal) String() string         { return AsString(node) }
 func (node *DFloat) String() string           { return AsString(node) }
+func (node *DGeography) String() string       { return AsString(node) }
+func (node *DGeometry) String() string        { return AsString(node) }
 func (node *DInt) String() string             { return AsString(node) }
 func (node *DInterval) String() string        { return AsString(node) }
 func (node *DJSON) String() string            { return AsString(node) }

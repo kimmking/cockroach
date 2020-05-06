@@ -31,8 +31,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
-	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -57,16 +57,14 @@ var webSessionTimeout = settings.RegisterPublicNonNegativeDurationSetting(
 )
 
 type authenticationServer struct {
-	server     *Server
-	memMetrics *sql.MemoryMetrics
+	server *Server
 }
 
 // newAuthenticationServer allocates and returns a new REST server for
 // authentication APIs.
 func newAuthenticationServer(s *Server) *authenticationServer {
 	return &authenticationServer{
-		server:     s,
-		memMetrics: &s.adminMemMetrics,
+		server: s,
 	}
 }
 
@@ -167,7 +165,7 @@ func (s *authenticationServer) UserLogout(
 	}
 
 	// Revoke the session.
-	if n, err := s.server.internalExecutor.ExecEx(
+	if n, err := s.server.sqlServer.internalExecutor.ExecEx(
 		ctx,
 		"revoke-auth-session",
 		nil, /* txn */
@@ -177,9 +175,9 @@ func (s *authenticationServer) UserLogout(
 	); err != nil {
 		return nil, apiInternalError(ctx, err)
 	} else if n == 0 {
-		msg := fmt.Sprintf("session with id %d nonexistent", sessionID)
-		log.Info(ctx, msg)
-		return nil, fmt.Errorf(msg)
+		err := errors.Newf("session with id %d nonexistent", sessionID)
+		log.Infof(ctx, "%v", err)
+		return nil, err
 	}
 
 	// Send back a header which will cause the browser to destroy the cookie.
@@ -215,7 +213,7 @@ WHERE id = $1`
 		isRevoked    bool
 	)
 
-	row, err := s.server.internalExecutor.QueryRowEx(
+	row, err := s.server.sqlServer.internalExecutor.QueryRowEx(
 		ctx,
 		"lookup-auth-session",
 		nil, /* txn */
@@ -264,7 +262,7 @@ func (s *authenticationServer) verifyPassword(
 	ctx context.Context, username string, password string,
 ) (valid bool, expired bool, err error) {
 	exists, canLogin, pwRetrieveFn, validUntilFn, err := sql.GetUserHashedPassword(
-		ctx, s.server.execCfg.InternalExecutor, username,
+		ctx, s.server.sqlServer.execCfg.InternalExecutor, username,
 	)
 	if err != nil {
 		return false, false, err
@@ -322,7 +320,7 @@ RETURNING id
 `
 	var id int64
 
-	row, err := s.server.internalExecutor.QueryRowEx(
+	row, err := s.server.sqlServer.internalExecutor.QueryRowEx(
 		ctx,
 		"create-auth-session",
 		nil, /* txn */

@@ -222,7 +222,7 @@ SELECT * FROM [EXPLAIN SELECT * FROM child@i] OFFSET 2
 ----
 scan  ·      ·
 ·     table  child@i
-·     spans  ALL
+·     spans  FULL SCAN
 
 query IIII
 SELECT * FROM child@i
@@ -385,7 +385,7 @@ index-join  ·            ·
  │          key columns  y
  └── scan   ·            ·
 ·           table        t@i1
-·           spans        ALL
+·           spans        FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i1
@@ -400,7 +400,7 @@ index-join  ·            ·
  │          key columns  y
  └── scan   ·            ·
 ·           table        t@i2
-·           spans        ALL
+·           spans        FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i2
@@ -415,7 +415,7 @@ index-join  ·            ·
  │          key columns  y
  └── scan   ·            ·
 ·           table        t@i3
-·           spans        ALL
+·           spans        FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i3
@@ -430,7 +430,7 @@ index-join  ·            ·
  │          key columns  y
  └── scan   ·            ·
 ·           table        t@i4
-·           spans        ALL
+·           spans        FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i4
@@ -445,7 +445,7 @@ index-join  ·            ·
  │          key columns  y
  └── scan   ·            ·
 ·           table        t@i5
-·           spans        ALL
+·           spans        FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i5
@@ -460,7 +460,7 @@ index-join  ·            ·
  │          key columns  y
  └── scan   ·            ·
 ·           table        t@i7
-·           spans        ALL
+·           spans        FULL SCAN
 
 query IIIIT
 SELECT * FROM t@i5
@@ -735,20 +735,6 @@ ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (x)
 statement ok
 ROLLBACK
 
-# Ensure that we cannot cancel the index cleanup jobs spawned by
-# a primary key change.
-statement ok
-DROP TABLE IF EXISTS t;
-CREATE TABLE t (x INT PRIMARY KEY, y INT NOT NULL);
-ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (y)
-
-statement error pq: job [0-9]*: not cancelable
-CANCEL JOB (
-  SELECT job_id FROM [SHOW JOBS] WHERE
-  description = 'CLEANUP JOB for ''ALTER TABLE test.public.t ALTER PRIMARY KEY USING COLUMNS (y)''' AND
-  status = 'running'
-)
-
 # Ensure that starting a primary key change that does not
 # enqueue any mutations doesn't start a job.
 # TODO (rohany): This test might become obselete when #44923 is fixed.
@@ -769,7 +755,7 @@ statement ok
 DROP TABLE IF EXISTS t;
 CREATE TABLE t (x INT PRIMARY KEY, y INT NOT NULL, FAMILY (x), FAMILY (y))
 
-statement error pq: primary key of table t dropped without subsequent addition of new primary key
+statement error pq: unimplemented: primary key of table t dropped without subsequent addition of new primary key
 ALTER TABLE t DROP CONSTRAINT "primary"
 
 statement error pq: multiple primary keys for table "t" are not allowed
@@ -833,7 +819,7 @@ BEGIN
 statement ok
 ALTER TABLE t DROP CONSTRAINT "primary"
 
-statement error pq: requested table does not have a primary key
+statement error pgcode 55C02 requested table does not have a primary key
 INSERT INTO t VALUES (1, 1)
 
 statement ok
@@ -845,7 +831,7 @@ BEGIN
 statement ok
 ALTER TABLE t DROP CONSTRAINT "primary"
 
-statement error pq: requested table does not have a primary key
+statement error pgcode 55C02 pq: requested table does not have a primary key
 DELETE FROM t WHERE x = 1
 
 statement ok
@@ -857,7 +843,7 @@ BEGIN
 statement ok
 ALTER TABLE t DROP CONSTRAINT "primary"
 
-statement error pq: requested table does not have a primary key
+statement error pgcode 55C02 pq: requested table does not have a primary key
 UPDATE t SET x = 1 WHERE y = 1
 
 statement ok
@@ -869,7 +855,7 @@ BEGIN
 statement ok
 ALTER TABLE t DROP CONSTRAINT "primary"
 
-statement error pq: requested table does not have a primary key
+statement error pgcode 55C02 pq: requested table does not have a primary key
 SELECT * FROM t
 
 statement ok
@@ -884,7 +870,7 @@ BEGIN
 statement ok
 ALTER TABLE t DROP CONSTRAINT "primary"
 
-statement error pq: requested table does not have a primary key
+statement error pgcode 55C02 pq: requested table does not have a primary key
 CREATE INDEX ON t(x)
 
 statement ok
@@ -896,7 +882,7 @@ BEGIN
 statement ok
 ALTER TABLE t DROP CONSTRAINT "primary"
 
-statement error pq: requested table does not have a primary key
+statement error pgcode 55C02 pq: requested table does not have a primary key
 ALTER TABLE t ADD COLUMN z INT
 
 statement ok
@@ -908,7 +894,7 @@ BEGIN
 statement ok
 ALTER TABLE t DROP CONSTRAINT "primary"
 
-statement error pq: requested table does not have a primary key
+statement error pgcode 55C02 pq: requested table does not have a primary key
 ALTER TABLE t ADD COLUMN z INT, ADD PRIMARY KEY (x)
 
 statement ok
@@ -930,7 +916,7 @@ ALTER TABLE t1 DROP CONSTRAINT "primary"
 statement ok
 INSERT INTO t2 VALUES (1)
 
-statement error pq: primary key of table t1 dropped without subsequent addition of new primary key
+statement error pq: unimplemented: primary key of table t1 dropped without subsequent addition of new primary key
 COMMIT
 
 query I

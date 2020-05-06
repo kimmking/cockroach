@@ -21,17 +21,17 @@ package colexec
 
 import (
 	"bytes"
-	"fmt"
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	// {{/*
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	// */}}
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
+
+// Remove unused warning.
+var _ = execgen.UNSAFEGET
 
 // {{/*
 
@@ -44,19 +44,35 @@ var _ bytes.Buffer
 // Dummy import to pull in "math" package.
 var _ = math.MaxInt64
 
+// _LEFT_CANONICAL_TYPE_FAMILY is the template variable.
+const _LEFT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _LEFT_TYPE_WIDTH is the template variable.
+const _LEFT_TYPE_WIDTH = 0
+
+// _RIGHT_CANONICAL_TYPE_FAMILY is the template variable.
+const _RIGHT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _RIGHT_TYPE_WIDTH is the template variable.
+const _RIGHT_TYPE_WIDTH = 0
+
 // _ASSIGN_NE is the template equality function for assigning the first input
 // to the result of the the second input != the third input.
 func _ASSIGN_NE(_, _, _ interface{}) int {
-	execerror.VectorizedInternalPanic("")
+	colexecerror.InternalError("")
 }
 
-// _PROBE_TYPE is the template type variable for coltypes.T. It will be
-// replaced by coltypes.Foo for each type Foo in the coltypes.T type.
-const _PROBE_TYPE = coltypes.Unhandled
+// _L_UNSAFEGET is the template function that will be replaced by
+// "execgen.UNSAFEGET" which uses _L_TYP.
+func _L_UNSAFEGET(_, _ interface{}) interface{} {
+	colexecerror.InternalError("")
+}
 
-// _BUILD_TYPE is the template type variable for coltypes.T. It will be
-// replaced by coltypes.Foo for each type Foo in the coltypes.T type.
-const _BUILD_TYPE = coltypes.Unhandled
+// _R_UNSAFEGET is the template function that will be replaced by
+// "execgen.UNSAFEGET" which uses _R_TYP.
+func _R_UNSAFEGET(_, _ interface{}) interface{} {
+	colexecerror.InternalError("")
+}
 
 func _CHECK_COL_BODY(
 	ht *hashTable,
@@ -71,8 +87,10 @@ func _CHECK_COL_BODY(
 	_USE_BUILD_SEL bool,
 ) { // */}}
 	// {{define "checkColBody" -}}
-	probeIsNull := false
-	buildIsNull := false
+	var (
+		probeIdx, buildIdx       int
+		probeIsNull, buildIsNull bool
+	)
 	// Early bounds check.
 	_ = ht.probeScratch.toCheck[nToCheck-1]
 	for i := uint64(0); i < nToCheck; i++ {
@@ -86,21 +104,21 @@ func _CHECK_COL_BODY(
 			// found.
 
 			// {{if .UseProbeSel}}
-			probeIdx := probeSel[toCheck]
+			probeIdx = probeSel[toCheck]
 			// {{else}}
-			probeIdx := int(toCheck)
+			probeIdx = int(toCheck)
 			// {{end}}
-			/* {{if .ProbeHasNulls }} */
+			/* {{if .ProbeHasNulls}} */
 			probeIsNull = probeVec.Nulls().NullAt(probeIdx)
 			/* {{end}} */
 
 			// {{if .UseBuildSel}}
-			buildIdx := buildSel[keyID-1]
+			buildIdx = buildSel[keyID-1]
 			// {{else}}
-			buildIdx := int(keyID - 1)
+			buildIdx = int(keyID - 1)
 			// {{end}}
 
-			/* {{if .BuildHasNulls }} */
+			/* {{if .BuildHasNulls}} */
 			buildIsNull = buildVec.Nulls().NullAt(buildIdx)
 			/* {{end}} */
 
@@ -124,8 +142,8 @@ func _CHECK_COL_BODY(
 			} else if buildIsNull {
 				ht.probeScratch.differs[toCheck] = true
 			} else {
-				probeVal := execgen.UNSAFEGET(probeKeys, probeIdx)
-				buildVal := execgen.UNSAFEGET(buildKeys, buildIdx)
+				probeVal := _L_UNSAFEGET(probeKeys, probeIdx)
+				buildVal := _R_UNSAFEGET(buildKeys, buildIdx)
 				var unique bool
 				_ASSIGN_NE(unique, probeVal, buildVal)
 
@@ -182,46 +200,46 @@ func _CHECK_COL_WITH_NULLS(
 // hashTable disallows null equality, then if any element in the key is null,
 // there is no match.
 func (ht *hashTable) checkCol(
-	probeVec, buildVec coldata.Vec,
-	probeType, buildType coltypes.T,
-	keyColIdx int,
-	nToCheck uint64,
-	probeSel []int,
-	buildSel []int,
+	probeVec, buildVec coldata.Vec, keyColIdx int, nToCheck uint64, probeSel []int, buildSel []int,
 ) {
-
 	// In order to inline the templated code of overloads, we need to have a
 	// `decimalScratch` local variable of type `decimalOverloadScratch`.
 	decimalScratch := ht.decimalScratch
-	switch probeType {
-	// {{range $lTyp, $rTypToOverload := .}}
-	case _PROBE_TYPE:
-		switch buildType {
-		// {{range $rTyp, $overload := $rTypToOverload}}
-		case _BUILD_TYPE:
-			probeKeys := probeVec._ProbeType()
-			buildKeys := buildVec._BuildType()
+	switch probeVec.CanonicalTypeFamily() {
+	// {{range .LeftFamilies}}
+	case _LEFT_CANONICAL_TYPE_FAMILY:
+		switch probeVec.Type().Width() {
+		// {{range .LeftWidths}}
+		case _LEFT_TYPE_WIDTH:
+			switch buildVec.CanonicalTypeFamily() {
+			// {{range .RightFamilies}}
+			case _RIGHT_CANONICAL_TYPE_FAMILY:
+				switch buildVec.Type().Width() {
+				// {{range .RightWidths}}
+				case _RIGHT_TYPE_WIDTH:
+					probeKeys := probeVec._ProbeType()
+					buildKeys := buildVec._BuildType()
 
-			if probeSel != nil {
-				if buildSel != nil {
-					_CHECK_COL_WITH_NULLS(ht, probeVec, buildVec, probeKeys, buildKeys, nToCheck, true, true)
-				} else {
-					_CHECK_COL_WITH_NULLS(ht, probeVec, buildVec, probeKeys, buildKeys, nToCheck, true, false)
+					if probeSel != nil {
+						if buildSel != nil {
+							_CHECK_COL_WITH_NULLS(ht, probeVec, buildVec, probeKeys, buildKeys, nToCheck, true, true)
+						} else {
+							_CHECK_COL_WITH_NULLS(ht, probeVec, buildVec, probeKeys, buildKeys, nToCheck, true, false)
+						}
+					} else {
+						if buildSel != nil {
+							_CHECK_COL_WITH_NULLS(ht, probeVec, buildVec, probeKeys, buildKeys, nToCheck, false, true)
+						} else {
+							_CHECK_COL_WITH_NULLS(ht, probeVec, buildVec, probeKeys, buildKeys, nToCheck, false, false)
+						}
+					}
+					// {{end}}
 				}
-			} else {
-				if buildSel != nil {
-					_CHECK_COL_WITH_NULLS(ht, probeVec, buildVec, probeKeys, buildKeys, nToCheck, false, true)
-				} else {
-					_CHECK_COL_WITH_NULLS(ht, probeVec, buildVec, probeKeys, buildKeys, nToCheck, false, false)
-				}
+				// {{end}}
 			}
 			// {{end}}
-		default:
-			execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled type %d", buildType))
 		}
-	// {{end}}
-	default:
-		execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled type %d", probeType))
+		// {{end}}
 	}
 }
 
@@ -229,7 +247,6 @@ func (ht *hashTable) checkCol(
 func _CHECK_COL_FOR_DISTINCT_WITH_NULLS(
 	ht *hashTable,
 	probeVec, buildVec coldata.Vec,
-	probeType coltypes.T,
 	nToCheck uint16,
 	probeSel []uint16,
 	_USE_PROBE_SEL bool,
@@ -255,35 +272,49 @@ func _CHECK_COL_FOR_DISTINCT_WITH_NULLS(
 } // */}}
 
 func (ht *hashTable) checkColForDistinctTuples(
-	probeVec, buildVec coldata.Vec, probeType coltypes.T, nToCheck uint64, probeSel []int,
+	probeVec, buildVec coldata.Vec, nToCheck uint64, probeSel []int,
 ) {
-	switch probeType {
-	// {{/*
-	// index directive allows the template to index into indexable types such as
-	// slices or maps. Following code is semantically equivalent to the Go code
-	// snippet below:
-	//
-	//  for lTyp, rTypeToOverload := range .Global {
-	//    overload := rTypeOverload[lTyp]
-	//	  ...
-	//  }
-	//
-	// */}}
-	// {{range $lTyp, $rTypToOverload := .}}
-	// {{with $overload := index $rTypToOverload $lTyp}}
-	case _PROBE_TYPE:
-		probeKeys := probeVec._ProbeType()
-		buildKeys := buildVec._ProbeType()
+	switch probeVec.CanonicalTypeFamily() {
+	// {{range .LeftFamilies}}
+	// {{$leftFamily := .LeftCanonicalFamilyStr}}
+	case _LEFT_CANONICAL_TYPE_FAMILY:
+		switch probeVec.Type().Width() {
+		// {{range .LeftWidths}}
+		// {{$leftWidth := .Width}}
+		case _LEFT_TYPE_WIDTH:
+			switch probeVec.CanonicalTypeFamily() {
+			// {{range .RightFamilies}}
+			// {{$rightFamily := .RightCanonicalFamilyStr}}
+			case _RIGHT_CANONICAL_TYPE_FAMILY:
+				switch probeVec.Type().Width() {
+				// {{range .RightWidths}}
+				// {{$rightWidth := .Width}}
+				// {{if and (eq $leftFamily $rightFamily) (eq $leftWidth $rightWidth)}}
+				// {{/* We're being this tricky with code generation because we
+				//      know that both probeVec and buildVec are of the same
+				//      type, so we need to iterate over one level of type
+				//      family - width. But, the checkCol function above needs
+				//      two layers, so in order to keep these templated
+				//      functions in a single file we make sure that we
+				//      generate the code only if the "second" level is the
+				//      same as the "first" one */}}
+				case _RIGHT_TYPE_WIDTH:
+					probeKeys := probeVec._ProbeType()
+					buildKeys := buildVec._ProbeType()
 
-		if probeSel != nil {
-			_CHECK_COL_FOR_DISTINCT_WITH_NULLS(ht, probeVec, buildVec, probeType, nToCheck, probeSel, true, false)
-		} else {
-			_CHECK_COL_FOR_DISTINCT_WITH_NULLS(ht, probeVec, buildVec, probeType, nToCheck, probeSel, false, false)
+					if probeSel != nil {
+						_CHECK_COL_FOR_DISTINCT_WITH_NULLS(ht, probeVec, buildVec, nToCheck, probeSel, true, false)
+					} else {
+						_CHECK_COL_FOR_DISTINCT_WITH_NULLS(ht, probeVec, buildVec, nToCheck, probeSel, false, false)
+					}
+					// {{end}}
+					// {{end}}
+				}
+				// {{end}}
+			}
+			// {{end}}
 		}
 		// {{end}}
-		// {{end}}
-	default:
-		execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled type %d", probeType))
 	}
 }
 
@@ -344,7 +375,7 @@ func (ht *hashTable) checkBuildForDistinct(
 	probeVecs []coldata.Vec, nToCheck uint64, probeSel []int,
 ) uint64 {
 	if probeSel == nil {
-		execerror.VectorizedInternalPanic("invalid selection vector")
+		colexecerror.InternalError("invalid selection vector")
 	}
 	copy(ht.probeScratch.distinct, zeroBoolColumn)
 
@@ -375,13 +406,9 @@ func (ht *hashTable) checkBuildForDistinct(
 // probe, or the bucket has reached the end (key not found in build table). The
 // new length of toCheck is returned by this function.
 func (ht *hashTable) check(
-	probeVecs []coldata.Vec,
-	probeKeyTypes []coltypes.T,
-	buildKeyCols []uint32,
-	nToCheck uint64,
-	probeSel []int,
+	probeVecs []coldata.Vec, buildKeyCols []uint32, nToCheck uint64, probeSel []int,
 ) uint64 {
-	ht.checkCols(probeVecs, ht.vals.ColVecs(), probeKeyTypes, buildKeyCols, nToCheck, probeSel, nil /* buildSel */)
+	ht.checkCols(probeVecs, ht.vals.ColVecs(), buildKeyCols, nToCheck, probeSel, nil /* buildSel */)
 
 	nDiffers := uint64(0)
 	_CHECK_BODY(ht, nDiffers, true)
@@ -393,7 +420,7 @@ func (ht *hashTable) check(
 // in the probe table.
 func (ht *hashTable) checkProbeForDistinct(vecs []coldata.Vec, nToCheck uint64, sel []int) uint64 {
 	for i := range ht.keyCols {
-		ht.checkCol(vecs[i], vecs[i], ht.keyTypes[i], ht.keyTypes[i], i, nToCheck, sel, sel)
+		ht.checkCol(vecs[i], vecs[i], i, nToCheck, sel, sel)
 	}
 
 	nDiffers := uint64(0)
@@ -459,14 +486,12 @@ func (ht *hashTable) updateSel(b coldata.Batch) {
 // toCheck. If the bucket has reached the end, the key is rejected. The toCheck
 // list is reconstructed to only hold the indices of the eqCol keys that have
 // not been found. The new length of toCheck is returned by this function.
-func (ht *hashTable) distinctCheck(
-	probeKeyTypes []coltypes.T, nToCheck uint64, probeSel []int,
-) uint64 {
+func (ht *hashTable) distinctCheck(nToCheck uint64, probeSel []int) uint64 {
 	probeVecs := ht.probeScratch.keys
 	buildVecs := ht.vals.ColVecs()
 	buildKeyCols := ht.keyCols
 	var buildSel []int
-	ht.checkCols(probeVecs, buildVecs, probeKeyTypes, buildKeyCols, nToCheck, probeSel, buildSel)
+	ht.checkCols(probeVecs, buildVecs, buildKeyCols, nToCheck, probeSel, buildSel)
 
 	// Select the indices that differ and put them into toCheck.
 	nDiffers := uint64(0)

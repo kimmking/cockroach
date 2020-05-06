@@ -51,7 +51,10 @@ func TestSampleAggregator(t *testing.T) {
 				Settings: st,
 				DB:       kvDB,
 				Executor: server.InternalExecutor().(sqlutil.InternalExecutor),
-				Gossip:   server.GossipI().(*gossip.Gossip),
+				Gossip: gossip.MakeDeprecatedGossip(
+					server.GossipI().(*gossip.Gossip),
+					true, /* exposed */
+				),
 			},
 		}
 		// Override the default memory limit. If memLimitBytes is small but
@@ -76,14 +79,14 @@ func TestSampleAggregator(t *testing.T) {
 		// aggregate the results.
 		numSamplers := 3
 
-		samplerOutTypes := []types.T{
-			*types.Int,   // original column
-			*types.Int,   // original column
-			*types.Int,   // rank
-			*types.Int,   // sketch index
-			*types.Int,   // num rows
-			*types.Int,   // null vals
-			*types.Bytes, // sketch data
+		samplerOutTypes := []*types.T{
+			types.Int,   // original column
+			types.Int,   // original column
+			types.Int,   // rank
+			types.Int,   // sketch index
+			types.Int,   // num rows
+			types.Int,   // null vals
+			types.Bytes, // sketch data
 		}
 
 		sketchSpecs := []execinfrapb.SketchSpec{
@@ -140,7 +143,7 @@ func TestSampleAggregator(t *testing.T) {
 		}
 
 		// Now run the sample aggregator.
-		finalOut := distsqlutils.NewRowBuffer([]types.T{}, nil /* rows*/, distsqlutils.RowBufferArgs{})
+		finalOut := distsqlutils.NewRowBuffer([]*types.T{}, nil /* rows*/, distsqlutils.RowBufferArgs{})
 		spec := &execinfrapb.SampleAggregatorSpec{
 			SampleSize:       100,
 			Sketches:         sketchSpecs,

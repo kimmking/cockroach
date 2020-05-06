@@ -258,10 +258,13 @@ type Config struct {
 
 	// ReadyFn is called when the server has started listening on its
 	// sockets.
-	// The argument waitForInit indicates (iff true) that the
-	// server is not bootstrapped yet, will not bootstrap itself and
-	// will be waiting for an `init` command or accept bootstrapping
-	// from a joined node.
+	//
+	// The bool parameter is true if the server is not bootstrapped yet, will not
+	// bootstrap itself and will be waiting for an `init` command or accept
+	// bootstrapping from a joined node.
+	//
+	// This method is invoked from the main start goroutine, so it should not
+	// do nontrivial work.
 	ReadyFn func(waitForInit bool)
 
 	// DelayedBootstrapFn is called if the boostrap process does not complete
@@ -398,7 +401,7 @@ func (cfg *Config) Report(ctx context.Context) {
 	} else {
 		log.Infof(ctx, "system total memory: %s", humanizeutil.IBytes(memSize))
 	}
-	log.Info(ctx, "server configuration:\n", cfg)
+	log.Infof(ctx, "server configuration:\n%s", cfg)
 }
 
 // Engines is a container of engines, allowing convenient closing.
@@ -573,7 +576,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 	log.Infof(ctx, "%d storage engine%s initialized",
 		len(engines), util.Pluralize(int64(len(engines))))
 	for _, s := range details {
-		log.Info(ctx, s)
+		log.Infof(ctx, "%v", s)
 	}
 	enginesCopy := engines
 	engines = nil
@@ -582,7 +585,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 
 // InitNode parses node attributes and initializes the gossip bootstrap
 // resolvers.
-func (cfg *Config) InitNode() error {
+func (cfg *Config) InitNode(ctx context.Context) error {
 	cfg.readEnvironmentVariables()
 
 	// Initialize attributes.
@@ -593,7 +596,7 @@ func (cfg *Config) InitNode() error {
 	cfg.Config.HistogramWindowInterval = cfg.HistogramWindowInterval()
 
 	// Get the gossip bootstrap resolvers.
-	resolvers, err := cfg.parseGossipBootstrapResolvers()
+	resolvers, err := cfg.parseGossipBootstrapResolvers(ctx)
 	if err != nil {
 		return err
 	}
@@ -644,10 +647,10 @@ func (cfg *Config) readEnvironmentVariables() {
 }
 
 // parseGossipBootstrapResolvers parses list of gossip bootstrap resolvers.
-func (cfg *Config) parseGossipBootstrapResolvers() ([]resolver.Resolver, error) {
+func (cfg *Config) parseGossipBootstrapResolvers(ctx context.Context) ([]resolver.Resolver, error) {
 	var bootstrapResolvers []resolver.Resolver
 	for _, address := range cfg.JoinList {
-		srvAddrs, err := resolver.SRV(address)
+		srvAddrs, err := resolver.SRV(ctx, address)
 		if err != nil {
 			return nil, err
 		}

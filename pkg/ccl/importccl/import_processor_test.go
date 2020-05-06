@@ -10,7 +10,6 @@ package importccl
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"math"
@@ -46,6 +45,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -184,7 +184,7 @@ func (r *errorReportingRowReceiver) Push(
 }
 
 func (r *errorReportingRowReceiver) ProducerDone() {}
-func (r *errorReportingRowReceiver) Types() []types.T {
+func (r *errorReportingRowReceiver) Types() []*types.T {
 	return nil
 }
 
@@ -536,7 +536,7 @@ func queryJob(db sqlutils.DBHandle, jobID int64) (js jobState) {
 		payload := &jobspb.Payload{}
 		js.err = protoutil.Unmarshal(payloadBytes, payload)
 		if js.err == nil {
-			js.err = errors.New(payload.Error)
+			js.err = errors.Newf("%s", payload.Error)
 		}
 		return
 	}

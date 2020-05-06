@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -140,9 +141,19 @@ func (n *alterTableNode) startExec(params runParams) error {
 		switch t := cmd.(type) {
 		case *tree.AlterTableAddColumn:
 			d := t.ColumnDef
-			if d.HasFKConstraint() {
-				return unimplemented.NewWithIssue(32917,
-					"adding a REFERENCES constraint while also adding a column via ALTER not supported")
+			version := params.ExecCfg().Settings.Version.ActiveVersionOrEmpty(params.ctx)
+			toType, err := tree.ResolveType(d.Type, params.p.semaCtx.GetTypeResolver())
+			if err != nil {
+				return err
+			}
+			if supported, err := isTypeSupportedInVersion(version, toType); err != nil {
+				return err
+			} else if !supported {
+				return pgerror.Newf(
+					pgcode.FeatureNotSupported,
+					"type %s is not supported until version upgrade is finalized",
+					toType.SQLString(),
+				)
 			}
 
 			newDef, seqDbDesc, seqName, seqOpts, err := params.p.processSerialInColumnDef(params.ctx, d, tn)
@@ -166,7 +177,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			d = newDef
 			incTelemetryForNewColumn(d)
 
-			col, idx, expr, err := sqlbase.MakeColumnDefDescs(d, &params.p.semaCtx)
+			col, idx, expr, err := sqlbase.MakeColumnDefDescs(d, &params.p.semaCtx, params.EvalContext())
 			if err != nil {
 				return err
 			}
@@ -191,7 +202,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 			// We're checking to see if a user is trying add a non-nullable column without a default to a
 			// non empty table by scanning the primary index span with a limit of 1 to see if any key exists.
 			if !col.Nullable && (col.DefaultExpr == nil && !col.IsComputed()) {
-				kvs, err := params.p.txn.Scan(params.ctx, n.tableDesc.PrimaryIndexSpan().Key, n.tableDesc.PrimaryIndexSpan().EndKey, 1)
+				span := n.tableDesc.PrimaryIndexSpan(params.ExecCfg().Codec)
+				kvs, err := params.p.txn.Scan(params.ctx, span.Key, span.EndKey, 1)
 				if err != nil {
 					return err
 				}
@@ -232,7 +244,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 		case *tree.AlterTableAddConstraint:
-			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil)
+			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil, params.ExecCfg().Codec)
 			if err != nil {
 				return err
 			}
@@ -306,12 +318,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 			case *tree.ForeignKeyConstraintTableDef:
 				for _, colName := range d.FromCols {
-					col, err := n.tableDesc.FindActiveColumnByName(string(colName))
+					col, err := n.tableDesc.FindActiveOrNewColumnByName(colName)
 					if err != nil {
-						if _, dropped, inactiveErr := n.tableDesc.FindColumnByName(colName); inactiveErr == nil && !dropped {
-							return unimplemented.NewWithIssue(32917,
-								"adding a REFERENCES constraint while the column is being added not supported")
-						}
 						return err
 					}
 
@@ -331,7 +339,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 					// Check whether the table is empty, and pass the result to resolveFK(). If
 					// the table is empty, then resolveFK will automatically add the necessary
 					// index for a fk constraint if the index does not exist.
-					kvs, scanErr := params.p.txn.Scan(params.ctx, n.tableDesc.PrimaryIndexSpan().Key, n.tableDesc.PrimaryIndexSpan().EndKey, 1)
+					span := n.tableDesc.PrimaryIndexSpan(params.ExecCfg().Codec)
+					kvs, scanErr := params.p.txn.Scan(params.ctx, span.Key, span.EndKey, 1)
 					if scanErr != nil {
 						err = scanErr
 						return
@@ -383,7 +392,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return pgerror.DangerousStatementf("ALTER TABLE DROP COLUMN will remove all data in that column")
 			}
 
-			col, dropped, err := n.tableDesc.FindColumnByName(t.Column)
+			colToDrop, dropped, err := n.tableDesc.FindColumnByName(t.Column)
 			if err != nil {
 				if t.IfExists {
 					// Noop.
@@ -396,19 +405,19 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 			// If the dropped column uses a sequence, remove references to it from that sequence.
-			if len(col.UsesSequenceIds) > 0 {
-				if err := params.p.removeSequenceDependencies(params.ctx, n.tableDesc, col); err != nil {
+			if len(colToDrop.UsesSequenceIds) > 0 {
+				if err := params.p.removeSequenceDependencies(params.ctx, n.tableDesc, colToDrop); err != nil {
 					return err
 				}
 			}
 
 			// You can't remove a column that owns a sequence that is depended on
 			// by another column
-			if err := params.p.canRemoveAllColumnOwnedSequences(params.ctx, n.tableDesc, col, t.DropBehavior); err != nil {
+			if err := params.p.canRemoveAllColumnOwnedSequences(params.ctx, n.tableDesc, colToDrop, t.DropBehavior); err != nil {
 				return err
 			}
 
-			if err := params.p.dropSequencesOwnedByCol(params.ctx, col); err != nil {
+			if err := params.p.dropSequencesOwnedByCol(params.ctx, colToDrop); err != nil {
 				return err
 			}
 
@@ -417,7 +426,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			for _, ref := range n.tableDesc.DependedOnBy {
 				found := false
 				for _, colID := range ref.ColumnIDs {
-					if colID == col.ID {
+					if colID == colToDrop.ID {
 						found = true
 						break
 					}
@@ -437,15 +446,22 @@ func (n *alterTableNode) startExec(params runParams) error {
 				if err != nil {
 					return err
 				}
-				droppedViews, err = params.p.removeDependentView(params.ctx, n.tableDesc, viewDesc)
+				jobDesc := fmt.Sprintf("removing view %q dependent on column %q which is being dropped",
+					viewDesc.Name, colToDrop.ColName())
+				droppedViews, err = params.p.removeDependentView(params.ctx, n.tableDesc, viewDesc, jobDesc)
 				if err != nil {
 					return err
 				}
 			}
 
-			if n.tableDesc.PrimaryIndex.ContainsColumnID(col.ID) {
+			// We cannot remove this column if there are computed columns that use it.
+			if err := checkColumnHasNoComputedColDependencies(n.tableDesc, colToDrop); err != nil {
+				return err
+			}
+
+			if n.tableDesc.PrimaryIndex.ContainsColumnID(colToDrop.ID) {
 				return pgerror.Newf(pgcode.InvalidColumnReference,
-					"column %q is referenced by the primary key", col.Name)
+					"column %q is referenced by the primary key", colToDrop.Name)
 			}
 			for _, idx := range n.tableDesc.AllNonDropIndexes() {
 				// We automatically drop indexes on that column that only
@@ -471,7 +487,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 				// Analyze the index.
 				for _, id := range idx.ColumnIDs {
-					if id == col.ID {
+					if id == colToDrop.ID {
 						containsThisColumn = true
 					} else {
 						containsOnlyThisColumn = false
@@ -486,7 +502,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 						// sufficient reason to reject the DROP.
 						continue
 					}
-					if id == col.ID {
+					if id == colToDrop.ID {
 						containsThisColumn = true
 					}
 				}
@@ -494,7 +510,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				// loop below is for the new encoding (where the STORING columns are
 				// always in the value part of a KV).
 				for _, id := range idx.StoreColumnIDs {
-					if id == col.ID {
+					if id == colToDrop.ID {
 						containsThisColumn = true
 					}
 				}
@@ -502,16 +518,18 @@ func (n *alterTableNode) startExec(params runParams) error {
 				// Perform the DROP.
 				if containsThisColumn {
 					if containsOnlyThisColumn || t.DropBehavior == tree.DropCascade {
+						jobDesc := fmt.Sprintf("removing index %q dependent on column %q which is being"+
+							" dropped; full details: %s", idx.Name, colToDrop.ColName(),
+							tree.AsStringWithFQNames(n.n, params.Ann()))
 						if err := params.p.dropIndexByName(
 							params.ctx, tn, tree.UnrestrictedName(idx.Name), n.tableDesc, false,
-							t.DropBehavior, ignoreIdxConstraint,
-							tree.AsStringWithFQNames(n.n, params.Ann()),
+							t.DropBehavior, ignoreIdxConstraint, jobDesc,
 						); err != nil {
 							return err
 						}
 					} else {
 						return pgerror.Newf(pgcode.InvalidColumnReference,
-							"column %q is referenced by existing index %q", col.Name, idx.Name)
+							"column %q is referenced by existing index %q", colToDrop.Name, idx.Name)
 					}
 				}
 			}
@@ -522,7 +540,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			// indexes in the same way, FKs will have to be dropped separately here.
 			validChecks := n.tableDesc.Checks[:0]
 			for _, check := range n.tableDesc.AllActiveAndInactiveChecks() {
-				if used, err := check.UsesColumn(n.tableDesc.TableDesc(), col.ID); err != nil {
+				if used, err := check.UsesColumn(n.tableDesc.TableDesc(), colToDrop.ID); err != nil {
 					return err
 				} else if used {
 					if check.Validity == sqlbase.ConstraintValidity_Validating {
@@ -542,14 +560,14 @@ func (n *alterTableNode) startExec(params runParams) error {
 			if err != nil {
 				return err
 			}
-			if err := params.p.removeColumnComment(params.ctx, n.tableDesc.ID, col.ID); err != nil {
+			if err := params.p.removeColumnComment(params.ctx, n.tableDesc.ID, colToDrop.ID); err != nil {
 				return err
 			}
 
 			found := false
 			for i := range n.tableDesc.Columns {
-				if n.tableDesc.Columns[i].ID == col.ID {
-					n.tableDesc.AddColumnMutation(col, sqlbase.DescriptorMutation_DROP)
+				if n.tableDesc.Columns[i].ID == colToDrop.ID {
+					n.tableDesc.AddColumnMutation(colToDrop, sqlbase.DescriptorMutation_DROP)
 					// Use [:i:i] to prevent reuse of existing slice, or outstanding refs
 					// to ColumnDescriptors may unexpectedly change.
 					n.tableDesc.Columns = append(n.tableDesc.Columns[:i:i], n.tableDesc.Columns[i+1:]...)
@@ -561,12 +579,12 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 					"column %q in the middle of being added, try again later", t.Column)
 			}
-			if err := n.tableDesc.Validate(params.ctx, params.p.txn); err != nil {
+			if err := n.tableDesc.Validate(params.ctx, params.p.txn, params.ExecCfg().Codec); err != nil {
 				return err
 			}
 
 		case *tree.AlterTableDropConstraint:
-			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil)
+			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil, params.ExecCfg().Codec)
 			if err != nil {
 				return err
 			}
@@ -588,12 +606,12 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 			descriptorChanged = true
-			if err := n.tableDesc.Validate(params.ctx, params.p.txn); err != nil {
+			if err := n.tableDesc.Validate(params.ctx, params.p.txn, params.ExecCfg().Codec); err != nil {
 				return err
 			}
 
 		case *tree.AlterTableValidateConstraint:
-			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil)
+			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil, params.ExecCfg().Codec)
 			if err != nil {
 				return err
 			}
@@ -715,14 +733,16 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 		case *tree.AlterTableRenameColumn:
-			descChanged, err := params.p.renameColumn(params.ctx, n.tableDesc, &t.Column, &t.NewName)
+			const allowRenameOfShardColumn = false
+			descChanged, err := params.p.renameColumn(params.ctx, n.tableDesc,
+				&t.Column, &t.NewName, allowRenameOfShardColumn)
 			if err != nil {
 				return err
 			}
 			descriptorChanged = descChanged
 
 		case *tree.AlterTableRenameConstraint:
-			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil)
+			info, err := n.tableDesc.GetConstraintInfo(params.ctx, nil, params.ExecCfg().Codec)
 			if err != nil {
 				return err
 			}
@@ -797,7 +817,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 		params.p.txn,
 		EventLogAlterTable,
 		int32(n.tableDesc.ID),
-		int32(params.extendedEvalCtx.NodeID),
+		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
 		struct {
 			TableName           string
 			Statement           string
@@ -868,7 +888,21 @@ func applyColumnMutation(
 ) error {
 	switch t := mut.(type) {
 	case *tree.AlterTableAlterColumnType:
-		typ := t.ToType
+		typ, err := tree.ResolveType(t.ToType, params.p.semaCtx.GetTypeResolver())
+		if err != nil {
+			return err
+		}
+
+		version := params.ExecCfg().Settings.Version.ActiveVersionOrEmpty(params.ctx)
+		if supported, err := isTypeSupportedInVersion(version, typ); err != nil {
+			return err
+		} else if !supported {
+			return pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"type %s is not supported until version upgrade is finalized",
+				typ.SQLString(),
+			)
+		}
 
 		// Special handling for STRING COLLATE xy to verify that we recognize the language.
 		if t.Collation != "" {
@@ -879,7 +913,7 @@ func applyColumnMutation(
 			}
 		}
 
-		err := sqlbase.ValidateColumnDefType(typ)
+		err = sqlbase.ValidateColumnDefType(typ)
 		if err != nil {
 			return err
 		}
@@ -891,7 +925,7 @@ func applyColumnMutation(
 			return nil
 		}
 
-		kind, err := schemachange.ClassifyConversion(&col.Type, typ)
+		kind, err := schemachange.ClassifyConversion(col.Type, typ)
 		if err != nil {
 			return err
 		}
@@ -905,7 +939,15 @@ func applyColumnMutation(
 				"the requested type conversion (%s -> %s) requires an explicit USING expression",
 				col.Type.SQLString(), typ.SQLString())
 		case schemachange.ColumnConversionTrivial:
-			col.Type = *typ
+			col.Type = typ
+		case schemachange.ColumnConversionGeneral:
+			return unimplemented.NewWithIssueDetailf(
+				9851,
+				fmt.Sprintf("%s->%s", col.Type.SQLString(), typ.SQLString()),
+				"type conversion from %s to %s requires overwriting existing values which is not yet implemented",
+				col.Type.SQLString(),
+				typ.SQLString(),
+			)
 		default:
 			return unimplemented.NewWithIssueDetail(9851,
 				fmt.Sprintf("%s->%s", col.Type.SQLString(), typ.SQLString()),
@@ -921,7 +963,7 @@ func applyColumnMutation(
 		if t.Default == nil {
 			col.DefaultExpr = nil
 		} else {
-			colDatumType := &col.Type
+			colDatumType := col.Type
 			expr, err := sqlbase.SanitizeVarFreeExpr(
 				t.Default, colDatumType, "DEFAULT", &params.p.semaCtx, true, /* allowImpure */
 			)
@@ -966,7 +1008,7 @@ func applyColumnMutation(
 			}
 		}
 
-		info, err := tableDesc.GetConstraintInfo(params.ctx, nil)
+		info, err := tableDesc.GetConstraintInfo(params.ctx, nil, params.ExecCfg().Codec)
 		if err != nil {
 			return err
 		}
@@ -1001,7 +1043,7 @@ func applyColumnMutation(
 					"constraint in the middle of being dropped")
 			}
 		}
-		info, err := tableDesc.GetConstraintInfo(params.ctx, nil)
+		info, err := tableDesc.GetConstraintInfo(params.ctx, nil, params.ExecCfg().Codec)
 		if err != nil {
 			return err
 		}
@@ -1023,6 +1065,47 @@ func applyColumnMutation(
 				"column %q is not a computed column", col.Name)
 		}
 		col.ComputeExpr = nil
+	}
+	return nil
+}
+
+func checkColumnHasNoComputedColDependencies(
+	desc *sqlbase.MutableTableDescriptor, col *sqlbase.ColumnDescriptor,
+) error {
+	checkComputed := func(c *sqlbase.ColumnDescriptor) error {
+		if !c.IsComputed() {
+			return nil
+		}
+		expr, err := parser.ParseExpr(*c.ComputeExpr)
+		if err != nil {
+			// At this point, we should be able to parse the computed expression.
+			return errors.WithAssertionFailure(err)
+		}
+		return iterColDescriptorsInExpr(desc, expr, func(colVar *sqlbase.ColumnDescriptor) error {
+			if colVar.ID == col.ID {
+				return pgerror.Newf(
+					pgcode.InvalidColumnReference,
+					"column %q is referenced by computed column %q",
+					col.Name,
+					c.Name,
+				)
+			}
+			return nil
+		})
+	}
+	for i := range desc.Columns {
+		if err := checkComputed(&desc.Columns[i]); err != nil {
+			return err
+		}
+	}
+	for i := range desc.Mutations {
+		mut := &desc.Mutations[i]
+		mutCol := mut.GetColumn()
+		if mut.Direction == sqlbase.DescriptorMutation_ADD && mutCol != nil {
+			if err := checkComputed(mutCol); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -1075,7 +1158,7 @@ func injectTableStats(
 	// Insert each statistic.
 	for i := range jsonStats {
 		s := &jsonStats[i]
-		h, err := s.GetHistogram(params.EvalContext())
+		h, err := s.GetHistogram(&params.p.semaCtx, params.EvalContext())
 		if err != nil {
 			return err
 		}
@@ -1135,7 +1218,8 @@ func injectTableStats(
 	// update is handled asynchronously).
 	params.extendedEvalCtx.ExecCfg.TableStatsCache.InvalidateTableStats(params.ctx, desc.ID)
 
-	return stats.GossipTableStatAdded(params.extendedEvalCtx.ExecCfg.Gossip, desc.ID)
+	return stats.GossipTableStatAdded(
+		params.extendedEvalCtx.ExecCfg.Gossip.Deprecated(47925), desc.ID)
 }
 
 func (p *planner) removeColumnComment(

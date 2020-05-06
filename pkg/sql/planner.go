@@ -51,8 +51,8 @@ type extendedEvalContext struct {
 	// tracing state should be done through the sessionDataMutator.
 	Tracing *SessionTracing
 
-	// StatusServer gives access to the Status service. Used to cancel queries.
-	StatusServer serverpb.StatusServer
+	// StatusServer gives access to the Status service.
+	StatusServer serverpb.OptionalStatusServer
 
 	// MemMetrics represent the group of metrics to which execution should
 	// contribute.
@@ -295,7 +295,7 @@ func newInternalPlanner(
 	p.extendedEvalCtx.Sequence = p
 	p.extendedEvalCtx.ClusterID = execCfg.ClusterID()
 	p.extendedEvalCtx.ClusterName = execCfg.RPCContext.ClusterName()
-	p.extendedEvalCtx.NodeID = execCfg.NodeID.Get()
+	p.extendedEvalCtx.NodeID = execCfg.NodeID
 	p.extendedEvalCtx.Locality = execCfg.Locality
 
 	p.sessionDataMutator = dataMutator
@@ -332,10 +332,7 @@ func internalExtendedEvalCtx(
 	execCfg *ExecutorConfig,
 	plannerMon *mon.BytesMonitor,
 ) extendedEvalContext {
-	var evalContextTestingKnobs tree.EvalContextTestingKnobs
-	var statusServer serverpb.StatusServer
-	evalContextTestingKnobs = execCfg.EvalContextTestingKnobs
-	statusServer = execCfg.StatusServer
+	evalContextTestingKnobs := execCfg.EvalContextTestingKnobs
 
 	return extendedEvalContext{
 		EvalContext: tree.EvalContext{
@@ -344,6 +341,7 @@ func internalExtendedEvalCtx(
 			TxnReadOnly:      false,
 			TxnImplicit:      true,
 			Settings:         execCfg.Settings,
+			Codec:            execCfg.Codec,
 			Context:          ctx,
 			Mon:              plannerMon,
 			TestingKnobs:     evalContextTestingKnobs,
@@ -354,7 +352,7 @@ func internalExtendedEvalCtx(
 		SessionMutator:  dataMutator,
 		VirtualSchemas:  execCfg.VirtualSchemas,
 		Tracing:         &SessionTracing{},
-		StatusServer:    statusServer,
+		StatusServer:    execCfg.StatusServer,
 		Tables:          tables,
 		ExecCfg:         execCfg,
 		schemaAccessors: newSchemaInterface(tables, execCfg.VirtualSchemas),
@@ -425,7 +423,11 @@ func (p *planner) DistSQLPlanner() *DistSQLPlanner {
 // ParseType implements the tree.EvalPlanner interface.
 // We define this here to break the dependency from eval.go to the parser.
 func (p *planner) ParseType(sql string) (*types.T, error) {
-	return parser.ParseType(sql)
+	ref, err := parser.ParseType(sql)
+	if err != nil {
+		return nil, err
+	}
+	return tree.ResolveType(ref, p.semaCtx.GetTypeResolver())
 }
 
 // ParseQualifiedTableName implements the tree.EvalDatabase interface.
@@ -450,6 +452,9 @@ func (p *planner) ResolveTableName(ctx context.Context, tn *tree.TableName) (tre
 // CommonLookupFlags, it could use or skip the TableCollection cache. See
 // TableCollection.getTableVersionByID for how it's used.
 func (p *planner) LookupTableByID(ctx context.Context, tableID sqlbase.ID) (row.TableEntry, error) {
+	if entry, err := p.getVirtualTabler().getVirtualTableEntryByID(tableID); err == nil {
+		return row.TableEntry{Desc: sqlbase.NewImmutableTableDescriptor(*entry.desc)}, nil
+	}
 	flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{AvoidCached: p.avoidCachedDescriptors}}
 	table, err := p.Tables().getTableVersionByID(ctx, p.txn, tableID, flags)
 	if err != nil {

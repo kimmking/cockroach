@@ -137,9 +137,6 @@ func (b *Builder) indexedVar(
 ) tree.TypedExpr {
 	idx, ok := ctx.ivarMap.Get(int(colID))
 	if !ok {
-		if b.nullifyMissingVarExprs > 0 {
-			return tree.ReType(tree.DNull, md.ColumnMeta(colID).Type)
-		}
 		panic(errors.AssertionFailedf("cannot map variable %d to an indexed var", log.Safe(colID)))
 	}
 	return ctx.ivh.IndexedVarWithType(idx, md.ColumnMeta(colID).Type)
@@ -320,7 +317,7 @@ func (b *Builder) buildCast(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Ty
 	if err != nil {
 		return nil, err
 	}
-	return tree.NewTypedCastExpr(input, cast.Typ)
+	return tree.NewTypedCastExpr(input, cast.Typ), nil
 }
 
 func (b *Builder) buildCoalesce(
@@ -487,9 +484,9 @@ func (b *Builder) buildAny(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Typ
 	}
 
 	// Construct tuple type of columns in the row.
-	contents := make([]types.T, plan.numOutputCols())
+	contents := make([]*types.T, plan.numOutputCols())
 	plan.outputCols.ForEach(func(key, val int) {
-		contents[val] = *b.mem.Metadata().ColumnMeta(opt.ColumnID(key)).Type
+		contents[val] = b.mem.Metadata().ColumnMeta(opt.ColumnID(key)).Type
 	})
 	typs := types.MakeTuple(contents)
 	subqueryExpr := b.addSubquery(exec.SubqueryAnyRows, typs, plan.root, any.OriginalExpr)

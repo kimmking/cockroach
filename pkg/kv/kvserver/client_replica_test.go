@@ -608,7 +608,7 @@ func (l *leaseTransferTest) sendRead(storeIdx int) *roachpb.Error {
 		getArgs(l.leftKey),
 	)
 	if pErr != nil {
-		log.Warning(context.TODO(), pErr)
+		log.Warningf(context.TODO(), "%v", pErr)
 	}
 	return pErr
 }
@@ -840,7 +840,7 @@ func TestRangeTransferLeaseExpirationBased(t *testing.T) {
 		// caught up to replica0 as draining code doesn't transfer leases to
 		// behind replicas.
 		l.ensureLeaderAndRaftState(t, l.replica0, l.replica1Desc)
-		l.mtc.stores[0].SetDraining(true)
+		l.mtc.stores[0].SetDraining(true, nil /* reporter */)
 
 		// Check that replica0 doesn't serve reads any more.
 		pErr := l.sendRead(0)
@@ -856,7 +856,7 @@ func TestRangeTransferLeaseExpirationBased(t *testing.T) {
 		// Check that replica1 now has the lease.
 		l.checkHasLease(t, 1)
 
-		l.mtc.stores[0].SetDraining(false)
+		l.mtc.stores[0].SetDraining(false, nil /* reporter */)
 	})
 
 	// DrainTransferWithExtension verifies that a draining store waits for any
@@ -889,7 +889,7 @@ func TestRangeTransferLeaseExpirationBased(t *testing.T) {
 
 		// Drain node 1 with an extension in progress.
 		go func() {
-			l.mtc.stores[1].SetDraining(true)
+			l.mtc.stores[1].SetDraining(true, nil /* reporter */)
 		}()
 		// Now unblock the extension.
 		extensionSem <- struct{}{}
@@ -1648,7 +1648,7 @@ func TestDrainRangeRejection(t *testing.T) {
 	}
 
 	drainingIdx := 1
-	mtc.stores[drainingIdx].SetDraining(true)
+	mtc.stores[drainingIdx].SetDraining(true, nil /* reporter */)
 	chgs := roachpb.MakeReplicationChanges(roachpb.ADD_REPLICA,
 		roachpb.ReplicationTarget{
 			NodeID:  mtc.idents[drainingIdx].NodeID,
@@ -2597,7 +2597,7 @@ func TestAdminRelocateRangeSafety(t *testing.T) {
 	var useSeenAdd atomic.Value
 	useSeenAdd.Store(false)
 	seenAdd := make(chan struct{}, 1)
-	responseFilter := func(ba roachpb.BatchRequest, _ *roachpb.BatchResponse) *roachpb.Error {
+	responseFilter := func(ctx context.Context, ba roachpb.BatchRequest, _ *roachpb.BatchResponse) *roachpb.Error {
 		if ba.IsSingleRequest() {
 			changeReplicas, ok := ba.Requests[0].GetInner().(*roachpb.AdminChangeReplicasRequest)
 			if ok && changeReplicas.Changes()[0].ChangeType == roachpb.ADD_REPLICA && useSeenAdd.Load().(bool) {
@@ -2978,7 +2978,7 @@ func TestStrictGCEnforcement(t *testing.T) {
 		}
 		tableID       = getTableID()
 		tenSecondsAgo hlc.Timestamp // written in setup
-		tableKey      = roachpb.Key(keys.MakeTablePrefix(tableID))
+		tableKey      = keys.SystemSQLCodec.TablePrefix(tableID)
 		tableSpan     = roachpb.Span{Key: tableKey, EndKey: tableKey.PrefixEnd()}
 		mkRecord      = func() ptpb.Record {
 			return ptpb.Record{
@@ -3110,7 +3110,7 @@ func TestStrictGCEnforcement(t *testing.T) {
 	t.Run("system ranges are unaffected", func(t *testing.T) {
 		setSystemGCTTL(t, 1)
 		txn := mkStaleTxn()
-		descriptorTable := roachpb.Key(keys.MakeTablePrefix(keys.DescriptorTableID))
+		descriptorTable := keys.SystemSQLCodec.TablePrefix(keys.DescriptorTableID)
 		_, err := txn.Scan(ctx, descriptorTable, descriptorTable.PrefixEnd(), 1)
 		require.NoError(t, err)
 	})

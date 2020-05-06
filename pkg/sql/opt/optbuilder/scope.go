@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -116,6 +117,7 @@ type cteSource struct {
 	originalExpr tree.Statement
 	bindingProps *props.Relational
 	expr         memo.RelExpr
+	mtr          tree.MaterializeClause
 	// If set, this function is called when a CTE is referenced. It can throw an
 	// error.
 	onRef func()
@@ -454,11 +456,7 @@ func (s *scope) resolveAndRequireType(expr tree.Expr, desired *types.T) tree.Typ
 // and can be cast to any other type.
 func (s *scope) ensureNullType(texpr tree.TypedExpr, desired *types.T) tree.TypedExpr {
 	if desired.Family() != types.AnyFamily && texpr.ResolvedType().Family() == types.UnknownFamily {
-		var err error
-		texpr, err = tree.NewTypedCastExpr(texpr, desired)
-		if err != nil {
-			panic(err)
-		}
+		texpr = tree.NewTypedCastExpr(texpr, desired)
 	}
 	return texpr
 }
@@ -535,7 +533,7 @@ func (s *scope) removeHiddenCols() {
 // isAnonymousTable returns true if the table name of the first column
 // in this scope is empty.
 func (s *scope) isAnonymousTable() bool {
-	return len(s.cols) > 0 && s.cols[0].table.TableName == ""
+	return len(s.cols) > 0 && s.cols[0].table.ObjectName == ""
 }
 
 // setTableAlias qualifies the names of all columns in this scope with the
@@ -703,7 +701,7 @@ func (s *scope) FindSourceProvidingColumn(
 				continue
 			}
 
-			if col.table.TableName == "" && !col.hidden {
+			if col.table.ObjectName == "" && !col.hidden {
 				if candidateFromAnonSource != nil {
 					moreThanOneCandidateFromAnonSource = true
 					break
@@ -808,7 +806,7 @@ func (s *scope) FindSourceMatchingName(
 // - a request for "kv" is matched by a source named "db1.public.kv"
 // - a request for "public.kv" is not matched by a source named just "kv"
 func sourceNameMatches(srcName tree.TableName, toFind tree.TableName) bool {
-	if srcName.TableName != toFind.TableName {
+	if srcName.ObjectName != toFind.ObjectName {
 		return false
 	}
 	if toFind.ExplicitSchema {
@@ -1087,7 +1085,7 @@ func (s *scope) lookupWindowDef(name tree.Name) *tree.WindowDef {
 	panic(pgerror.Newf(pgcode.UndefinedObject, "window %q does not exist", name))
 }
 
-func (s *scope) constructWindowDef(def tree.WindowDef) *tree.WindowDef {
+func (s *scope) constructWindowDef(def tree.WindowDef) tree.WindowDef {
 	switch {
 	case def.RefName != "":
 		// SELECT rank() OVER (w) FROM t WINDOW w AS (...)
@@ -1096,14 +1094,16 @@ func (s *scope) constructWindowDef(def tree.WindowDef) *tree.WindowDef {
 		if err != nil {
 			panic(err)
 		}
-		return &result
+		return result
+
 	case def.Name != "":
 		// SELECT rank() OVER w FROM t WINDOW w AS (...)
 		// Note the lack of parens around w, compared to the first case.
 		// We use the referenced window specification directly, without modification.
-		return s.lookupWindowDef(def.Name)
+		return *s.lookupWindowDef(def.Name)
+
 	default:
-		return &def
+		return def
 	}
 }
 
@@ -1122,9 +1122,12 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 	s.builder.semaCtx.Properties.Require("window",
 		tree.RejectNestedWindowFunctions)
 
-	f.WindowDef = s.constructWindowDef(*f.WindowDef)
+	// Make a copy of f so we can modify the WindowDef.
+	fCopy := *f
+	newWindowDef := s.constructWindowDef(*f.WindowDef)
+	fCopy.WindowDef = &newWindowDef
 
-	expr := f.Walk(s)
+	expr := fCopy.Walk(s)
 
 	typedFunc, err := tree.TypeCheck(expr, s.builder.semaCtx, types.Any)
 	if err != nil {
@@ -1149,17 +1152,25 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 	)
 	s.builder.semaCtx.Properties.Derived.InWindowFunc = true
 
-	for i, e := range f.WindowDef.Partitions {
+	oldPartitions := f.WindowDef.Partitions
+	f.WindowDef.Partitions = make(tree.Exprs, len(oldPartitions))
+	for i, e := range oldPartitions {
 		typedExpr := s.resolveType(e, types.Any)
 		f.WindowDef.Partitions[i] = typedExpr
 	}
-	for i, e := range f.WindowDef.OrderBy {
-		if e.OrderType != tree.OrderByColumn {
+
+	oldOrderBy := f.WindowDef.OrderBy
+	f.WindowDef.OrderBy = make(tree.OrderBy, len(oldOrderBy))
+	for i := range oldOrderBy {
+		ord := *oldOrderBy[i]
+		if ord.OrderType != tree.OrderByColumn {
 			panic(errOrderByIndexInWindow)
 		}
-		typedExpr := s.resolveType(e.Expr, types.Any)
-		f.WindowDef.OrderBy[i].Expr = typedExpr
+		typedExpr := s.resolveType(ord.Expr, types.Any)
+		ord.Expr = typedExpr
+		f.WindowDef.OrderBy[i] = &ord
 	}
+
 	if f.WindowDef.Frame != nil {
 		if err := analyzeWindowFrame(s, f.WindowDef); err != nil {
 			panic(err)
@@ -1215,11 +1226,14 @@ func analyzeWindowFrame(s *scope, windowDef *tree.WindowDef) error {
 			// At least one of the bounds is of type 'value' PRECEDING or 'value' FOLLOWING.
 			// We require ordering on a single column that supports addition/subtraction.
 			if len(windowDef.OrderBy) != 1 {
-				return pgerror.Newf(pgcode.Windowing, "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column")
+				return pgerror.Newf(pgcode.Windowing,
+					"RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column")
 			}
 			requiredType = windowDef.OrderBy[0].Expr.(tree.TypedExpr).ResolvedType()
 			if !types.IsAdditiveType(requiredType) {
-				return pgerror.Newf(pgcode.Windowing, fmt.Sprintf("RANGE with offset PRECEDING/FOLLOWING is not supported for column type %s", requiredType))
+				return pgerror.Newf(pgcode.Windowing,
+					"RANGE with offset PRECEDING/FOLLOWING is not supported for column type %s",
+					log.Safe(requiredType))
 			}
 			if types.IsDateTimeType(requiredType) {
 				// Spec: for datetime ordering columns, the required type is an 'interval'.
@@ -1405,7 +1419,7 @@ func (s *scope) newAmbiguousColumnError(
 	for i := range s.cols {
 		col := &s.cols[i]
 		if col.name == n && (allowHidden || !col.hidden) {
-			if col.table.TableName == "" && !col.hidden {
+			if col.table.ObjectName == "" && !col.hidden {
 				if moreThanOneCandidateFromAnonSource {
 					// Only print first anonymous source, since other(s) are identical.
 					fmtCandidate(col.table)
@@ -1438,7 +1452,7 @@ func newAmbiguousSourceError(tn *tree.TableName) error {
 	}
 	return pgerror.Newf(pgcode.AmbiguousAlias,
 		"ambiguous source name: %q (within database %q)",
-		tree.ErrString(&tn.TableName), tree.ErrString(&tn.CatalogName))
+		tree.ErrString(&tn.ObjectName), tree.ErrString(&tn.CatalogName))
 }
 
 func (s *scope) String() string {

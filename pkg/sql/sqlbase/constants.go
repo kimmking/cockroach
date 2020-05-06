@@ -109,6 +109,7 @@ const (
 	InformationSchemaViewsTableID
 	InformationSchemaUserPrivilegesID
 	PgCatalogID
+	PgCatalogAggregateTableID
 	PgCatalogAmTableID
 	PgCatalogAttrDefTableID
 	PgCatalogAttributeTableID
@@ -126,6 +127,7 @@ const (
 	PgCatalogDescriptionTableID
 	PgCatalogSharedDescriptionTableID
 	PgCatalogEnumTableID
+	PgCatalogEventTriggerTableID
 	PgCatalogExtensionTableID
 	PgCatalogForeignDataWrapperTableID
 	PgCatalogForeignServerTableID

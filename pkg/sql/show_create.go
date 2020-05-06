@@ -51,7 +51,7 @@ func ShowCreateTable(
 	tn *tree.Name,
 	dbPrefix string,
 	desc *sqlbase.TableDescriptor,
-	lCtx *internalLookupCtx,
+	lCtx simpleSchemaResolver,
 	fkDisplayMode shouldOmitFKClausesFromCreate,
 ) (string, error) {
 	a := &sqlbase.DatumAlloc{}
@@ -136,7 +136,7 @@ func ShowCreateTable(
 				}
 			}
 			if err := ShowCreatePartitioning(
-				a, desc, idx, &idx.Partitioning, &f.Buffer, 1 /* indent */, 0, /* colOffset */
+				a, p.ExecCfg().Codec, desc, idx, &idx.Partitioning, &f.Buffer, 1 /* indent */, 0, /* colOffset */
 			); err != nil {
 				return "", err
 			}
@@ -151,7 +151,7 @@ func ShowCreateTable(
 		return "", err
 	}
 	if err := ShowCreatePartitioning(
-		a, desc, &desc.PrimaryIndex, &desc.PrimaryIndex.Partitioning, &f.Buffer, 0 /* indent */, 0, /* colOffset */
+		a, p.ExecCfg().Codec, desc, &desc.PrimaryIndex, &desc.PrimaryIndex.Partitioning, &f.Buffer, 0 /* indent */, 0, /* colOffset */
 	); err != nil {
 		return "", err
 	}

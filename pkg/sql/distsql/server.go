@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -47,6 +48,12 @@ import (
 // nodes.
 const minFlowDrainWait = 1 * time.Second
 
+// MultiTenancyIssueNo is the issue tracking DistSQL's Gossip and
+// NodeID dependencies.
+//
+// See https://github.com/cockroachdb/cockroach/issues/47900.
+const MultiTenancyIssueNo = 47900
+
 var noteworthyMemoryUsageBytes = envutil.EnvOrDefaultInt64("COCKROACH_NOTEWORTHY_DISTSQL_MEMORY_USAGE", 1024*1024 /* 1MB */)
 
 // ServerImpl implements the server for the distributed SQL APIs.
@@ -65,7 +72,7 @@ func NewServer(ctx context.Context, cfg execinfra.ServerConfig) *ServerImpl {
 	ds := &ServerImpl{
 		ServerConfig:  cfg,
 		regexpCache:   tree.NewRegexpCache(512),
-		flowRegistry:  flowinfra.NewFlowRegistry(cfg.NodeID.Get()),
+		flowRegistry:  flowinfra.NewFlowRegistry(cfg.NodeID.DeprecatedNodeID(MultiTenancyIssueNo)),
 		flowScheduler: flowinfra.NewFlowScheduler(cfg.AmbientContext, cfg.Stopper, cfg.Settings, cfg.Metrics),
 		memMonitor: mon.MakeMonitor(
 			"distsql",
@@ -85,8 +92,8 @@ func NewServer(ctx context.Context, cfg execinfra.ServerConfig) *ServerImpl {
 func (ds *ServerImpl) Start() {
 	// Gossip the version info so that other nodes don't plan incompatible flows
 	// for us.
-	if err := ds.ServerConfig.Gossip.AddInfoProto(
-		gossip.MakeDistSQLNodeVersionKey(ds.ServerConfig.NodeID.Get()),
+	if err := ds.ServerConfig.Gossip.Deprecated(MultiTenancyIssueNo).AddInfoProto(
+		gossip.MakeDistSQLNodeVersionKey(ds.ServerConfig.NodeID.DeprecatedNodeID(MultiTenancyIssueNo)),
 		&execinfrapb.DistSQLVersionGossipInfo{
 			Version:            execinfra.Version,
 			MinAcceptedVersion: execinfra.MinAcceptedVersion,
@@ -105,7 +112,9 @@ func (ds *ServerImpl) Start() {
 
 // Drain changes the node's draining state through gossip and drains the
 // server's flowRegistry. See flowRegistry.Drain for more details.
-func (ds *ServerImpl) Drain(ctx context.Context, flowDrainWait time.Duration) {
+func (ds *ServerImpl) Drain(
+	ctx context.Context, flowDrainWait time.Duration, reporter func(int, string),
+) {
 	if err := ds.setDraining(true); err != nil {
 		log.Warningf(ctx, "unable to gossip distsql draining state: %s", err)
 	}
@@ -115,28 +124,26 @@ func (ds *ServerImpl) Drain(ctx context.Context, flowDrainWait time.Duration) {
 	if ds.ServerConfig.TestingKnobs.DrainFast {
 		flowWait = 0
 		minWait = 0
-	} else if len(ds.Gossip.Outgoing()) == 0 {
+	} else if len(ds.Gossip.Deprecated(MultiTenancyIssueNo).Outgoing()) == 0 {
 		// If there is only one node in the cluster (us), there's no need to
 		// wait a minimum time for the draining state to be gossiped.
 		minWait = 0
 	}
-	ds.flowRegistry.Drain(flowWait, minWait)
-}
-
-// Undrain changes the node's draining state through gossip and undrains the
-// server's flowRegistry. See flowRegistry.Undrain for more details.
-func (ds *ServerImpl) Undrain(ctx context.Context) {
-	ds.flowRegistry.Undrain()
-	if err := ds.setDraining(false); err != nil {
-		log.Warningf(ctx, "unable to gossip distsql draining state: %s", err)
-	}
+	ds.flowRegistry.Drain(flowWait, minWait, reporter)
 }
 
 // setDraining changes the node's draining state through gossip to the provided
 // state.
 func (ds *ServerImpl) setDraining(drain bool) error {
-	return ds.ServerConfig.Gossip.AddInfoProto(
-		gossip.MakeDistSQLDrainingKey(ds.ServerConfig.NodeID.Get()),
+	nodeID, ok := ds.ServerConfig.NodeID.OptionalNodeID()
+	if !ok {
+		// Ignore draining requests when running on behalf of a tenant.
+		// NB: intentionally swallow the error or the server will fatal.
+		_ = MultiTenancyIssueNo // related issue
+		return nil
+	}
+	return ds.ServerConfig.Gossip.Deprecated(MultiTenancyIssueNo).AddInfoProto(
+		gossip.MakeDistSQLDrainingKey(nodeID),
 		&execinfrapb.DistSQLDrainingInfo{
 			Draining: drain,
 		},
@@ -173,12 +180,8 @@ func (ds *ServerImpl) setupFlow(
 			"version mismatch in flow request: %d; this node accepts %d through %d",
 			req.Version, execinfra.MinAcceptedVersion, execinfra.Version,
 		)
-		log.Warning(ctx, err)
+		log.Warningf(ctx, "%v", err)
 		return ctx, nil, err
-	}
-	nodeID := ds.ServerConfig.NodeID.Get()
-	if nodeID == 0 {
-		return nil, nil, errors.AssertionFailedf("setupFlow called before the NodeID was resolved")
 	}
 
 	const opName = "flow"
@@ -232,7 +235,7 @@ func (ds *ServerImpl) setupFlow(
 		}
 		// The flow will run in a LeafTxn because we do not want each distributed
 		// Txn to heartbeat the transaction.
-		return kv.NewLeafTxn(ctx, ds.FlowDB, req.Flow.Gateway, tis), nil
+		return kv.NewLeafTxn(ctx, ds.DB, req.Flow.Gateway, tis), nil
 	}
 
 	var evalCtx *tree.EvalContext
@@ -255,14 +258,14 @@ func (ds *ServerImpl) setupFlow(
 			return ctx, nil, err
 		}
 
-		var be sessiondata.BytesEncodeFormat
+		var be lex.BytesEncodeFormat
 		switch req.EvalContext.BytesEncodeFormat {
 		case execinfrapb.BytesEncodeFormat_HEX:
-			be = sessiondata.BytesEncodeHex
+			be = lex.BytesEncodeHex
 		case execinfrapb.BytesEncodeFormat_ESCAPE:
-			be = sessiondata.BytesEncodeEscape
+			be = lex.BytesEncodeEscape
 		case execinfrapb.BytesEncodeFormat_BASE64:
-			be = sessiondata.BytesEncodeBase64
+			be = lex.BytesEncodeBase64
 		default:
 			return nil, nil, errors.AssertionFailedf("unknown byte encode format: %s",
 				errors.Safe(req.EvalContext.BytesEncodeFormat))
@@ -298,7 +301,8 @@ func (ds *ServerImpl) setupFlow(
 			SessionData: sd,
 			ClusterID:   ds.ServerConfig.ClusterID.Get(),
 			ClusterName: ds.ServerConfig.ClusterName,
-			NodeID:      nodeID,
+			NodeID:      ds.ServerConfig.NodeID,
+			Codec:       ds.ServerConfig.Codec,
 			ReCache:     ds.regexpCache,
 			Mon:         &monitor,
 			// Most processors will override this Context with their own context in
@@ -324,13 +328,14 @@ func (ds *ServerImpl) setupFlow(
 				*req.EvalContext.SeqState.LastSeqIncremented)
 		}
 	}
+
 	// TODO(radu): we should sanity check some of these fields.
 	flowCtx := execinfra.FlowCtx{
 		AmbientContext: ds.AmbientContext,
 		Cfg:            &ds.ServerConfig,
 		ID:             req.Flow.FlowID,
 		EvalCtx:        evalCtx,
-		NodeID:         nodeID,
+		NodeID:         ds.ServerConfig.NodeID,
 		TraceKV:        req.TraceKV,
 		Local:          localState.IsLocal,
 	}
@@ -348,6 +353,7 @@ func (ds *ServerImpl) setupFlow(
 		// to use the RootTxn.
 		opt = flowinfra.FuseAggressively
 	}
+
 	var err error
 	if ctx, err = f.Setup(ctx, &req.Flow, opt); err != nil {
 		log.Errorf(ctx, "error setting up flow: %s", err)
@@ -568,7 +574,7 @@ func (ds *ServerImpl) FlowStream(stream execinfrapb.DistSQL_FlowStreamServer) er
 		// flowStreamInt may return an error during normal operation (e.g. a flow
 		// was canceled as part of a graceful teardown). Log this error at the INFO
 		// level behind a verbose flag for visibility.
-		log.Info(ctx, err)
+		log.Infof(ctx, "%v", err)
 	}
 	return err
 }

@@ -16,7 +16,9 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/oidext"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
@@ -47,7 +49,7 @@ import (
 //   Width         - maximum size or scale of the type (numeric)
 //   Locale        - location which governs sorting, formatting, etc. (string)
 //   ArrayContents - array element type (T)
-//   TupleContents - slice of types of each tuple field ([]T)
+//   TupleContents - slice of types of each tuple field ([]*T)
 //   TupleLabels   - slice of labels of each tuple field ([]string)
 //
 // Some types are not currently allowed as the type of a column (e.g. nested
@@ -153,6 +155,9 @@ import (
 // When these types are themselves made into arrays, the Oids become T__int2vector and
 // T__oidvector, respectively.
 //
+// See types.proto for the corresponding proto definition. Its automatic
+// type declaration is suppressed in the proto so that it is possible to
+// add additional fields to T without serializing them.
 type T struct {
 	// InternalType should never be directly referenced outside this package. The
 	// only reason it is exported is because gogoproto panics when printing the
@@ -325,6 +330,30 @@ var (
 	INet = &T{InternalType: InternalType{
 		Family: INetFamily, Oid: oid.T_inet, Locale: &emptyLocale}}
 
+	// Geometry is the type of a geospatial Geometry object.
+	Geometry = &T{
+		InternalType: InternalType{
+			Family: GeometryFamily,
+			Oid:    oidext.T_geometry,
+			Locale: &emptyLocale,
+			GeoMetadata: &GeoMetadata{
+				SRID: geopb.DefaultGeometrySRID,
+			},
+		},
+	}
+
+	// Geography is the type of a geospatial Geography object.
+	Geography = &T{
+		InternalType: InternalType{
+			Family: GeographyFamily,
+			Oid:    oidext.T_geography,
+			Locale: &emptyLocale,
+			GeoMetadata: &GeoMetadata{
+				SRID: geopb.DefaultGeographySRID,
+			},
+		},
+	}
+
 	// Scalar contains all types that meet this criteria:
 	//
 	//   1. Scalar type (no ArrayFamily or TupleFamily types).
@@ -339,6 +368,8 @@ var (
 		Date,
 		Timestamp,
 		Interval,
+		Geography,
+		Geometry,
 		String,
 		Bytes,
 		TimestampTZ,
@@ -369,7 +400,7 @@ var (
 	// type that matches a tuple with any number of fields of any type (including
 	// tuple types). Execution-time values should never have this type.
 	AnyTuple = &T{InternalType: InternalType{
-		Family: TupleFamily, TupleContents: []T{*Any}, Oid: oid.T_record, Locale: &emptyLocale}}
+		Family: TupleFamily, TupleContents: []*T{Any}, Oid: oid.T_record, Locale: &emptyLocale}}
 
 	// AnyCollatedString is a special type used only during static analysis as a
 	// wildcard type that matches a collated string with any locale. Execution-
@@ -493,8 +524,7 @@ func MakeScalar(family Family, o oid.Oid, precision, width int32, locale string)
 	t := OidToType[o]
 	if family != t.Family() {
 		if family != CollatedStringFamily || StringFamily != t.Family() {
-			panic(errors.AssertionFailedf(
-				"oid %s does not match %s", oid.TypeName[o], family))
+			panic(errors.AssertionFailedf("oid %d does not match %s", o, family))
 		}
 	}
 	if family == ArrayFamily || family == TupleFamily {
@@ -506,6 +536,7 @@ func MakeScalar(family Family, o oid.Oid, precision, width int32, locale string)
 
 	timePrecisionIsSet := false
 	var intervalDurationField *IntervalDurationField
+	var geoMetadata *GeoMetadata
 	switch family {
 	case IntervalFamily:
 		intervalDurationField = &IntervalDurationField{}
@@ -551,6 +582,10 @@ func MakeScalar(family Family, o oid.Oid, precision, width int32, locale string)
 		}
 	case StringFamily, BytesFamily, CollatedStringFamily, BitFamily:
 		// These types can have any width.
+	case GeometryFamily:
+		geoMetadata = &GeoMetadata{SRID: geopb.DefaultGeometrySRID}
+	case GeographyFamily:
+		geoMetadata = &GeoMetadata{SRID: geopb.DefaultGeographySRID}
 	default:
 		if width != 0 {
 			panic(errors.AssertionFailedf("type %s cannot have width", family))
@@ -565,6 +600,7 @@ func MakeScalar(family Family, o oid.Oid, precision, width int32, locale string)
 		Width:                 width,
 		Locale:                &locale,
 		IntervalDurationField: intervalDurationField,
+		GeoMetadata:           geoMetadata,
 	}}
 }
 
@@ -714,6 +750,33 @@ func MakeTimeTZ(precision int32) *T {
 	}}
 }
 
+// MakeGeometry constructs a new instance of a GEOMETRY type (oid = T_geometry)
+// that has the given shape and SRID.
+func MakeGeometry(shape geopb.Shape, srid geopb.SRID) *T {
+	return &T{InternalType: InternalType{
+		Family: GeometryFamily,
+		Oid:    oidext.T_geometry,
+		Locale: &emptyLocale,
+		GeoMetadata: &GeoMetadata{
+			Shape: shape,
+			SRID:  srid,
+		},
+	}}
+}
+
+// MakeGeography constructs a new instance of a geography-related type.
+func MakeGeography(shape geopb.Shape, srid geopb.SRID) *T {
+	return &T{InternalType: InternalType{
+		Family: GeographyFamily,
+		Oid:    oidext.T_geography,
+		Locale: &emptyLocale,
+		GeoMetadata: &GeoMetadata{
+			Shape: shape,
+			SRID:  srid,
+		},
+	}}
+}
+
 var (
 	// DefaultIntervalTypeMetadata returns a duration field that is unset,
 	// using INTERVAL or INTERVAL ( iconst32 ) syntax instead of INTERVAL
@@ -827,7 +890,7 @@ func MakeArray(typ *T) *T {
 //
 // Warning: the contents slice is used directly; the caller should not modify it
 // after calling this function.
-func MakeTuple(contents []T) *T {
+func MakeTuple(contents []*T) *T {
 	return &T{InternalType: InternalType{
 		Family: TupleFamily, Oid: oid.T_record, TupleContents: contents, Locale: &emptyLocale,
 	}}
@@ -835,7 +898,7 @@ func MakeTuple(contents []T) *T {
 
 // MakeLabeledTuple constructs a new instance of a TupleFamily type with the
 // given field types and labels.
-func MakeLabeledTuple(contents []T, labels []string) *T {
+func MakeLabeledTuple(contents []*T, labels []string) *T {
 	if len(contents) != len(labels) && labels != nil {
 		panic(errors.AssertionFailedf(
 			"tuple contents and labels must be of same length: %v, %v", contents, labels))
@@ -949,7 +1012,7 @@ func (t *T) ArrayContents() *T {
 
 // TupleContents returns a slice containing the type of each tuple field. This
 // is nil for non-TupleFamily types.
-func (t *T) TupleContents() []T {
+func (t *T) TupleContents() []*T {
 	return t.InternalType.TupleContents
 }
 
@@ -1000,6 +1063,10 @@ func (t *T) Name() string {
 		default:
 			panic(errors.AssertionFailedf("programming error: unknown float width: %d", t.Width()))
 		}
+	case GeographyFamily:
+		return "geography"
+	case GeometryFamily:
+		return "geometry"
 	case INetFamily:
 		return "inet"
 	case IntFamily:
@@ -1066,7 +1133,7 @@ func (t *T) Name() string {
 //   int4[]       _int4
 //
 func (t *T) PGName() string {
-	name, ok := oid.TypeName[t.Oid()]
+	name, ok := oidext.TypeName(t.Oid())
 	if ok {
 		return strings.ToLower(name)
 	}
@@ -1162,6 +1229,8 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 		default:
 			panic(errors.AssertionFailedf("programming error: unknown float width: %d", t.Width()))
 		}
+	case GeometryFamily, GeographyFamily:
+		return t.Name() + t.InternalType.GeoMetadata.SQLString()
 	case INetFamily:
 		return "inet"
 	case IntFamily:
@@ -1335,6 +1404,8 @@ func (t *T) SQLString() string {
 		if t.InternalType.Precision > 0 || t.InternalType.TimePrecisionIsSet {
 			return fmt.Sprintf("%s(%d)", strings.ToUpper(t.Name()), t.Precision())
 		}
+	case GeometryFamily, GeographyFamily:
+		return strings.ToUpper(t.Name() + t.InternalType.GeoMetadata.SQLString())
 	case IntervalFamily:
 		switch t.InternalType.IntervalDurationField.DurationType {
 		case IntervalDurationType_UNSET:
@@ -1359,7 +1430,7 @@ func (t *T) SQLString() string {
 			)
 		}
 	case OidFamily:
-		if name, ok := oid.TypeName[t.Oid()]; ok {
+		if name, ok := oidext.TypeName(t.Oid()); ok {
 			return name
 		}
 	case ArrayFamily:
@@ -1413,7 +1484,7 @@ func (t *T) Equivalent(other *T) bool {
 			return false
 		}
 		for i := range t.TupleContents() {
-			if !t.TupleContents()[i].Equivalent(&other.TupleContents()[i]) {
+			if !t.TupleContents()[i].Equivalent(other.TupleContents()[i]) {
 				return false
 			}
 		}
@@ -1438,8 +1509,8 @@ func (t *T) Identical(other *T) bool {
 }
 
 // Equal is for use in generated protocol buffer code only.
-func (t *T) Equal(other T) bool {
-	return t.Identical(&other)
+func (t *T) Equal(other *T) bool {
+	return t.Identical(other)
 }
 
 // Size returns the size, in bytes, of this type once it has been marshaled to
@@ -1456,16 +1527,6 @@ func (t *T) Size() (n int) {
 		panic(errors.AssertionFailedf("error during Size call: %v", err))
 	}
 	return temp.InternalType.Size()
-}
-
-// ProtoMessage is the protobuf marker method. It is part of the
-// protoutil.Message interface.
-func (t *T) ProtoMessage() {}
-
-// Reset clears the type instance. It is part of the protoutil.Message
-// interface.
-func (t *T) Reset() {
-	*t = T{}
 }
 
 // Identical is the internal implementation for T.Identical. See that comment
@@ -1492,6 +1553,18 @@ func (t *InternalType) Identical(other *InternalType) bool {
 	} else if other.IntervalDurationField != nil {
 		return false
 	}
+	if t.GeoMetadata != nil && other.GeoMetadata != nil {
+		if t.GeoMetadata.Shape != other.GeoMetadata.Shape {
+			return false
+		}
+		if t.GeoMetadata.SRID != other.GeoMetadata.SRID {
+			return false
+		}
+	} else if t.GeoMetadata != nil {
+		return false
+	} else if other.GeoMetadata != nil {
+		return false
+	}
 	if t.Locale != nil && other.Locale != nil {
 		if *t.Locale != *other.Locale {
 			return false
@@ -1514,7 +1587,7 @@ func (t *InternalType) Identical(other *InternalType) bool {
 		return false
 	}
 	for i := range t.TupleContents {
-		if !t.TupleContents[i].Identical(&other.TupleContents[i]) {
+		if !t.TupleContents[i].Identical(other.TupleContents[i]) {
 			return false
 		}
 	}
@@ -1722,11 +1795,10 @@ func (t *T) upgradeType() error {
 		if t.Width() != 0 {
 			return errors.AssertionFailedf("name type cannot have non-zero width: %d", t.Width())
 		}
+	}
 
-	default:
-		if t.InternalType.Oid == 0 {
-			t.InternalType.Oid = familyToOid[t.Family()]
-		}
+	if t.InternalType.Oid == 0 {
+		t.InternalType.Oid = familyToOid[t.Family()]
 	}
 
 	// Clear the deprecated visible types, since they are now handled by the
@@ -2049,7 +2121,16 @@ var typNameLiterals map[string]*T
 func init() {
 	typNameLiterals = make(map[string]*T)
 	for o, t := range OidToType {
-		name := strings.ToLower(oid.TypeName[o])
+		name, ok := oidext.TypeName(o)
+		if !ok {
+			panic(errors.AssertionFailedf("oid %d has no type name", o))
+		}
+		name = strings.ToLower(name)
+		if _, ok := typNameLiterals[name]; !ok {
+			typNameLiterals[name] = t
+		}
+	}
+	for name, t := range unreservedTypeTokens {
 		if _, ok := typNameLiterals[name]; !ok {
 			typNameLiterals[name] = t
 		}
@@ -2070,6 +2151,64 @@ func TypeForNonKeywordTypeName(name string) (*T, bool, int) {
 	return nil, false, postgresPredefinedTypeIssues[name]
 }
 
+// The SERIAL types are pseudo-types that are only used during parsing. After
+// that, they should behave identically to INT columns. They are declared
+// as INT types, but using different instances than types.Int, types.Int2, etc.
+// so that they can be compared by pointer to differentiate them from the
+// singleton INT types. While the usual requirement is that == is never used to
+// compare types, this is one case where it's allowed.
+var (
+	Serial2Type = *Int2
+	Serial4Type = *Int4
+	Serial8Type = *Int
+)
+
+// IsSerialType returns whether or not the input type is a SERIAL type.
+// This function should only be used during parsing.
+func IsSerialType(typ *T) bool {
+	// This is a special case where == is used to compare types, since the SERIAL
+	// types are pseudo-types.
+	return typ == &Serial2Type || typ == &Serial4Type || typ == &Serial8Type
+}
+
+// unreservedTypeTokens contain type alias that we resolve during parsing.
+// Instead of adding a new token to the parser, add the type here.
+var unreservedTypeTokens = map[string]*T{
+	"blob":       Bytes,
+	"bool":       Bool,
+	"bytea":      Bytes,
+	"bytes":      Bytes,
+	"date":       Date,
+	"float4":     Float,
+	"float8":     Float,
+	"inet":       INet,
+	"int2":       Int2,
+	"int4":       Int4,
+	"int8":       Int,
+	"int64":      Int,
+	"int2vector": Int2Vector,
+	"json":       Jsonb,
+	"jsonb":      Jsonb,
+	"name":       Name,
+	"oid":        Oid,
+	"oidvector":  OidVector,
+	// Postgres OID pseudo-types. See https://www.postgresql.org/docs/9.4/static/datatype-oid.html.
+	"regclass":     RegClass,
+	"regproc":      RegProc,
+	"regprocedure": RegProcedure,
+	"regnamespace": RegNamespace,
+	"regtype":      RegType,
+
+	"serial2":     &Serial2Type,
+	"serial4":     &Serial4Type,
+	"serial8":     &Serial8Type,
+	"smallserial": &Serial2Type,
+	"bigserial":   &Serial8Type,
+
+	"string": String,
+	"uuid":   Uuid,
+}
+
 // The following map must include all types predefined in PostgreSQL
 // that are also not yet defined in CockroachDB and link them to
 // github issues. It is also possible, but not necessary, to include
@@ -2085,10 +2224,24 @@ var postgresPredefinedTypeIssues = map[string]int{
 	"money":         -1,
 	"path":          21286,
 	"pg_lsn":        -1,
-	"point":         21286,
-	"polygon":       21286,
 	"tsquery":       7821,
 	"tsvector":      7821,
 	"txid_snapshot": -1,
 	"xml":           -1,
+}
+
+// SQLString outputs the GeoMetadata in a SQL-compatible string.
+func (m *GeoMetadata) SQLString() string {
+	// If SRID is available, display both shape and SRID.
+	// If shape is available but not SRID, just display shape.
+	if m.SRID != 0 {
+		shapeName := strings.ToLower(m.Shape.String())
+		if m.Shape == geopb.Shape_Unset {
+			shapeName = "geometry"
+		}
+		return fmt.Sprintf("(%s,%d)", shapeName, m.SRID)
+	} else if m.Shape != geopb.Shape_Unset {
+		return fmt.Sprintf("(%s)", m.Shape)
+	}
+	return ""
 }

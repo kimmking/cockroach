@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
@@ -42,14 +43,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -70,6 +74,12 @@ var ClusterOrganization = settings.RegisterPublicStringSetting(
 	"organization name",
 	"",
 )
+
+// ClusterIsInternal returns true if the cluster organization contains
+// "Cockroach Labs", indicating an internal cluster.
+func ClusterIsInternal(sv *settings.Values) bool {
+	return strings.Contains(ClusterOrganization.Get(sv), "Cockroach Labs")
+}
 
 // ClusterSecret is a cluster specific secret. This setting is
 // non-reportable.
@@ -131,17 +141,10 @@ const ReorderJoinsLimitClusterSettingName = "sql.defaults.reorder_joins_limit"
 
 // ReorderJoinsLimitClusterValue controls the cluster default for the maximum
 // number of joins reordered.
-var ReorderJoinsLimitClusterValue = settings.RegisterValidatedIntSetting(
+var ReorderJoinsLimitClusterValue = settings.RegisterNonNegativeIntSetting(
 	ReorderJoinsLimitClusterSettingName,
 	"default number of joins to reorder",
 	opt.DefaultJoinOrderLimit,
-	func(v int64) error {
-		if v < 0 {
-			return pgerror.Newf(pgcode.InvalidParameterValue,
-				"cannot set sql.defaults.reorder_joins_limit to a negative value: %d", v)
-		}
-		return nil
-	},
 )
 
 var requireExplicitPrimaryKeysClusterMode = settings.RegisterBoolSetting(
@@ -168,9 +171,45 @@ var zigzagJoinClusterMode = settings.RegisterBoolSetting(
 	true,
 )
 
-var optDrivenFKClusterMode = settings.RegisterBoolSetting(
+var optDrivenFKChecksClusterMode = settings.RegisterBoolSetting(
 	"sql.defaults.optimizer_foreign_keys.enabled",
 	"default value for optimizer_foreign_keys session setting; enables optimizer-driven foreign key checks by default",
+	true,
+)
+
+var optDrivenFKCascadesClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.experimental_optimizer_foreign_key_cascades.enabled",
+	"default value for experimental_optimizer_foreign_key_cascades session setting; enables optimizer-driven foreign key cascades by default",
+	false,
+)
+
+var optDrivenFKCascadesClusterLimit = settings.RegisterNonNegativeIntSetting(
+	"sql.defaults.foreign_key_cascades_limit",
+	"default value for foreign_key_cascades_limit session setting; limits the number of cascading operations that run as part of a single query",
+	10000,
+)
+
+// optUseHistogramsClusterMode controls the cluster default for whether
+// histograms are used by the optimizer for cardinality estimation.
+// Note that it does not control histogram collection; regardless of the
+// value of this setting, the optimizer cannot use histograms if they
+// haven't been collected. Collection of histograms is controlled by the
+// cluster setting sql.stats.histogram_collection.enabled.
+var optUseHistogramsClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.optimizer_use_histograms.enabled",
+	"default value for optimizer_use_histograms session setting; enables usage of histograms in the optimizer by default",
+	true,
+)
+
+// optUseMultiColStatsClusterMode controls the cluster default for whether
+// multi-column stats are used by the optimizer for cardinality estimation.
+// Note that it does not control collection of multi-column stats; regardless
+// of the value of this setting, the optimizer cannot use multi-column stats
+// if they haven't been collected. Collection of multi-column stats is
+// controlled by the cluster setting sql.stats.multi_column_collection.enabled.
+var optUseMultiColStatsClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.optimizer_use_multicol_stats.enabled",
+	"default value for optimizer_use_multicol_stats session setting; enables usage of multi-column stats in the optimizer by default",
 	true,
 )
 
@@ -195,11 +234,11 @@ const VectorizeClusterSettingName = "sql.defaults.vectorize"
 var VectorizeClusterMode = settings.RegisterEnumSetting(
 	VectorizeClusterSettingName,
 	"default vectorize mode",
-	"auto",
+	"on",
 	map[int64]string{
-		int64(sessiondata.VectorizeOff):  "off",
-		int64(sessiondata.VectorizeAuto): "auto",
-		int64(sessiondata.VectorizeOn):   "on",
+		int64(sessiondata.VectorizeOff):     "off",
+		int64(sessiondata.Vectorize201Auto): "201auto",
+		int64(sessiondata.VectorizeOn):      "on",
 	},
 )
 
@@ -529,7 +568,7 @@ func getMetricMeta(meta metric.Metadata, internal bool) metric.Metadata {
 // NodeInfo contains metadata about the executing node and cluster.
 type NodeInfo struct {
 	ClusterID func() uuid.UUID
-	NodeID    *base.NodeIDContainer
+	NodeID    *base.SQLIDContainer
 	AdminURL  func() *url.URL
 	PGURL     func(*url.Userinfo) (*url.URL, error)
 }
@@ -547,30 +586,32 @@ type nodeStatusGenerator interface {
 type ExecutorConfig struct {
 	Settings *cluster.Settings
 	NodeInfo
+	Codec             keys.SQLCodec
 	DefaultZoneConfig *zonepb.ZoneConfig
 	Locality          roachpb.Locality
 	AmbientCtx        log.AmbientContext
 	DB                *kv.DB
-	Gossip            *gossip.Gossip
+	Gossip            gossip.DeprecatedGossip
 	DistSender        *kvcoord.DistSender
 	RPCContext        *rpc.Context
 	LeaseManager      *LeaseManager
 	Clock             *hlc.Clock
 	DistSQLSrv        *distsql.ServerImpl
-	StatusServer      serverpb.StatusServer
-	MetricsRecorder   nodeStatusGenerator
-	SessionRegistry   *SessionRegistry
-	JobRegistry       *jobs.Registry
-	VirtualSchemas    *VirtualSchemaHolder
-	DistSQLPlanner    *DistSQLPlanner
-	TableStatsCache   *stats.TableStatisticsCache
-	StatsRefresher    *stats.Refresher
-	ExecLogger        *log.SecondaryLogger
-	AuditLogger       *log.SecondaryLogger
-	SlowQueryLogger   *log.SecondaryLogger
-	AuthLogger        *log.SecondaryLogger
-	InternalExecutor  *InternalExecutor
-	QueryCache        *querycache.C
+	// StatusServer gives access to the Status service.
+	StatusServer     serverpb.OptionalStatusServer
+	MetricsRecorder  nodeStatusGenerator
+	SessionRegistry  *SessionRegistry
+	JobRegistry      *jobs.Registry
+	VirtualSchemas   *VirtualSchemaHolder
+	DistSQLPlanner   *DistSQLPlanner
+	TableStatsCache  *stats.TableStatisticsCache
+	StatsRefresher   *stats.Refresher
+	ExecLogger       *log.SecondaryLogger
+	AuditLogger      *log.SecondaryLogger
+	SlowQueryLogger  *log.SecondaryLogger
+	AuthLogger       *log.SecondaryLogger
+	InternalExecutor *InternalExecutor
+	QueryCache       *querycache.C
 
 	TestingKnobs              ExecutorTestingKnobs
 	PGWireTestingKnobs        *PGWireTestingKnobs
@@ -592,7 +633,7 @@ type ExecutorConfig struct {
 	ProtectedTimestampProvider protectedts.Provider
 
 	// StmtDiagnosticsRecorder deals with recording statement diagnostics.
-	StmtDiagnosticsRecorder StmtDiagnosticsRecorder
+	StmtDiagnosticsRecorder *stmtdiagnostics.Registry
 }
 
 // Organization returns the value of cluster.organization.
@@ -766,7 +807,7 @@ var _ dbCacheSubscriber = &databaseCacheHolder{}
 // received.
 func (dc *databaseCacheHolder) updateSystemConfig(cfg *config.SystemConfig) {
 	dc.mu.Lock()
-	dc.mu.c = newDatabaseCache(cfg)
+	dc.mu.c = newDatabaseCache(dc.mu.c.codec, cfg)
 	dc.mu.cv.Broadcast()
 	dc.mu.Unlock()
 }
@@ -815,7 +856,7 @@ func shouldDistributePlan(
 // TODO: This does not support arguments of the SQL 'Date' type, as there is not
 // an equivalent type in Go's standard library. It's not currently needed by any
 // of our internal tables.
-func golangFillQueryArguments(args ...interface{}) tree.Datums {
+func golangFillQueryArguments(args ...interface{}) (tree.Datums, error) {
 	res := make(tree.Datums, len(args))
 	for i, arg := range args {
 		if arg == nil {
@@ -831,7 +872,11 @@ func golangFillQueryArguments(args ...interface{}) tree.Datums {
 		case tree.Datum:
 			d = t
 		case time.Time:
-			d = tree.MakeDTimestamp(t, time.Microsecond)
+			var err error
+			d, err = tree.MakeDTimestamp(t, time.Microsecond)
+			if err != nil {
+				return nil, err
+			}
 		case time.Duration:
 			d = &tree.DInterval{Duration: duration.MakeDuration(t.Nanoseconds(), 0, 0)}
 		case bitarray.BitArray:
@@ -871,7 +916,7 @@ func golangFillQueryArguments(args ...interface{}) tree.Datums {
 		}
 		res[i] = d
 	}
-	return res
+	return res, nil
 }
 
 // checkResultType verifies that a table result can be returned to the
@@ -886,6 +931,8 @@ func checkResultType(typ *types.T) error {
 	case types.FloatFamily:
 	case types.DecimalFamily:
 	case types.BytesFamily:
+	case types.GeographyFamily:
+	case types.GeometryFamily:
 	case types.StringFamily:
 	case types.CollatedStringFamily:
 	case types.DateFamily:
@@ -1632,10 +1679,15 @@ func generateSessionTraceVTable(spans []tracing.RecordedSpan) ([]traceRow, error
 			return nil, fmt.Errorf("unable to split trace message: %q", lrr.msg)
 		}
 
+		tsDatum, err := tree.MakeDTimestampTZ(lrr.timestamp, time.Nanosecond)
+		if err != nil {
+			return nil, err
+		}
+
 		row := traceRow{
-			tree.NewDInt(tree.DInt(lrr.span.index)),               // span_idx
-			tree.NewDInt(tree.DInt(lrr.index)),                    // message_idx
-			tree.MakeDTimestampTZ(lrr.timestamp, time.Nanosecond), // timestamp
+			tree.NewDInt(tree.DInt(lrr.span.index)), // span_idx
+			tree.NewDInt(tree.DInt(lrr.index)),      // message_idx
+			tsDatum,                                 // timestamp
 			tree.DNull,                              // duration, will be populated below
 			tree.DNull,                              // operation, will be populated below
 			tree.NewDString(lrr.msg[loc[2]:loc[3]]), // location
@@ -1841,7 +1893,7 @@ func (m *sessionDataMutator) SetApplicationName(appName string) {
 	m.paramStatusUpdater.AppendParamStatusUpdate("application_name", appName)
 }
 
-func (m *sessionDataMutator) SetBytesEncodeFormat(val sessiondata.BytesEncodeFormat) {
+func (m *sessionDataMutator) SetBytesEncodeFormat(val lex.BytesEncodeFormat) {
 	m.data.DataConversion.BytesEncodeFormat = val
 }
 
@@ -1860,6 +1912,10 @@ func (m *sessionDataMutator) SetTemporarySchemaName(scName string) {
 
 func (m *sessionDataMutator) SetDefaultIntSize(size int) {
 	m.data.DefaultIntSize = size
+}
+
+func (m *sessionDataMutator) SetDefaultTransactionPriority(val tree.UserPriority) {
+	m.data.DefaultTxnPriority = int(val)
 }
 
 func (m *sessionDataMutator) SetDefaultReadOnly(val bool) {
@@ -1894,8 +1950,24 @@ func (m *sessionDataMutator) SetVectorizeRowCountThreshold(val uint64) {
 	m.data.VectorizeRowCountThreshold = val
 }
 
-func (m *sessionDataMutator) SetOptimizerFKs(val bool) {
-	m.data.OptimizerFKs = val
+func (m *sessionDataMutator) SetOptimizerFKChecks(val bool) {
+	m.data.OptimizerFKChecks = val
+}
+
+func (m *sessionDataMutator) SetOptimizerFKCascades(val bool) {
+	m.data.OptimizerFKCascades = val
+}
+
+func (m *sessionDataMutator) SetOptimizerFKCascadesLimit(val int) {
+	m.data.OptimizerFKCascadesLimit = val
+}
+
+func (m *sessionDataMutator) SetOptimizerUseHistograms(val bool) {
+	m.data.OptimizerUseHistograms = val
+}
+
+func (m *sessionDataMutator) SetOptimizerUseMultiColStats(val bool) {
+	m.data.OptimizerUseMultiColStats = val
 }
 
 func (m *sessionDataMutator) SetImplicitSelectForUpdate(val bool) {
@@ -1951,6 +2023,11 @@ func (m *sessionDataMutator) SetHashShardedIndexesEnabled(val bool) {
 // a sequence.
 func (m *sessionDataMutator) RecordLatestSequenceVal(seqID uint32, val int64) {
 	m.data.SequenceState.RecordValue(seqID, val)
+}
+
+// SetNoticeDisplaySeverity sets the NoticeDisplaySeverity for the given session.
+func (m *sessionDataMutator) SetNoticeDisplaySeverity(severity pgnotice.DisplaySeverity) {
+	m.data.NoticeDisplaySeverity = severity
 }
 
 type sqlStatsCollector struct {

@@ -150,6 +150,17 @@ INSERT INTO f VALUES(2, NULL)
 ----
 CPut /Table/55/1/2/0 -> /TUPLE/
 
+# Test that updating a row that edits inverted index entries doesn't delete and
+# re-put things that exist both in the old and in the new value.
+# This case adds 15 and removes 1, so we should just see those commands.
+query T kvtrace
+UPDATE f SET b = ARRAY[0,15,7,10] WHERE a = 0
+----
+Scan /Table/55/1/0{-/#}
+Put /Table/55/1/0/0 -> /TUPLE/
+Del /Table/55/2/1/0/0
+InitPut /Table/55/2/15/0/0 -> /BYTES/
+
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * from d where b @>'{"a": "b"}'
 ----
@@ -229,7 +240,7 @@ EXPLAIN (VERBOSE) SELECT * from d where b @> '[]';
 ·     vectorized   false      ·       ·
 scan  ·            ·          (a, b)  ·
 ·     table        d@primary  ·       ·
-·     spans        ALL        ·       ·
+·     spans        FULL SCAN  ·       ·
 ·     filter       b @> '[]'  ·       ·
 
 
@@ -240,7 +251,7 @@ EXPLAIN (VERBOSE) SELECT * from d where b @> '{}';
 ·     vectorized   false      ·       ·
 scan  ·            ·          (a, b)  ·
 ·     table        d@primary  ·       ·
-·     spans        ALL        ·       ·
+·     spans        FULL SCAN  ·       ·
 ·     filter       b @> '{}'  ·       ·
 
 
@@ -295,7 +306,7 @@ EXPLAIN (VERBOSE) SELECT * from d where b IS NULL
 ·     vectorized   false      ·       ·
 scan  ·            ·          (a, b)  ·
 ·     table        d@primary  ·       ·
-·     spans        ALL        ·       ·
+·     spans        FULL SCAN  ·       ·
 ·     filter       b IS NULL  ·       ·
 
 query TTT
@@ -305,7 +316,7 @@ EXPLAIN SELECT * from d where b @> '{"a": []}' ORDER BY a;
 ·     vectorized   false
 scan  ·            ·
 ·     table        d@primary
-·     spans        ALL
+·     spans        FULL SCAN
 ·     filter       b @> '{"a": []}'
 
 query TTT
@@ -315,7 +326,7 @@ EXPLAIN SELECT * from d where b @> '{"a": {}}' ORDER BY a;
 ·     vectorized   false
 scan  ·            ·
 ·     table        d@primary
-·     spans        ALL
+·     spans        FULL SCAN
 ·     filter       b @> '{"a": {}}'
 
 # Multi-path contains queries. Should create zigzag joins.
@@ -470,7 +481,7 @@ EXPLAIN (VERBOSE) SELECT * from d where b @> '{"a": {}, "b": {}}'
 ·     vectorized   false                      ·       ·
 scan  ·            ·                          (a, b)  ·
 ·     table        d@primary                  ·       ·
-·     spans        ALL                        ·       ·
+·     spans        FULL SCAN                  ·       ·
 ·     filter       b @> '{"a": {}, "b": {}}'  ·       ·
 
 subtest array
@@ -495,7 +506,7 @@ EXPLAIN (VERBOSE) SELECT * from e where b @> ARRAY[]::INT[]
 ·     vectorized   false         ·       ·
 scan  ·            ·             (a, b)  ·
 ·     table        e@primary     ·       ·
-·     spans        ALL           ·       ·
+·     spans        FULL SCAN     ·       ·
 ·     filter       b @> ARRAY[]  ·       ·
 
 # Test that searching for a NULL element using the inverted index.
@@ -523,7 +534,7 @@ EXPLAIN (VERBOSE) SELECT * from e where b IS NULL
 ·     vectorized   false      ·       ·
 scan  ·            ·          (a, b)  ·
 ·     table        e@primary  ·       ·
-·     spans        ALL        ·       ·
+·     spans        FULL SCAN  ·       ·
 ·     filter       b IS NULL  ·       ·
 
 query TTTTT

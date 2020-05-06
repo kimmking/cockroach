@@ -44,35 +44,34 @@ import (
 // testUser has valid client certs.
 var testUser = server.TestUser
 
-var errInfo = testutils.MakeCaller(3, 2)
-
 // checkKVs verifies that a KeyValue slice contains the expected keys and
 // values. The values can be either integers or strings; the expected results
 // are passed as alternating keys and values, e.g:
 //   checkScanResult(t, result, key1, val1, key2, val2)
 func checkKVs(t *testing.T, kvs []kv.KeyValue, expected ...interface{}) {
+	t.Helper()
 	expLen := len(expected) / 2
 	if expLen != len(kvs) {
-		t.Errorf("%s: expected %d scan results, got %d", errInfo(), expLen, len(kvs))
+		t.Errorf("expected %d scan results, got %d", expLen, len(kvs))
 		return
 	}
 	for i := 0; i < expLen; i++ {
 		expKey := expected[2*i].(roachpb.Key)
 		if key := kvs[i].Key; !key.Equal(expKey) {
-			t.Errorf("%s: expected scan key %d to be %q; got %q", errInfo(), i, expKey, key)
+			t.Errorf("expected scan key %d to be %q; got %q", i, expKey, key)
 		}
 		switch expValue := expected[2*i+1].(type) {
 		case int:
 			if value, err := kvs[i].Value.GetInt(); err != nil {
-				t.Errorf("%s: non-integer scan value %d: %q", errInfo(), i, kvs[i].Value)
+				t.Errorf("non-integer scan value %d: %q", i, kvs[i].Value)
 			} else if value != int64(expValue) {
-				t.Errorf("%s: expected scan value %d to be %d; got %d",
-					errInfo(), i, expValue, value)
+				t.Errorf("expected scan value %d to be %d; got %d",
+					i, expValue, value)
 			}
 		case string:
 			if value := kvs[i].Value.String(); value != expValue {
-				t.Errorf("%s: expected scan value %d to be %s; got %s",
-					errInfo(), i, expValue, value)
+				t.Errorf("expected scan value %d to be %s; got %s",
+					i, expValue, value)
 			}
 		default:
 			t.Fatalf("unsupported type %T", expValue)
@@ -296,7 +295,7 @@ func TestClientGetAndPutProto(t *testing.T) {
 
 	zoneConfig := zonepb.ZoneConfig{
 		NumReplicas:   proto.Int32(2),
-		Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "mem"}}}},
+		Constraints:   []zonepb.ConstraintsConjunction{{Constraints: []zonepb.Constraint{{Value: "mem"}}}},
 		RangeMinBytes: proto.Int64(1 << 10), // 1k
 		RangeMaxBytes: proto.Int64(1 << 18), // 256k
 	}
@@ -827,10 +826,18 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 			return ba.CreateReply(), nil
 		})
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	dbCtx := kv.DefaultDBContext()
-	dbCtx.NodeID = &base.NodeIDContainer{}
-	db := kv.NewDBWithContext(testutils.MakeAmbientCtx(), factory, clock, dbCtx)
+	setup := func(nodeID roachpb.NodeID) *kv.DB {
+		clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+		dbCtx := kv.DefaultDBContext()
+		var c base.NodeIDContainer
+		if nodeID != 0 {
+			c.Set(context.Background(), nodeID)
+		}
+		dbCtx.NodeID = base.NewSQLIDContainer(0, &c, true /* exposed */)
+
+		db := kv.NewDBWithContext(testutils.MakeAmbientCtx(), factory, clock, dbCtx)
+		return db
+	}
 	ctx := context.Background()
 
 	// Verify direct creation of Txns.
@@ -846,6 +853,7 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 	}
 	for i, test := range directCases {
 		t.Run(fmt.Sprintf("direct-txn-%d", i), func(t *testing.T) {
+			db := setup(test.nodeID)
 			now := db.Clock().Now()
 			kvTxn := roachpb.MakeTransaction("unnamed", nil /*baseKey*/, roachpb.NormalUserPriority, now, db.Clock().MaxOffset().Nanoseconds())
 			txn := kv.NewTxnFromProto(ctx, db, test.nodeID, now, test.typ, &kvTxn)
@@ -866,9 +874,7 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 	}
 	for i, test := range indirectCases {
 		t.Run(fmt.Sprintf("indirect-txn-%d", i), func(t *testing.T) {
-			if test.nodeID != 0 {
-				dbCtx.NodeID.Set(ctx, test.nodeID)
-			}
+			db := setup(test.nodeID)
 			if err := db.Txn(
 				ctx, func(_ context.Context, txn *kv.Txn) error {
 					ots := txn.TestingCloneTxn().ObservedTimestamps

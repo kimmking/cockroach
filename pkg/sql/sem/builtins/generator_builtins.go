@@ -73,7 +73,7 @@ func genPropsWithLabels(returnLabels []string) tree.FunctionProperties {
 }
 
 var aclexplodeGeneratorType = types.MakeLabeledTuple(
-	[]types.T{*types.Oid, *types.Oid, *types.String, *types.Bool},
+	[]*types.T{types.Oid, types.Oid, types.String, types.Bool},
 	[]string{"grantor", "grantee", "privilege_type", "is_grantable"},
 )
 
@@ -84,7 +84,7 @@ func (aclexplodeGenerator) ResolvedType() *types.T                   { return ac
 func (aclexplodeGenerator) Start(_ context.Context, _ *kv.Txn) error { return nil }
 func (aclexplodeGenerator) Close()                                   {}
 func (aclexplodeGenerator) Next(_ context.Context) (bool, error)     { return false, nil }
-func (aclexplodeGenerator) Values() tree.Datums                      { return nil }
+func (aclexplodeGenerator) Values() (tree.Datums, error)             { return nil, nil }
 
 // generators is a map from name to slice of Builtins for all built-in
 // generators.
@@ -175,13 +175,13 @@ var generators = map[string]builtinDefinition{
 				VarType:    types.AnyArray,
 			},
 			func(args []tree.TypedExpr) *types.T {
-				returnTypes := make([]types.T, len(args))
+				returnTypes := make([]*types.T, len(args))
 				labels := make([]string, len(args))
 				for i, arg := range args {
 					if arg.ResolvedType().Family() == types.UnknownFamily {
 						return tree.UnknownReturnType
 					}
-					returnTypes[i] = *arg.ResolvedType().ArrayContents()
+					returnTypes[i] = arg.ResolvedType().ArrayContents()
 					labels[i] = "unnest"
 				}
 				return types.MakeLabeledTuple(returnTypes, labels)
@@ -199,7 +199,7 @@ var generators = map[string]builtinDefinition{
 					return tree.UnknownReturnType
 				}
 				t := args[0].ResolvedType().ArrayContents()
-				return types.MakeLabeledTuple([]types.T{*t, *types.Int}, expandArrayValueGeneratorLabels)
+				return types.MakeLabeledTuple([]*types.T{t, types.Int}, expandArrayValueGeneratorLabels)
 			},
 			makeExpandArrayGenerator,
 			"Returns the input array as a set of rows with an index",
@@ -306,7 +306,7 @@ type keywordsValueGenerator struct {
 }
 
 var keywordsValueGeneratorType = types.MakeLabeledTuple(
-	[]types.T{*types.String, *types.String, *types.String},
+	[]*types.T{types.String, types.String, types.String},
 	[]string{"word", "catcode", "catdesc"},
 )
 
@@ -331,11 +331,11 @@ func (k *keywordsValueGenerator) Next(_ context.Context) (bool, error) {
 }
 
 // Values implements the tree.ValueGenerator interface.
-func (k *keywordsValueGenerator) Values() tree.Datums {
+func (k *keywordsValueGenerator) Values() (tree.Datums, error) {
 	kw := lex.KeywordNames[k.curKeyword]
 	cat := lex.KeywordsCategories[kw]
 	desc := keywordCategoryDescriptions[cat]
-	return tree.Datums{tree.NewDString(kw), tree.NewDString(cat), tree.NewDString(desc)}
+	return tree.Datums{tree.NewDString(kw), tree.NewDString(cat), tree.NewDString(desc)}, nil
 }
 
 var keywordCategoryDescriptions = map[string]string{
@@ -352,7 +352,7 @@ type seriesValueGenerator struct {
 	nextOK                              bool
 	genType                             *types.T
 	next                                func(*seriesValueGenerator) (bool, error)
-	genValue                            func(*seriesValueGenerator) tree.Datums
+	genValue                            func(*seriesValueGenerator) (tree.Datums, error)
 }
 
 var seriesValueGeneratorType = types.Int
@@ -380,8 +380,8 @@ func seriesIntNext(s *seriesValueGenerator) (bool, error) {
 	return true, nil
 }
 
-func seriesGenIntValue(s *seriesValueGenerator) tree.Datums {
-	return tree.Datums{tree.NewDInt(tree.DInt(s.value.(int64)))}
+func seriesGenIntValue(s *seriesValueGenerator) (tree.Datums, error) {
+	return tree.Datums{tree.NewDInt(tree.DInt(s.value.(int64)))}, nil
 }
 
 // seriesTSNext performs calendar-aware math.
@@ -407,8 +407,12 @@ func seriesTSNext(s *seriesValueGenerator) (bool, error) {
 	return true, nil
 }
 
-func seriesGenTSValue(s *seriesValueGenerator) tree.Datums {
-	return tree.Datums{tree.MakeDTimestamp(s.value.(time.Time), time.Microsecond)}
+func seriesGenTSValue(s *seriesValueGenerator) (tree.Datums, error) {
+	ts, err := tree.MakeDTimestamp(s.value.(time.Time), time.Microsecond)
+	if err != nil {
+		return nil, err
+	}
+	return tree.Datums{ts}, nil
 }
 
 func makeSeriesGenerator(_ *tree.EvalContext, args tree.Datums) (tree.ValueGenerator, error) {
@@ -472,9 +476,8 @@ func (s *seriesValueGenerator) Next(_ context.Context) (bool, error) {
 }
 
 // Values implements the tree.ValueGenerator interface.
-func (s *seriesValueGenerator) Values() tree.Datums {
-	x := s.genValue(s)
-	return x
+func (s *seriesValueGenerator) Values() (tree.Datums, error) {
+	return s.genValue(s)
 }
 
 func makeVariadicUnnestGenerator(
@@ -499,10 +502,10 @@ type multipleArrayValueGenerator struct {
 // ResolvedType implements the tree.ValueGenerator interface.
 func (s *multipleArrayValueGenerator) ResolvedType() *types.T {
 	arraysN := len(s.arrays)
-	returnTypes := make([]types.T, arraysN)
+	returnTypes := make([]*types.T, arraysN)
 	labels := make([]string, arraysN)
 	for i, arr := range s.arrays {
-		returnTypes[i] = *arr.ParamTyp
+		returnTypes[i] = arr.ParamTyp
 		labels[i] = "unnest"
 	}
 	return types.MakeLabeledTuple(returnTypes, labels)
@@ -530,7 +533,7 @@ func (s *multipleArrayValueGenerator) Next(_ context.Context) (bool, error) {
 }
 
 // Values implements the tree.ValueGenerator interface.
-func (s *multipleArrayValueGenerator) Values() tree.Datums {
+func (s *multipleArrayValueGenerator) Values() (tree.Datums, error) {
 	for i, arr := range s.arrays {
 		if s.nextIndex < arr.Len() {
 			s.datums[i] = arr.Array[s.nextIndex]
@@ -538,7 +541,7 @@ func (s *multipleArrayValueGenerator) Values() tree.Datums {
 			s.datums[i] = tree.DNull
 		}
 	}
-	return s.datums
+	return s.datums, nil
 }
 
 func makeArrayGenerator(_ *tree.EvalContext, args tree.Datums) (tree.ValueGenerator, error) {
@@ -577,8 +580,8 @@ func (s *arrayValueGenerator) Next(_ context.Context) (bool, error) {
 }
 
 // Values implements the tree.ValueGenerator interface.
-func (s *arrayValueGenerator) Values() tree.Datums {
-	return tree.Datums{s.array.Array[s.nextIndex]}
+func (s *arrayValueGenerator) Values() (tree.Datums, error) {
+	return tree.Datums{s.array.Array[s.nextIndex]}, nil
 }
 
 func makeExpandArrayGenerator(
@@ -602,7 +605,7 @@ var expandArrayValueGeneratorLabels = []string{"x", "n"}
 // ResolvedType implements the tree.ValueGenerator interface.
 func (s *expandArrayValueGenerator) ResolvedType() *types.T {
 	return types.MakeLabeledTuple(
-		[]types.T{*s.avg.array.ParamTyp, *types.Int},
+		[]*types.T{s.avg.array.ParamTyp, types.Int},
 		expandArrayValueGeneratorLabels,
 	)
 }
@@ -623,11 +626,11 @@ func (s *expandArrayValueGenerator) Next(_ context.Context) (bool, error) {
 }
 
 // Values implements the tree.ValueGenerator interface.
-func (s *expandArrayValueGenerator) Values() tree.Datums {
+func (s *expandArrayValueGenerator) Values() (tree.Datums, error) {
 	// Expand array's index is 1 based.
 	s.buf[0] = s.avg.array.Array[s.avg.nextIndex]
 	s.buf[1] = tree.NewDInt(tree.DInt(s.avg.nextIndex + 1))
-	return s.buf[:]
+	return s.buf[:], nil
 }
 
 func makeGenerateSubscriptsGenerator(
@@ -700,9 +703,9 @@ func (s *subscriptsValueGenerator) Next(_ context.Context) (bool, error) {
 }
 
 // Values implements the tree.ValueGenerator interface.
-func (s *subscriptsValueGenerator) Values() tree.Datums {
+func (s *subscriptsValueGenerator) Values() (tree.Datums, error) {
 	s.buf[0] = tree.NewDInt(tree.DInt(s.avg.nextIndex + s.firstIndex))
-	return s.buf[:]
+	return s.buf[:], nil
 }
 
 // EmptyGenerator returns a new, empty generator. Used when a SRF
@@ -746,7 +749,7 @@ func (s *unaryValueGenerator) Next(_ context.Context) (bool, error) {
 var noDatums tree.Datums
 
 // Values implements the tree.ValueGenerator interface.
-func (s *unaryValueGenerator) Values() tree.Datums { return noDatums }
+func (s *unaryValueGenerator) Values() (tree.Datums, error) { return noDatums, nil }
 
 func jsonAsText(j json.JSON) (tree.Datum, error) {
 	text, err := j.AsText()
@@ -855,8 +858,8 @@ func (g *jsonArrayGenerator) Next(_ context.Context) (bool, error) {
 }
 
 // Values implements the tree.ValueGenerator interface.
-func (g *jsonArrayGenerator) Values() tree.Datums {
-	return g.buf[:]
+func (g *jsonArrayGenerator) Values() (tree.Datums, error) {
+	return g.buf[:], nil
 }
 
 // jsonObjectKeysImpl is a key generator of a JSON object.
@@ -911,8 +914,8 @@ func (g *jsonObjectKeysGenerator) Next(_ context.Context) (bool, error) {
 }
 
 // Values implements the tree.ValueGenerator interface.
-func (g *jsonObjectKeysGenerator) Values() tree.Datums {
-	return tree.Datums{tree.NewDString(g.iter.Key())}
+func (g *jsonObjectKeysGenerator) Values() (tree.Datums, error) {
+	return tree.Datums{tree.NewDString(g.iter.Key())}, nil
 }
 
 var jsonEachImpl = makeGeneratorOverload(
@@ -933,12 +936,12 @@ var jsonEachTextImpl = makeGeneratorOverload(
 var jsonEachGeneratorLabels = []string{"key", "value"}
 
 var jsonEachGeneratorType = types.MakeLabeledTuple(
-	[]types.T{*types.String, *types.Jsonb},
+	[]*types.T{types.String, types.Jsonb},
 	jsonEachGeneratorLabels,
 )
 
 var jsonEachTextGeneratorType = types.MakeLabeledTuple(
-	[]types.T{*types.String, *types.String},
+	[]*types.T{types.String, types.String},
 	jsonEachGeneratorLabels,
 )
 
@@ -1017,8 +1020,8 @@ func (g *jsonEachGenerator) Next(_ context.Context) (bool, error) {
 }
 
 // Values implements the tree.ValueGenerator interface.
-func (g *jsonEachGenerator) Values() tree.Datums {
-	return tree.Datums{g.key, g.value}
+func (g *jsonEachGenerator) Values() (tree.Datums, error) {
+	return tree.Datums{g.key, g.value}, nil
 }
 
 type checkConsistencyGenerator struct {
@@ -1072,7 +1075,7 @@ func makeCheckConsistencyGenerator(
 }
 
 var checkConsistencyGeneratorType = types.MakeLabeledTuple(
-	[]types.T{*types.Int, *types.Bytes, *types.String, *types.String, *types.String},
+	[]*types.T{types.Int, types.Bytes, types.String, types.String, types.String},
 	[]string{"range_id", "start_key", "start_key_pretty", "status", "detail"},
 )
 
@@ -1115,14 +1118,14 @@ func (c *checkConsistencyGenerator) Next(_ context.Context) (bool, error) {
 }
 
 // Values is part of the tree.ValueGenerator interface.
-func (c *checkConsistencyGenerator) Values() tree.Datums {
+func (c *checkConsistencyGenerator) Values() (tree.Datums, error) {
 	return tree.Datums{
 		tree.NewDInt(tree.DInt(c.curRow.RangeID)),
 		tree.NewDBytes(tree.DBytes(c.curRow.StartKey)),
 		tree.NewDString(roachpb.Key(c.curRow.StartKey).String()),
 		tree.NewDString(c.curRow.Status.String()),
 		tree.NewDString(c.curRow.Detail),
-	}
+	}, nil
 }
 
 // Close is part of the tree.ValueGenerator interface.

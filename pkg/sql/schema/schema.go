@@ -18,23 +18,33 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
+
+var staticSchemaIDMap = map[sqlbase.ID]string{
+	keys.PublicSchemaID:         tree.PublicSchema,
+	sqlbase.PgCatalogID:         sessiondata.PgCatalogName,
+	sqlbase.InformationSchemaID: sessiondata.InformationSchemaName,
+	sqlbase.CrdbInternalID:      sessiondata.CRDBInternalSchemaName,
+}
 
 // ResolveNameByID resolves a schema's name based on db and schema id.
 // TODO(sqlexec): this should return the descriptor instead if given an ID.
 // Instead, we have to rely on a scan of the kv table.
 // TODO(sqlexec): this should probably be cached.
 func ResolveNameByID(
-	ctx context.Context, txn *kv.Txn, dbID sqlbase.ID, schemaID sqlbase.ID,
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, dbID sqlbase.ID, schemaID sqlbase.ID,
 ) (string, error) {
-	// Fast-path for public schema, to avoid hot lookups.
-	if schemaID == keys.PublicSchemaID {
-		return string(tree.PublicSchemaName), nil
+	// Fast-path for public schema and virtual schemas, to avoid hot lookups.
+	for id, schemaName := range staticSchemaIDMap {
+		if id == schemaID {
+			return schemaName, nil
+		}
 	}
-	schemas, err := GetForDatabase(ctx, txn, dbID)
+	schemas, err := GetForDatabase(ctx, txn, codec, dbID)
 	if err != nil {
 		return "", err
 	}
@@ -47,11 +57,11 @@ func ResolveNameByID(
 // GetForDatabase looks up and returns all available
 // schema ids to names for a given database.
 func GetForDatabase(
-	ctx context.Context, txn *kv.Txn, dbID sqlbase.ID,
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, dbID sqlbase.ID,
 ) (map[sqlbase.ID]string, error) {
 	log.Eventf(ctx, "fetching all schema descriptor IDs for %d", dbID)
 
-	nameKey := sqlbase.NewSchemaKey(dbID, "" /* name */).Key()
+	nameKey := sqlbase.NewSchemaKey(dbID, "" /* name */).Key(codec)
 	kvs, err := txn.Scan(ctx, nameKey, nameKey.PrefixEnd(), 0 /* maxRows */)
 	if err != nil {
 		return nil, err
@@ -68,7 +78,7 @@ func GetForDatabase(
 		if _, ok := ret[id]; ok {
 			continue
 		}
-		_, _, name, err := sqlbase.DecodeNameMetadataKey(kv.Key)
+		_, _, name, err := sqlbase.DecodeNameMetadataKey(codec, kv.Key)
 		if err != nil {
 			return nil, err
 		}

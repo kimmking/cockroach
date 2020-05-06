@@ -31,12 +31,12 @@ var _ DescriptorProto = &TableDescriptor{}
 // databaseKey and tableKey. It is used to easily get the
 // descriptor key and plain name.
 type DescriptorKey interface {
-	Key() roachpb.Key
+	Key(codec keys.SQLCodec) roachpb.Key
 	Name() string
 }
 
-// DescriptorProto is the interface implemented by both DatabaseDescriptor
-// and TableDescriptor.
+// DescriptorProto is the interface implemented by DatabaseDescriptor,
+// TableDescriptor, and TypeDescriptor.
 // TODO(marc): this is getting rather large.
 type DescriptorProto interface {
 	protoutil.Message
@@ -59,6 +59,8 @@ func WrapDescriptor(descriptor DescriptorProto) *Descriptor {
 		desc.Union = &Descriptor_Table{Table: t}
 	case *DatabaseDescriptor:
 		desc.Union = &Descriptor_Database{Database: t}
+	case *TypeDescriptor:
+		desc.Union = &Descriptor_Type{Type: t}
 	default:
 		panic(fmt.Sprintf("unknown descriptor type: %s", descriptor.TypeName()))
 	}
@@ -70,6 +72,7 @@ func WrapDescriptor(descriptor DescriptorProto) *Descriptor {
 // installed on the underlying persistent storage before a cockroach store can
 // start running correctly, thus requiring this special initialization.
 type MetadataSchema struct {
+	codec         keys.SQLCodec
 	descs         []metadataDescriptor
 	otherSplitIDs []uint32
 	otherKV       []roachpb.KeyValue
@@ -83,9 +86,11 @@ type metadataDescriptor struct {
 // MakeMetadataSchema constructs a new MetadataSchema value which constructs
 // the "system" database.
 func MakeMetadataSchema(
-	defaultZoneConfig *zonepb.ZoneConfig, defaultSystemZoneConfig *zonepb.ZoneConfig,
+	codec keys.SQLCodec,
+	defaultZoneConfig *zonepb.ZoneConfig,
+	defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) MetadataSchema {
-	ms := MetadataSchema{}
+	ms := MetadataSchema{codec: codec}
 	addSystemDatabaseToSchema(&ms, defaultZoneConfig, defaultSystemZoneConfig)
 	return ms
 }
@@ -150,7 +155,7 @@ func (ms MetadataSchema) GetInitialValues(
 		if bootstrapVersion.IsActive(clusterversion.VersionNamespaceTableWithSchemas) {
 			if parentID != keys.RootNamespaceID {
 				ret = append(ret, roachpb.KeyValue{
-					Key:   NewPublicTableKey(parentID, desc.GetName()).Key(),
+					Key:   NewPublicTableKey(parentID, desc.GetName()).Key(ms.codec),
 					Value: value,
 				})
 			} else {
@@ -161,17 +166,17 @@ func (ms MetadataSchema) GetInitialValues(
 				ret = append(
 					ret,
 					roachpb.KeyValue{
-						Key:   NewDatabaseKey(desc.GetName()).Key(),
+						Key:   NewDatabaseKey(desc.GetName()).Key(ms.codec),
 						Value: value,
 					},
 					roachpb.KeyValue{
-						Key:   NewPublicSchemaKey(desc.GetID()).Key(),
+						Key:   NewPublicSchemaKey(desc.GetID()).Key(ms.codec),
 						Value: publicSchemaValue,
 					})
 			}
 		} else {
 			ret = append(ret, roachpb.KeyValue{
-				Key:   NewDeprecatedTableKey(parentID, desc.GetName()).Key(),
+				Key:   NewDeprecatedTableKey(parentID, desc.GetName()).Key(ms.codec),
 				Value: value,
 			})
 		}
@@ -183,11 +188,11 @@ func (ms MetadataSchema) GetInitialValues(
 			log.Fatalf(context.TODO(), "could not marshal %v", desc)
 		}
 		ret = append(ret, roachpb.KeyValue{
-			Key:   MakeDescMetadataKey(desc.GetID()),
+			Key:   MakeDescMetadataKey(ms.codec, desc.GetID()),
 			Value: value,
 		})
 		if desc.GetID() > keys.MaxSystemConfigDescID {
-			splits = append(splits, roachpb.RKey(keys.MakeTablePrefix(uint32(desc.GetID()))))
+			splits = append(splits, roachpb.RKey(ms.codec.TablePrefix(uint32(desc.GetID()))))
 		}
 	}
 
@@ -198,7 +203,7 @@ func (ms MetadataSchema) GetInitialValues(
 	}
 
 	for _, id := range ms.otherSplitIDs {
-		splits = append(splits, roachpb.RKey(keys.MakeTablePrefix(id)))
+		splits = append(splits, roachpb.RKey(ms.codec.TablePrefix(id)))
 	}
 
 	// Other key/value generation that doesn't fit into databases and
@@ -243,6 +248,19 @@ var systemTableIDCache = func() map[string]ID {
 		cache[t.Name] = t.ID
 	}
 
+	// This special case exists so that we resolve "namespace" to the new
+	// namespace table ID (30) in 20.1, while the Name in the "namespace"
+	// descriptor is still set to "namespace2" during the
+	// 20.1 cycle. We couldn't set the new namespace table's Name to "namespace"
+	// in 20.1, because it had to co-exist with the old namespace table, whose
+	// name must *remain* "namespace" - and you can't have duplicate descriptor
+	// Name fields.
+	//
+	// This can be removed in 20.2, when we add a migration to change the new
+	// namespace table's Name to "namespace" again.
+	// TODO(solon): remove this in 20.2.
+	cache[NamespaceTableName] = keys.NamespaceTableID
+
 	return cache
 }()
 
@@ -257,7 +275,7 @@ func LookupSystemTableDescriptorID(
 
 	if settings != nil &&
 		!settings.Version.IsActive(ctx, clusterversion.VersionNamespaceTableWithSchemas) &&
-		tableName == NamespaceTable.Name {
+		tableName == NamespaceTableName {
 		return DeprecatedNamespaceTable.ID
 	}
 	dbID, ok := systemTableIDCache[tableName]

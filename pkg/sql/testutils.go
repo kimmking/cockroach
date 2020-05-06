@@ -111,7 +111,7 @@ func (dsp *DistSQLPlanner) Exec(
 		execCfg.LeaseHolderCache,
 		p.txn,
 		func(ts hlc.Timestamp) {
-			_ = execCfg.Clock.Update(ts)
+			execCfg.Clock.Update(ts)
 		},
 		p.ExtendedEvalContext().Tracing,
 	)
@@ -123,6 +123,6 @@ func (dsp *DistSQLPlanner) Exec(
 	planCtx.planner = p
 	planCtx.stmtType = recv.stmtType
 
-	dsp.PlanAndRun(ctx, evalCtx, planCtx, p.txn, p.curPlan.plan, recv)()
+	dsp.PlanAndRun(ctx, evalCtx, planCtx, p.txn, p.curPlan.main, recv)()
 	return rw.Err()
 }

@@ -20,6 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
@@ -34,12 +36,16 @@ type verifyColOperatorArgs struct {
 	// anyOrder determines whether the results should be matched in order (when
 	// anyOrder is false) or as sets (when anyOrder is true).
 	anyOrder    bool
-	inputTypes  [][]types.T
+	inputTypes  [][]*types.T
 	inputs      []sqlbase.EncDatumRows
-	outputTypes []types.T
+	outputTypes []*types.T
 	pspec       *execinfrapb.ProcessorSpec
 	// forceDiskSpill, if set, will force the operator to spill to disk.
 	forceDiskSpill bool
+	// forcedDiskSpillMightNotOccur determines whether we error out if
+	// forceDiskSpill is true but the spilling doesn't occur. Please leave an
+	// explanation for why that could be the case.
+	forcedDiskSpillMightNotOccur bool
 	// numForcedRepartitions specifies a number of "repartitions" that a
 	// disk-backed operator should be forced to perform. "Repartition" can mean
 	// different things depending on the operator (for example, for hash joiner
@@ -97,8 +103,8 @@ func verifyColOperator(args verifyColOperatorArgs) error {
 
 	acc := evalCtx.Mon.MakeBoundAccount()
 	defer acc.Close(ctx)
-	testAllocator := colexec.NewAllocator(ctx, &acc)
-	columnarizers := make([]colexec.Operator, len(args.inputs))
+	testAllocator := colmem.NewAllocator(ctx, &acc)
+	columnarizers := make([]colexecbase.Operator, len(args.inputs))
 	for i, input := range inputsColOp {
 		c, err := colexec.NewColumnarizer(ctx, testAllocator, flowCtx, int32(i)+1, input)
 		if err != nil {
@@ -113,7 +119,7 @@ func verifyColOperator(args verifyColOperatorArgs) error {
 		StreamingMemAccount:  &acc,
 		ProcessorConstructor: rowexec.NewProcessor,
 		DiskQueueCfg:         colcontainer.DiskQueueCfg{FS: tempFS},
-		FDSemaphore:          colexec.NewTestingSemaphore(256),
+		FDSemaphore:          colexecbase.NewTestingSemaphore(256),
 	}
 	var spilled bool
 	if args.forceDiskSpill {
@@ -157,7 +163,7 @@ func verifyColOperator(args verifyColOperatorArgs) error {
 	printRowForChecking := func(r sqlbase.EncDatumRow) []string {
 		res := make([]string, len(args.outputTypes))
 		for i, col := range r {
-			res[i] = col.String(&args.outputTypes[i])
+			res[i] = col.String(args.outputTypes[i])
 		}
 		return res
 	}
@@ -273,7 +279,7 @@ func verifyColOperator(args verifyColOperatorArgs) error {
 				}
 				foundDifference := false
 				for k, typ := range args.outputTypes {
-					match, err := datumsMatch(expStrRow[k], retStrRow[k], &typ)
+					match, err := datumsMatch(expStrRow[k], retStrRow[k], typ)
 					if err != nil {
 						return errors.Errorf("error while parsing datum in rows\n%v\n%v\n%s",
 							expStrRow, retStrRow, err.Error())
@@ -300,7 +306,7 @@ func verifyColOperator(args verifyColOperatorArgs) error {
 			retStrRow := colOpRows[i]
 			// anyOrder is false, so the result rows must match in the same order.
 			for k, typ := range args.outputTypes {
-				match, err := datumsMatch(expStrRow[k], retStrRow[k], &typ)
+				match, err := datumsMatch(expStrRow[k], retStrRow[k], typ)
 				if err != nil {
 					return errors.Errorf("error while parsing datum in rows\n%v\n%v\n%s",
 						expStrRow, retStrRow, err.Error())
@@ -317,7 +323,7 @@ func verifyColOperator(args verifyColOperatorArgs) error {
 
 	if args.forceDiskSpill {
 		// Check that the spilling did occur.
-		if !spilled {
+		if !spilled && !args.forcedDiskSpillMightNotOccur {
 			return errors.Errorf("expected spilling to disk but it did *not* occur")
 		}
 	}

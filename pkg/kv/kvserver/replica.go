@@ -439,10 +439,13 @@ type Replica struct {
 		// released as the base index moves up by one, etc.
 		proposalQuotaBaseIndex uint64
 
-		// Once the leader observes a proposal come 'out of Raft', we add the
-		// size of the associated command to a queue of quotas we have yet to
-		// release back to the quota pool. We only do so when all replicas have
-		// persisted the corresponding entry into their logs.
+		// Once the leader observes a proposal come 'out of Raft', we add the size
+		// of the associated command to a queue of quotas we have yet to release
+		// back to the quota pool. At that point ownership of the quota is
+		// transferred from r.mu.proposals to this queue.
+		// We'll release the respective quota once all replicas have persisted the
+		// corresponding entry into their logs (or once we give up waiting on some
+		// replica because it looks like it's dead).
 		quotaReleaseQueue []*quotapool.IntAlloc
 
 		// Counts calls to Replica.tick()
@@ -478,6 +481,25 @@ type Replica struct {
 		// size drops below its current zone.MaxRangeBytes or if the
 		// zone.MaxRangeBytes increases to surpass the current value.
 		largestPreviousMaxRangeSizeBytes int64
+
+		// failureToGossipSystemConfig is set to true when the leaseholder of the
+		// range containing the system config span fails to gossip due to an
+		// outstanding intent (see MaybeGossipSystemConfig). It is reset when the
+		// system config is successfully gossiped or when the Replica loses the
+		// lease. It is read when handling a MaybeGossipSystemConfigIfHaveFailure
+		// local result trigger. That trigger is set when an EndTransaction with an
+		// ABORTED status is evaluated on a range containing the system config span.
+		//
+		// While the gossipping of the system config span is best-effort, the sql
+		// schema leasing mechanism degrades dramatically if changes are not
+		// gossiped. This degradation is due to the fact that schema changes, after
+		// writing intents, often need to ensure that there aren't outstanding
+		// leases on old versions and if there are, roll back and wait until there
+		// are not. The problem is that this waiting may take a long time if the
+		// current leaseholders are not notified. We deal with this by detecting the
+		// abort of a transaction which might have blocked the system config from
+		// being gossiped and attempting to gossip again.
+		failureToGossipSystemConfig bool
 	}
 
 	rangefeedMu struct {
@@ -1010,18 +1032,17 @@ func (r *Replica) State() storagepb.RangeInfo {
 func (r *Replica) assertStateLocked(ctx context.Context, reader storage.Reader) {
 	diskState, err := r.mu.stateLoader.Load(ctx, reader, r.mu.state.Desc)
 	if err != nil {
-		log.Fatal(ctx, err)
+		log.Fatalf(ctx, "%v", err)
 	}
 	if !diskState.Equal(r.mu.state) {
 		// The roundabout way of printing here is to expose this information in sentry.io.
 		//
 		// TODO(dt): expose properly once #15892 is addressed.
-		log.Errorf(ctx, "on-disk and in-memory state diverged:\n%s", pretty.Diff(diskState, r.mu.state))
+		log.Errorf(ctx, "on-disk and in-memory state diverged:\n%s",
+			pretty.Diff(diskState, r.mu.state))
 		r.mu.state.Desc, diskState.Desc = nil, nil
-		log.Fatal(ctx, log.Safe(
-			fmt.Sprintf("on-disk and in-memory state diverged: %s",
-				pretty.Diff(diskState, r.mu.state)),
-		))
+		log.Fatalf(ctx, "on-disk and in-memory state diverged: %s",
+			log.Safe(pretty.Diff(diskState, r.mu.state)))
 	}
 }
 
@@ -1556,6 +1577,18 @@ func (r *Replica) GetExternalStorageFromURI(
 	ctx context.Context, uri string,
 ) (cloud.ExternalStorage, error) {
 	return r.store.cfg.ExternalStorageFromURI(ctx, uri)
+}
+
+func (r *Replica) markSystemConfigGossipSuccess() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.mu.failureToGossipSystemConfig = false
+}
+
+func (r *Replica) markSystemConfigGossipFailed() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.mu.failureToGossipSystemConfig = true
 }
 
 func init() {

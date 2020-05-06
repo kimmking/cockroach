@@ -178,7 +178,11 @@ func (ps *projectSetProcessor) nextGeneratorValues() (newValAvail bool, err erro
 				}
 				if hasVals {
 					// This source has values, use them.
-					for _, value := range gen.Values() {
+					values, err := gen.Values()
+					if err != nil {
+						return false, err
+					}
+					for _, value := range values {
 						ps.rowBuffer[colIdx] = ps.toEncDatum(value, colIdx)
 						colIdx++
 					}
@@ -278,7 +282,7 @@ func (ps *projectSetProcessor) Next() (sqlbase.EncDatumRow, *execinfrapb.Produce
 
 func (ps *projectSetProcessor) toEncDatum(d tree.Datum, colIdx int) sqlbase.EncDatum {
 	generatedColIdx := colIdx - len(ps.input.OutputTypes())
-	ctyp := &ps.spec.GeneratedColumns[generatedColIdx]
+	ctyp := ps.spec.GeneratedColumns[generatedColIdx]
 	return sqlbase.DatumToEncDatum(ctyp, d)
 }
 

@@ -13,12 +13,14 @@ package execbuilder
 import (
 	"bytes"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 )
 
@@ -63,6 +65,7 @@ func (b *Builder) buildCreateView(cv *memo.CreateViewExpr) (execPlan, error) {
 		schema,
 		cv.ViewName,
 		cv.IfNotExists,
+		cv.Replace,
 		cv.Temporary,
 		cv.ViewQuery,
 		cols,
@@ -129,7 +132,7 @@ func (b *Builder) buildExplain(explain *memo.ExplainExpr) (execPlan, error) {
 			return execPlan{}, err
 		}
 
-		plan, err := b.factory.ConstructPlan(input.root, b.subqueries, b.postqueries)
+		plan, err := b.factory.ConstructPlan(input.root, b.subqueries, b.cascades, b.checks)
 		if err != nil {
 			return execPlan{}, err
 		}
@@ -144,10 +147,11 @@ func (b *Builder) buildExplain(explain *memo.ExplainExpr) (execPlan, error) {
 	for i, c := range explain.ColList {
 		ep.outputCols.Set(int(c), i)
 	}
-	// The sub- and postqueries are now owned by the explain node; remove them so
-	// they don't also show up in the final plan.
-	b.subqueries = b.subqueries[:0]
-	b.postqueries = b.postqueries[:0]
+	// The subqueries/cascades/checks are now owned by the explain node;
+	// remove them so they don't also show up in the final plan.
+	b.subqueries = nil
+	b.cascades = nil
+	b.checks = nil
 	return ep, nil
 }
 
@@ -270,6 +274,9 @@ func (b *Builder) buildCancelQueries(cancel *memo.CancelQueriesExpr) (execPlan, 
 	if err != nil {
 		return execPlan{}, err
 	}
+	if !b.disableTelemetry {
+		telemetry.Inc(sqltelemetry.CancelQueriesUseCounter)
+	}
 	// CancelQueries returns no columns.
 	return execPlan{root: node}, nil
 }
@@ -282,6 +289,9 @@ func (b *Builder) buildCancelSessions(cancel *memo.CancelSessionsExpr) (execPlan
 	node, err := b.factory.ConstructCancelSessions(input.root, cancel.IfExists)
 	if err != nil {
 		return execPlan{}, err
+	}
+	if !b.disableTelemetry {
+		telemetry.Inc(sqltelemetry.CancelSessionsUseCounter)
 	}
 	// CancelSessions returns no columns.
 	return execPlan{root: node}, nil

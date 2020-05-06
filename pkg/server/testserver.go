@@ -13,6 +13,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -26,26 +27,36 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptprovider"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tscache"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
@@ -301,7 +312,15 @@ func (ts *TestServer) Clock() *hlc.Clock {
 // JobRegistry returns the *jobs.Registry as an interface{}.
 func (ts *TestServer) JobRegistry() interface{} {
 	if ts != nil {
-		return ts.jobRegistry
+		return ts.sqlServer.jobRegistry
+	}
+	return nil
+}
+
+// MigrationManager returns the *sqlmigrations.Manager as an interface{}.
+func (ts *TestServer) MigrationManager() interface{} {
+	if ts != nil {
+		return ts.sqlServer.migMgr
 	}
 	return nil
 }
@@ -333,7 +352,7 @@ func (ts *TestServer) DB() *kv.DB {
 // PGServer returns the pgwire.Server used by the TestServer.
 func (ts *TestServer) PGServer() *pgwire.Server {
 	if ts != nil {
-		return ts.pgServer
+		return ts.sqlServer.pgServer
 	}
 	return nil
 }
@@ -365,8 +384,10 @@ func (ts *TestServer) Start(params base.TestServerArgs) error {
 		ts.Cfg.DefaultZoneConfig.NumReplicas = proto.Int32(1)
 	}
 
+	ctx := context.Background()
+
 	// Needs to be called before NewServer to ensure resolvers are initialized.
-	if err := ts.Cfg.InitNode(); err != nil {
+	if err := ts.Cfg.InitNode(ctx); err != nil {
 		return err
 	}
 
@@ -387,7 +408,169 @@ func (ts *TestServer) Start(params base.TestServerArgs) error {
 	// Our context must be shared with our server.
 	ts.Cfg = &ts.Server.cfg
 
-	return ts.Server.Start(context.Background())
+	return ts.Server.Start(ctx)
+}
+
+type allErrorsFakeLiveness struct{}
+
+var _ jobs.NodeLiveness = (*allErrorsFakeLiveness)(nil)
+
+func (allErrorsFakeLiveness) Self() (storagepb.Liveness, error) {
+	return storagepb.Liveness{}, errors.New("fake liveness")
+
+}
+func (allErrorsFakeLiveness) GetLivenesses() []storagepb.Liveness {
+	return nil
+}
+
+func (allErrorsFakeLiveness) IsLive(roachpb.NodeID) (bool, error) {
+	return false, errors.New("fake liveness")
+}
+
+type dummyProtectedTSProvider struct {
+	protectedts.Provider
+}
+
+func (d dummyProtectedTSProvider) Protect(context.Context, *kv.Txn, *ptpb.Record) error {
+	return errors.New("fake protectedts.Provider")
+}
+
+func testSQLServerArgs(ts *TestServer) sqlServerArgs {
+	st := cluster.MakeTestingClusterSettings()
+	stopper := ts.Stopper()
+
+	cfg := makeTestConfig(st)
+
+	clock := hlc.NewClock(hlc.UnixNano, 1)
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
+
+	nl := allErrorsFakeLiveness{}
+
+	ds := ts.DistSender()
+
+	circularInternalExecutor := &sql.InternalExecutor{}
+	// Protected timestamps won't be available (at first) in multi-tenant
+	// clusters.
+	var protectedTSProvider protectedts.Provider
+	{
+		pp, err := ptprovider.New(ptprovider.Config{
+			DB:               ts.DB(),
+			InternalExecutor: circularInternalExecutor,
+			Settings:         st,
+		})
+		if err != nil {
+			panic(err)
+		}
+		protectedTSProvider = dummyProtectedTSProvider{pp}
+	}
+
+	registry := metric.NewRegistry()
+
+	// If we used a dummy gossip, DistSQL and random other things won't work.
+	// Just use the test server's for now.
+	// g := gossip.NewTest(nodeID, nil, nil, stopper, registry, nil)
+	g := ts.Gossip()
+
+	nd := nodedialer.New(rpcContext, gossip.AddressResolver(ts.Gossip()))
+
+	dummyRecorder := &status.MetricsRecorder{}
+
+	const fakeNodeID = roachpb.NodeID(9999)
+	var c base.NodeIDContainer
+	c.Set(context.Background(), fakeNodeID)
+	const sqlInstanceID = base.SQLInstanceID(10001)
+	idContainer := base.NewSQLIDContainer(sqlInstanceID, &c, false /* exposed */)
+
+	// We don't need this for anything except some services that want a gRPC
+	// server to register against (but they'll never get RPCs at the time of
+	// writing): the blob service and DistSQL.
+	dummyRPCServer := rpc.NewServer(rpcContext)
+	noStatusServer := serverpb.MakeOptionalStatusServer(nil)
+	return sqlServerArgs{
+		sqlServerOptionalArgs: sqlServerOptionalArgs{
+			rpcContext:   rpcContext,
+			distSender:   ds,
+			statusServer: noStatusServer,
+			nodeLiveness: nl,
+			gossip:       gossip.MakeDeprecatedGossip(g, false /* exposed */),
+			nodeDialer:   nd,
+			grpcServer:   dummyRPCServer,
+			recorder:     dummyRecorder,
+			isMeta1Leaseholder: func(timestamp hlc.Timestamp) (bool, error) {
+				return false, errors.New("fake isMeta1Leaseholder")
+			},
+			nodeIDContainer: idContainer,
+			externalStorage: func(ctx context.Context, dest roachpb.ExternalStorage) (cloud.ExternalStorage, error) {
+				return nil, errors.New("fake external storage")
+			},
+			externalStorageFromURI: func(ctx context.Context, uri string) (cloud.ExternalStorage, error) {
+				return nil, errors.New("fake external uri storage")
+			},
+		},
+		Config:                   &cfg,
+		stopper:                  stopper,
+		clock:                    clock,
+		runtime:                  status.NewRuntimeStatSampler(context.Background(), clock),
+		tenantID:                 roachpb.SystemTenantID,
+		db:                       ts.DB(),
+		registry:                 registry,
+		sessionRegistry:          sql.NewSessionRegistry(),
+		circularInternalExecutor: circularInternalExecutor,
+		jobRegistry:              &jobs.Registry{},
+		protectedtsProvider:      protectedTSProvider,
+	}
+}
+
+// StartTenant starts a SQL tenant communicating with this TestServer.
+func (ts *TestServer) StartTenant() (addr string, _ error) {
+	ctx := context.Background()
+	args := testSQLServerArgs(ts)
+	s, err := newSQLServer(ctx, args)
+	if err != nil {
+		return "", err
+	}
+
+	// NB: this should no longer be necessary after #47902. Right now it keeps
+	// the tenant from crashing.
+	s.execCfg.DistSQLPlanner.SetNodeDesc(roachpb.NodeDescriptor{NodeID: -1})
+
+	connManager := netutil.MakeServer(
+		args.stopper,
+		// The SQL server only uses connManager.ServeWith. The both below
+		// are unused.
+		nil, // tlsConfig
+		nil, // handler
+	)
+
+	pgL, err := net.Listen("tcp", args.Config.SQLAddr)
+	if err != nil {
+		return "", err
+	}
+	ts.Stopper().RunWorker(ctx, func(ctx context.Context) {
+		<-ts.Stopper().ShouldQuiesce()
+		// NB: we can't do this as a Closer because (*Server).ServeWith is
+		// running in a worker and usually sits on accept(pgL) which unblocks
+		// only when pgL closes. In other words, pgL needs to close when
+		// quiescing starts to allow that worker to shut down.
+		_ = pgL.Close()
+	})
+
+	const (
+		socketFile = "" // no unix socket
+	)
+	orphanedLeasesTimeThresholdNanos := args.clock.Now().WallTime
+
+	if err := s.start(ctx,
+		args.stopper,
+		args.Config.TestingKnobs,
+		connManager,
+		pgL,
+		socketFile,
+		orphanedLeasesTimeThresholdNanos,
+	); err != nil {
+		return "", err
+	}
+	return pgL.Addr().String(), nil
 }
 
 // ExpectedInitialRangeCount returns the expected number of ranges that should
@@ -403,7 +586,9 @@ func (ts *TestServer) ExpectedInitialRangeCount() (int, error) {
 func ExpectedInitialRangeCount(
 	db *kv.DB, defaultZoneConfig *zonepb.ZoneConfig, defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) (int, error) {
-	descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(context.Background(), db, defaultZoneConfig, defaultSystemZoneConfig)
+	descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(
+		context.Background(), db, keys.SystemSQLCodec, defaultZoneConfig, defaultSystemZoneConfig,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -463,6 +648,11 @@ func (ts *TestServer) HTTPAddr() string {
 // Note: use ServingRPCAddr() instead unless there is a specific reason not to.
 func (ts *TestServer) RPCAddr() string {
 	return ts.cfg.Addr
+}
+
+// DrainClients exports the drainClients() method for use by tests.
+func (ts *TestServer) DrainClients(ctx context.Context) error {
+	return ts.drainClients(ctx, nil /* reporter */)
 }
 
 // SQLAddr returns the server's listening SQL address.
@@ -558,7 +748,7 @@ func (ts *TestServer) getAuthenticatedHTTPClientAndCookie(
 }
 
 func (ts *TestServer) createAuthUser(userName string, isAdmin bool) error {
-	if _, err := ts.Server.internalExecutor.ExecEx(context.TODO(),
+	if _, err := ts.Server.sqlServer.internalExecutor.ExecEx(context.TODO(),
 		"create-auth-user", nil,
 		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		"CREATE USER $1", userName,
@@ -568,7 +758,7 @@ func (ts *TestServer) createAuthUser(userName string, isAdmin bool) error {
 	if isAdmin {
 		// We can't use the GRANT statement here because we don't want
 		// to rely on CCL code.
-		if _, err := ts.Server.internalExecutor.ExecEx(context.TODO(),
+		if _, err := ts.Server.sqlServer.internalExecutor.ExecEx(context.TODO(),
 			"grant-admin", nil,
 			sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 			"INSERT INTO system.role_members (role, member, \"isAdmin\") VALUES ('admin', $1, true)", userName,
@@ -608,7 +798,7 @@ func (ts *TestServer) MustGetSQLNetworkCounter(name string) int64 {
 	var found bool
 
 	reg := metric.NewRegistry()
-	for _, m := range ts.pgServer.Metrics() {
+	for _, m := range ts.sqlServer.pgServer.Metrics() {
 		reg.AddMetricStruct(m)
 	}
 	reg.Each(func(n string, v interface{}) {
@@ -631,12 +821,12 @@ func (ts *TestServer) MustGetSQLNetworkCounter(name string) int64 {
 
 // LeaseManager is part of TestServerInterface.
 func (ts *TestServer) LeaseManager() interface{} {
-	return ts.leaseMgr
+	return ts.sqlServer.leaseMgr
 }
 
 // InternalExecutor is part of TestServerInterface.
 func (ts *TestServer) InternalExecutor() interface{} {
-	return ts.internalExecutor
+	return ts.sqlServer.internalExecutor
 }
 
 // GetNode exposes the Server's Node.
@@ -662,12 +852,12 @@ func (ts *TestServer) SQLServer() interface{} {
 
 // DistSQLServer is part of TestServerInterface.
 func (ts *TestServer) DistSQLServer() interface{} {
-	return ts.distSQLServer
+	return ts.sqlServer.distSQLServer
 }
 
 // SetDistSQLSpanResolver is part of TestServerInterface.
 func (s *Server) SetDistSQLSpanResolver(spanResolver interface{}) {
-	s.execCfg.DistSQLPlanner.SetSpanResolver(spanResolver.(physicalplan.SpanResolver))
+	s.sqlServer.execCfg.DistSQLPlanner.SetSpanResolver(spanResolver.(physicalplan.SpanResolver))
 }
 
 // GetFirstStoreID is part of TestServerInterface.
@@ -840,7 +1030,7 @@ func (ts *TestServer) GetRangeLease(
 
 // ExecutorConfig is part of the TestServerInterface.
 func (ts *TestServer) ExecutorConfig() interface{} {
-	return *ts.execCfg
+	return *ts.sqlServer.execCfg
 }
 
 // GCSystemLog deletes entries in the given system log table between
@@ -866,7 +1056,7 @@ func (ts *TestServer) ForceTableGC(
    JOIN system.namespace dbs ON dbs.id = tables."parentID"
    WHERE dbs.name = $1 AND tables.name = $2
  `
-	row, err := ts.internalExecutor.QueryRowEx(
+	row, err := ts.sqlServer.internalExecutor.QueryRowEx(
 		ctx, "resolve-table-id", nil, /* txn */
 		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		tableIDQuery, database, table)
@@ -880,7 +1070,7 @@ func (ts *TestServer) ForceTableGC(
 		return errors.AssertionFailedf("expected 1 column from internal query")
 	}
 	tableID := uint32(*row[0].(*tree.DInt))
-	tblKey := roachpb.Key(keys.MakeTablePrefix(tableID))
+	tblKey := keys.SystemSQLCodec.TablePrefix(tableID)
 	gcr := roachpb.GCRequest{
 		RequestHeader: roachpb.RequestHeader{
 			Key:    tblKey,

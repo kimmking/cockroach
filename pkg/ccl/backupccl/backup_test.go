@@ -414,17 +414,19 @@ func TestBackupRestoreAppend(t *testing.T) {
 	var tsBefore, ts1, ts2 string
 	sqlDB.QueryRow(t, "SELECT cluster_logical_timestamp()").Scan(&tsBefore)
 
-	sqlDB.Exec(t, "BACKUP DATABASE data TO ($1, $2, $3) AS OF SYSTEM TIME "+tsBefore, backups...)
+	sqlDB.Exec(t, "BACKUP TO ($1, $2, $3) AS OF SYSTEM TIME "+tsBefore, backups...)
 
 	sqlDB.QueryRow(t, "UPDATE data.bank SET balance = 100 RETURNING cluster_logical_timestamp()").Scan(&ts1)
-	sqlDB.Exec(t, "BACKUP DATABASE data TO ($1, $2, $3) AS OF SYSTEM TIME "+ts1, backups...)
+	sqlDB.Exec(t, "BACKUP TO ($1, $2, $3) AS OF SYSTEM TIME "+ts1, backups...)
 
 	sqlDB.QueryRow(t, "UPDATE data.bank SET balance = 200 RETURNING cluster_logical_timestamp()").Scan(&ts2)
 	rowsTS2 := sqlDB.QueryStr(t, "SELECT * from data.bank ORDER BY id")
-	sqlDB.Exec(t, "BACKUP DATABASE data TO ($1, $2, $3) AS OF SYSTEM TIME "+ts2, backups...)
+	sqlDB.Exec(t, "BACKUP TO ($1, $2, $3) AS OF SYSTEM TIME "+ts2, backups...)
 
 	sqlDB.Exec(t, "ALTER TABLE data.bank RENAME TO data.renamed")
-	sqlDB.Exec(t, "BACKUP DATABASE data TO ($1, $2, $3)", backups...)
+	sqlDB.Exec(t, "BACKUP TO ($1, $2, $3)", backups...)
+
+	sqlDB.ExpectErr(t, "cannot append a backup of specific", "BACKUP system.users TO ($1, $2, $3)", backups...)
 
 	sqlDB.Exec(t, "DROP DATABASE data CASCADE")
 	sqlDB.Exec(t, "RESTORE DATABASE data FROM ($1, $2, $3)", backups...)
@@ -837,7 +839,7 @@ func checkInProgressBackupRestore(
 	var allowResponse chan struct{}
 	params := base.TestClusterArgs{}
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
-		TestingResponseFilter: func(ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
+		TestingResponseFilter: func(ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
 			for _, ru := range br.Responses {
 				switch ru.GetInner().(type) {
 				case *roachpb.ExportResponse, *roachpb.ImportResponse:
@@ -965,11 +967,11 @@ func TestBackupRestoreCheckpointing(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		low := keys.MakeTablePrefix(ip.backupTableID)
-		high := keys.MakeTablePrefix(ip.backupTableID + 1)
+		low := keys.SystemSQLCodec.TablePrefix(ip.backupTableID)
+		high := keys.SystemSQLCodec.TablePrefix(ip.backupTableID + 1)
 		if bytes.Compare(highWaterMark, low) <= 0 || bytes.Compare(highWaterMark, high) >= 0 {
 			return errors.Errorf("expected high-water mark %v to be between %v and %v",
-				highWaterMark, roachpb.Key(low), roachpb.Key(high))
+				highWaterMark, low, high)
 		}
 		return nil
 	}
@@ -1040,11 +1042,11 @@ func TestBackupRestoreResume(t *testing.T) {
 	_, tc, outerDB, dir, cleanupFn := backupRestoreTestSetup(t, multiNode, numAccounts, initNone)
 	defer cleanupFn()
 
-	backupTableDesc := sqlbase.GetTableDescriptor(tc.Servers[0].DB(), "data", "bank")
+	backupTableDesc := sqlbase.GetTableDescriptor(tc.Servers[0].DB(), keys.SystemSQLCodec, "data", "bank")
 
 	t.Run("backup", func(t *testing.T) {
 		sqlDB := sqlutils.MakeSQLRunner(outerDB.DB)
-		backupStartKey := backupTableDesc.PrimaryIndexSpan().Key
+		backupStartKey := backupTableDesc.PrimaryIndexSpan(keys.SystemSQLCodec).Key
 		backupEndKey, err := sqlbase.TestingMakePrimaryIndexKey(backupTableDesc, numAccounts/2)
 		if err != nil {
 			t.Fatal(err)
@@ -1314,7 +1316,7 @@ func TestBackupRestoreControlJob(t *testing.T) {
 		// still present. Also ensure that the table that was being restored (bank)
 		// is not.
 		sqlDB.Exec(t, `USE data;`)
-		sqlDB.CheckQueryResults(t, `SHOW TABLES;`, [][]string{{"new_table"}})
+		sqlDB.CheckQueryResults(t, `SHOW TABLES;`, [][]string{{"public", "new_table", "table"}})
 	})
 
 	t.Run("cancel", func(t *testing.T) {
@@ -1350,7 +1352,7 @@ func TestRestoreFailCleanup(t *testing.T) {
 	// Disable GC job so that the final check of crdb_internal.tables is
 	// guaranteed to not be cleaned up. Although this was never observed by a
 	// stress test, it is here for safety.
-	params.Knobs.GCJob = &sql.GCJobTestingKnobs{RunBeforeResume: func() { select {} /* blocks forever */ }}
+	params.Knobs.GCJob = &sql.GCJobTestingKnobs{RunBeforeResume: func(_ int64) error { select {} /* blocks forever */ }}
 
 	const numAccounts = 1000
 	_, _, sqlDB, dir, cleanup := backupRestoreTestSetupWithParams(t, singleNode, numAccounts,
@@ -1394,7 +1396,7 @@ func TestRestoreFailDatabaseCleanup(t *testing.T) {
 	// crdb_internal.tables is guaranteed to not be cleaned up. Although this
 	// was never observed by a stress test, it is here for safety.
 	blockGC := make(chan struct{})
-	params.Knobs.GCJob = &sql.GCJobTestingKnobs{RunBeforeResume: func() { <-blockGC }}
+	params.Knobs.GCJob = &sql.GCJobTestingKnobs{RunBeforeResume: func(_ int64) error { <-blockGC; return nil }}
 
 	const numAccounts = 1000
 	_, _, sqlDB, dir, cleanup := backupRestoreTestSetupWithParams(t, singleNode, numAccounts,
@@ -2465,7 +2467,7 @@ func TestRestoreAsOfSystemTimeGCBounds(t *testing.T) {
 	gcr := roachpb.GCRequest{
 		// Bogus span to make it a valid request.
 		RequestHeader: roachpb.RequestHeader{
-			Key:    keys.MakeTablePrefix(keys.MinUserDescID),
+			Key:    keys.SystemSQLCodec.TablePrefix(keys.MinUserDescID),
 			EndKey: keys.MaxKey,
 		},
 		Threshold: tc.Server(0).Clock().Now(),
@@ -3593,7 +3595,9 @@ func TestProtectedTimestampsDuringBackup(t *testing.T) {
 	params := base.TestClusterArgs{}
 	params.ServerArgs.ExternalIODir = dir
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
-		TestingResponseFilter: func(ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
+		TestingResponseFilter: func(
+			ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse,
+		) *roachpb.Error {
 			for _, ru := range br.Responses {
 				switch ru.GetInner().(type) {
 				case *roachpb.ExportResponse, *roachpb.ImportResponse:
@@ -3624,7 +3628,14 @@ func TestProtectedTimestampsDuringBackup(t *testing.T) {
 	rowCount := runner.QueryStr(t, "SELECT * FROM foo")
 
 	go func() {
-		runner.Exec(t, `BACKUP TABLE FOO TO 'nodelocal://1/foo'`)
+		// N.B. We use the conn rather than the runner here since the test may
+		// finish before the job finishes. The test will finish as soon as the
+		// timestamp is no longer protected. If the test starts tearing down the
+		// cluster before the backup job is done, the test may still fail when the
+		// backup fails. This test does not particularly care if the BACKUP
+		// completes with a success or failure, as long as the timestamp is released
+		// shortly after the BACKUP is unblocked.
+		_, _ = conn.Exec(`BACKUP TABLE FOO TO 'nodelocal://1/foo'`) // ignore error.
 	}()
 
 	var jobID string
@@ -3667,11 +3678,15 @@ func TestProtectedTimestampsDuringBackup(t *testing.T) {
 
 	// Wait for the ranges to learn about the removed record and ensure that we
 	// can GC from the range soon.
-	gcRanRE := regexp.MustCompile("(?s)shouldQueue=true.*processing replica.*GC score after GC")
+	// This regex matches when all float priorities other than 0.00000. It does
+	// this by matching either a float >= 1 (e.g. 1230.012) or a float < 1 (e.g.
+	// 0.000123).
+	matchNonZero := "[1-9]\\d*\\.\\d+|0\\.\\d*[1-9]\\d*"
+	nonZeroProgressRE := regexp.MustCompile(fmt.Sprintf("priority=(%s)", matchNonZero))
 	testutils.SucceedsSoon(t, func() error {
 		writeGarbage(3, 10)
-		if trace := gcTable(false /* skipShouldQueue */); !gcRanRE.MatchString(trace) {
-			return fmt.Errorf("expected %v in trace: %v", gcRanRE, trace)
+		if trace := gcTable(false /* skipShouldQueue */); !nonZeroProgressRE.MatchString(trace) {
+			return fmt.Errorf("expected %v in trace: %v", nonZeroProgressRE, trace)
 		}
 		return nil
 	})

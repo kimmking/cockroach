@@ -24,7 +24,7 @@ end_test
 
 proc start_secure_server {argv certs_dir extra} {
     report "BEGIN START SECURE SERVER"
-    system "$argv start-single-node --host=localhost --certs-dir=$certs_dir --pid-file=server_pid -s=path=logs/db --background $extra >>expect-cmd.log 2>&1;
+    system "$argv start-single-node --host=localhost --socket-dir=. --certs-dir=$certs_dir --pid-file=server_pid -s=path=logs/db --background $extra >>expect-cmd.log 2>&1;
             $argv sql --certs-dir=$certs_dir -e 'select 1'"
     report "END START SECURE SERVER"
 }
@@ -63,9 +63,9 @@ start_test "Check that CREATE USER WITH PASSWORD can be used from transactions."
 send "$argv sql --certs-dir=$certs_dir\r"
 eexpect "root@"
 send "BEGIN TRANSACTION;\r"
-eexpect " ->"
+eexpect "root@"
 send "CREATE USER eisen WITH PASSWORD 'hunter2';\r"
-eexpect " ->"
+eexpect "root@"
 send "COMMIT TRANSACTION;\r"
 eexpect "root@"
 send "\\q\r"
@@ -97,6 +97,24 @@ start_test "Check that an auth cookie cannot be created for a user that does not
 send "$argv auth-session login nonexistent --certs-dir=$certs_dir\r"
 eexpect "user \"nonexistent\" does not exist"
 eexpect $prompt
+end_test
+
+set mywd [pwd]
+
+start_test "Check that socket-based login works."
+
+send "$argv sql --url 'postgres://eisen@?host=$mywd&port=26257&sslmode=require'\r"
+eexpect "Enter password:"
+send "hunter2\r"
+eexpect "eisen@"
+interrupt
+eexpect $prompt
+
+send "$argv sql --url 'postgres://eisen:hunter2@?host=$mywd&port=26257&sslmode=require'\r"
+eexpect "eisen@"
+interrupt
+eexpect $prompt
+
 end_test
 
 start_test "Check that the auth cookie creation works and reports useful output."

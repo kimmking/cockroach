@@ -240,6 +240,12 @@ Dumps the data as of the specified timestamp. Formats supported are the same
 as the timestamp type.`,
 	}
 
+	DumpAll = FlagInfo{
+		Name: "dump-all",
+		Description: `
+Dumps all databases, for each non-system database provides dump of all available tables.`,
+	}
+
 	Execute = FlagInfo{
 		Name:      "execute",
 		Shorthand: "e",
@@ -271,8 +277,8 @@ Reveal the SQL statements sent implicitly by the command-line utility.`,
 Simplify the SQL CLI to ease troubleshooting of CockroachDB
 issues. This echoes sent SQL, removes the database name and txn status
 from the prompt, and forces behavior to become independent on current
-transaction state. Equivalent to --echo-sql, \unset check_syntax,
-\unset smart_prompt, and \set prompt1 %n@%M>.`,
+transaction state. Equivalent to --echo-sql, \unset check_syntax and
+\set prompt1 %n@%M>.`,
 	}
 
 	SafeUpdates = FlagInfo{
@@ -673,6 +679,20 @@ fields.
 		Description: `Path to the CA key.`,
 	}
 
+	ClockDevice = FlagInfo{
+		Name: "clock-device",
+		Description: `
+Override HLC to use PTP hardware clock user space API when querying for current time.
+The value corresponds to the clock device to be used. This is currently only tested
+and supported on Linux.
+<PRE>
+
+  --clock-device=/dev/ptp0
+
+</PRE>
+`,
+	}
+
 	MaxOffset = FlagInfo{
 		Name: "max-offset",
 		Description: `
@@ -889,6 +909,13 @@ long and not particularly human-readable.`,
 		Description: `Deprecated: use 'node decommission' instead.`,
 	}
 
+	DrainWait = FlagInfo{
+		Name: "drain-wait",
+		Description: `
+When non-zero, wait for the specified amount of time for the node to
+drain all active client connections and migrate away range leases.`,
+	}
+
 	Wait = FlagInfo{
 		Name: "wait",
 		Description: `
@@ -1029,6 +1056,12 @@ Start with an empty database: avoid pre-loading a default dataset in
 the demo shell.`,
 	}
 
+	GeoLibsDir = FlagInfo{
+		Name: "geo-libs",
+		Description: `
+The location where all libraries for Geospatial operations is located.`,
+	}
+
 	Global = FlagInfo{
 		Name: "global",
 		Description: `
@@ -1110,5 +1143,21 @@ Addresses for network benchmark.`,
 		Name: "latency",
 		Description: `
 Latency or throughput mode.`,
+	}
+
+	ZipNodes = FlagInfo{
+		Name: "nodes",
+		Description: `
+List of nodes to include. Can be specified as a comma-delimited
+list of node IDs or ranges of node IDs, for example: 5,10-20,23.
+The default is to include all nodes.`,
+	}
+
+	ZipExcludeNodes = FlagInfo{
+		Name: "exclude-nodes",
+		Description: `
+List of nodes to exclude. Can be specified as a comma-delimited
+list of node IDs or ranges of node IDs, for example: 5,10-20,23.
+The default is to not exclude any node.`,
 	}
 )

@@ -11,20 +11,20 @@
 package sqlsmith
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
 func typeFromName(name string) *types.T {
-	typ, err := parser.ParseType(name)
+	typRef, err := parser.ParseType(name)
 	if err != nil {
 		panic(errors.AssertionFailedf("failed to parse type: %v", name))
 	}
-	return typ
+	return tree.MustBeStaticallyKnownType(typRef)
 }
 
 // pickAnyType returns a concrete type if typ is types.Any or types.AnyArray,
@@ -66,7 +66,7 @@ func (s *Smither) randType() *types.T {
 // vectorization).
 func (s *Smither) allowedType(types ...*types.T) bool {
 	for _, t := range types {
-		if s.vectorizable && typeconv.FromColumnType(t) == coltypes.Unhandled {
+		if s.vectorizable && !typeconv.IsTypeSupported(t) {
 			return false
 		}
 	}

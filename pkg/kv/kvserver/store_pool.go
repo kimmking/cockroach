@@ -340,7 +340,7 @@ func (sp *StorePool) storeGossipUpdate(_ string, content roachpb.Value) {
 	var storeDesc roachpb.StoreDescriptor
 	if err := content.GetProto(&storeDesc); err != nil {
 		ctx := sp.AnnotateCtx(context.TODO())
-		log.Error(ctx, err)
+		log.Errorf(ctx, "%v", err)
 		return
 	}
 
@@ -613,7 +613,7 @@ func (sl StoreList) String() string {
 
 // filter takes a store list and filters it using the passed in constraints. It
 // maintains the original order of the passed in store list.
-func (sl StoreList) filter(constraints []zonepb.Constraints) StoreList {
+func (sl StoreList) filter(constraints []zonepb.ConstraintsConjunction) StoreList {
 	if len(constraints) == 0 {
 		return sl
 	}

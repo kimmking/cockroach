@@ -335,10 +335,10 @@ type protoGetter interface {
 // ID passed in using an existing proto getter. Returns an error if the
 // descriptor doesn't exist or if it exists and is not a database.
 func GetDatabaseDescFromID(
-	ctx context.Context, protoGetter protoGetter, id ID,
+	ctx context.Context, protoGetter protoGetter, codec keys.SQLCodec, id ID,
 ) (*DatabaseDescriptor, error) {
 	desc := &Descriptor{}
-	descKey := MakeDescMetadataKey(id)
+	descKey := MakeDescMetadataKey(codec, id)
 	_, err := protoGetter.GetProtoTs(ctx, descKey, desc)
 	if err != nil {
 		return nil, err
@@ -356,14 +356,14 @@ func GetDatabaseDescFromID(
 // NB: If this function changes, make sure to update GetTableDescFromIDWithFKsChanged
 // in a similar way.
 func GetTableDescFromID(
-	ctx context.Context, protoGetter protoGetter, id ID,
+	ctx context.Context, protoGetter protoGetter, codec keys.SQLCodec, id ID,
 ) (*TableDescriptor, error) {
-	table, err := getTableDescFromIDRaw(ctx, protoGetter, id)
+	table, err := getTableDescFromIDRaw(ctx, protoGetter, codec, id)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := table.MaybeFillInDescriptor(ctx, protoGetter); err != nil {
+	if err := table.MaybeFillInDescriptor(ctx, protoGetter, codec); err != nil {
 		return nil, err
 	}
 
@@ -375,15 +375,15 @@ func GetTableDescFromID(
 // GetTableDescFromID but additionally returns whether or not the table descriptor
 // was changed during the foreign key upgrade process.
 func GetTableDescFromIDWithFKsChanged(
-	ctx context.Context, protoGetter protoGetter, id ID,
+	ctx context.Context, protoGetter protoGetter, codec keys.SQLCodec, id ID,
 ) (*TableDescriptor, bool, error) {
-	table, err := getTableDescFromIDRaw(ctx, protoGetter, id)
+	table, err := getTableDescFromIDRaw(ctx, protoGetter, codec, id)
 	if err != nil {
 		return nil, false, err
 	}
 	table.maybeUpgradeFormatVersion()
 	table.Privileges.MaybeFixPrivileges(table.ID)
-	changed, err := table.MaybeUpgradeForeignKeyRepresentation(ctx, protoGetter, false /* skipFKsWithNoMatchingTable */)
+	changed, err := table.MaybeUpgradeForeignKeyRepresentation(ctx, protoGetter, codec, false /* skipFKsWithNoMatchingTable */)
 	if err != nil {
 		return nil, false, err
 	}
@@ -397,10 +397,10 @@ func GetTableDescFromIDWithFKsChanged(
 // migrations and is *required* before ordinary presentation to other code. This
 // method is for internal use only and shouldn't get exposed.
 func getTableDescFromIDRaw(
-	ctx context.Context, protoGetter protoGetter, id ID,
+	ctx context.Context, protoGetter protoGetter, codec keys.SQLCodec, id ID,
 ) (*TableDescriptor, error) {
 	desc := &Descriptor{}
-	descKey := MakeDescMetadataKey(id)
+	descKey := MakeDescMetadataKey(codec, id)
 	ts, err := protoGetter.GetProtoTs(ctx, descKey, desc)
 	if err != nil {
 		return nil, err
@@ -417,9 +417,9 @@ func getTableDescFromIDRaw(
 // descriptor doesn't exist or if it exists and is not a table.
 // Otherwise a mutable copy of the table is returned.
 func GetMutableTableDescFromID(
-	ctx context.Context, protoGetter protoGetter, id ID,
+	ctx context.Context, protoGetter protoGetter, codec keys.SQLCodec, id ID,
 ) (*MutableTableDescriptor, error) {
-	table, err := GetTableDescFromID(ctx, protoGetter, id)
+	table, err := GetTableDescFromID(ctx, protoGetter, codec, id)
 	if err != nil {
 		return nil, err
 	}
@@ -885,12 +885,12 @@ func generatedFamilyName(familyID FamilyID, columnNames []string) string {
 // NB: If this function changes, make sure to update GetTableDescFromIDWithFKsChanged
 // in a similar way.
 func (desc *TableDescriptor) MaybeFillInDescriptor(
-	ctx context.Context, protoGetter protoGetter,
+	ctx context.Context, protoGetter protoGetter, codec keys.SQLCodec,
 ) error {
 	desc.maybeUpgradeFormatVersion()
 	desc.Privileges.MaybeFixPrivileges(desc.ID)
 	if protoGetter != nil {
-		if _, err := desc.MaybeUpgradeForeignKeyRepresentation(ctx, protoGetter, false /* skipFKsWithNoMatchingTable*/); err != nil {
+		if _, err := desc.MaybeUpgradeForeignKeyRepresentation(ctx, protoGetter, codec, false /* skipFKsWithNoMatchingTable*/); err != nil {
 			return err
 		}
 	}
@@ -941,7 +941,10 @@ func (m MapProtoGetter) GetProtoTs(
 // is dropped from the table and no error is returned.
 // TODO(lucy): Write tests for when skipFKsWithNoMatchingTable is true.
 func (desc *TableDescriptor) MaybeUpgradeForeignKeyRepresentation(
-	ctx context.Context, protoGetter protoGetter, skipFKsWithNoMatchingTable bool,
+	ctx context.Context,
+	protoGetter protoGetter,
+	codec keys.SQLCodec,
+	skipFKsWithNoMatchingTable bool,
 ) (bool, error) {
 	if desc.Dropped() {
 		// If the table has been dropped, it's permitted to have corrupted foreign
@@ -954,7 +957,7 @@ func (desc *TableDescriptor) MaybeUpgradeForeignKeyRepresentation(
 	// cluster (after finalizing the upgrade) have foreign key mutations.
 	for i := range desc.Indexes {
 		newChanged, err := maybeUpgradeForeignKeyRepOnIndex(
-			ctx, protoGetter, otherUnupgradedTables, desc, &desc.Indexes[i], skipFKsWithNoMatchingTable,
+			ctx, protoGetter, codec, otherUnupgradedTables, desc, &desc.Indexes[i], skipFKsWithNoMatchingTable,
 		)
 		if err != nil {
 			return false, err
@@ -962,7 +965,7 @@ func (desc *TableDescriptor) MaybeUpgradeForeignKeyRepresentation(
 		changed = changed || newChanged
 	}
 	newChanged, err := maybeUpgradeForeignKeyRepOnIndex(
-		ctx, protoGetter, otherUnupgradedTables, desc, &desc.PrimaryIndex, skipFKsWithNoMatchingTable,
+		ctx, protoGetter, codec, otherUnupgradedTables, desc, &desc.PrimaryIndex, skipFKsWithNoMatchingTable,
 	)
 	if err != nil {
 		return false, err
@@ -977,6 +980,7 @@ func (desc *TableDescriptor) MaybeUpgradeForeignKeyRepresentation(
 func maybeUpgradeForeignKeyRepOnIndex(
 	ctx context.Context,
 	protoGetter protoGetter,
+	codec keys.SQLCodec,
 	otherUnupgradedTables map[ID]*TableDescriptor,
 	desc *TableDescriptor,
 	idx *IndexDescriptor,
@@ -986,7 +990,7 @@ func maybeUpgradeForeignKeyRepOnIndex(
 	if idx.ForeignKey.IsSet() {
 		ref := &idx.ForeignKey
 		if _, ok := otherUnupgradedTables[ref.Table]; !ok {
-			tbl, err := getTableDescFromIDRaw(ctx, protoGetter, ref.Table)
+			tbl, err := getTableDescFromIDRaw(ctx, protoGetter, codec, ref.Table)
 			if err != nil {
 				if err == ErrDescriptorNotFound && skipFKsWithNoMatchingTable {
 					// Ignore this FK and keep going.
@@ -1025,7 +1029,7 @@ func maybeUpgradeForeignKeyRepOnIndex(
 	for refIdx := range idx.ReferencedBy {
 		ref := &(idx.ReferencedBy[refIdx])
 		if _, ok := otherUnupgradedTables[ref.Table]; !ok {
-			tbl, err := getTableDescFromIDRaw(ctx, protoGetter, ref.Table)
+			tbl, err := getTableDescFromIDRaw(ctx, protoGetter, codec, ref.Table)
 			if err != nil {
 				if err == ErrDescriptorNotFound && skipFKsWithNoMatchingTable {
 					// Ignore this FK and keep going.
@@ -1221,12 +1225,15 @@ func (desc *MutableTableDescriptor) AllocateIDs() error {
 		}
 	}
 
-	// Only physical tables can have / need indexes and column families.
-	if desc.IsPhysicalTable() {
+	// Only tables can have / need indexes and column families.
+	if desc.IsTable() {
 		if err := desc.allocateIndexIDs(columnNames); err != nil {
 			return err
 		}
-		desc.allocateColumnFamilyIDs(columnNames)
+		// Virtual tables don't have column families.
+		if desc.IsPhysicalTable() {
+			desc.allocateColumnFamilyIDs(columnNames)
+		}
 	}
 
 	// This is sort of ugly. If the descriptor does not have an ID, we hack one in
@@ -1251,7 +1258,7 @@ func (desc *MutableTableDescriptor) ensurePrimaryKey() error {
 		s := "unique_rowid()"
 		col := &ColumnDescriptor{
 			Name:        GenerateUniqueConstraintName("rowid", nameExists),
-			Type:        *types.Int,
+			Type:        types.Int,
 			DefaultExpr: &s,
 			Hidden:      true,
 			Nullable:    false,
@@ -1299,7 +1306,9 @@ func DatumTypeHasCompositeKeyEncoding(typ *types.T) bool {
 func MustBeValueEncoded(semanticType types.Family) bool {
 	return semanticType == types.ArrayFamily ||
 		semanticType == types.JsonFamily ||
-		semanticType == types.TupleFamily
+		semanticType == types.TupleFamily ||
+		semanticType == types.GeometryFamily ||
+		semanticType == types.GeographyFamily
 }
 
 // HasOldStoredColumns returns whether the index has stored columns in the old
@@ -1558,7 +1567,7 @@ func (desc *MutableTableDescriptor) MaybeIncrementVersion(
 
 // Validate validates that the table descriptor is well formed. Checks include
 // both single table and cross table invariants.
-func (desc *TableDescriptor) Validate(ctx context.Context, txn *kv.Txn) error {
+func (desc *TableDescriptor) Validate(ctx context.Context, txn *kv.Txn, codec keys.SQLCodec) error {
 	err := desc.ValidateTable()
 	if err != nil {
 		return err
@@ -1566,15 +1575,17 @@ func (desc *TableDescriptor) Validate(ctx context.Context, txn *kv.Txn) error {
 	if desc.Dropped() {
 		return nil
 	}
-	return desc.validateCrossReferences(ctx, txn)
+	return desc.validateCrossReferences(ctx, txn, codec)
 }
 
 // validateCrossReferences validates that each reference to another table is
 // resolvable and that the necessary back references exist.
-func (desc *TableDescriptor) validateCrossReferences(ctx context.Context, txn *kv.Txn) error {
+func (desc *TableDescriptor) validateCrossReferences(
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec,
+) error {
 	// Check that parent DB exists.
 	{
-		res, err := txn.Get(ctx, MakeDescMetadataKey(desc.ParentID))
+		res, err := txn.Get(ctx, MakeDescMetadataKey(codec, desc.ParentID))
 		if err != nil {
 			return err
 		}
@@ -1588,7 +1599,7 @@ func (desc *TableDescriptor) validateCrossReferences(ctx context.Context, txn *k
 		if table, ok := tablesByID[id]; ok {
 			return table, nil
 		}
-		table, err := GetTableDescFromID(ctx, txn, id)
+		table, err := GetTableDescFromID(ctx, txn, codec, id)
 		if err != nil {
 			return nil, err
 		}
@@ -1708,6 +1719,16 @@ func (desc *TableDescriptor) validateCrossReferences(ctx context.Context, txn *k
 		}
 	}
 	// TODO(dan): Also validate SharedPrefixLen in the interleaves.
+	return nil
+}
+
+// ValidateIndexNameIsUnique validates that the index name does not exist.
+func (desc *TableDescriptor) ValidateIndexNameIsUnique(indexName string) error {
+	for _, index := range desc.AllNonDropIndexes() {
+		if indexName == index.Name {
+			return NewRelationAlreadyExistsError(indexName)
+		}
+	}
 	return nil
 }
 
@@ -1977,13 +1998,16 @@ func (desc *TableDescriptor) validateTableIndexes(columnNames map[string]ColumnI
 			return fmt.Errorf("invalid index ID %d", index.ID)
 		}
 
-		if _, ok := indexNames[index.Name]; ok {
+		if _, indexNameExists := indexNames[index.Name]; indexNameExists {
 			for i := range desc.Indexes {
 				if desc.Indexes[i].Name == index.Name {
-					return fmt.Errorf("duplicate index name: %q", index.Name)
+					// This error should be caught in MakeIndexDescriptor.
+					return errors.HandleAsAssertionFailure(fmt.Errorf("duplicate index name: %q", index.Name))
 				}
 			}
-			return fmt.Errorf("duplicate: index %q in the middle of being added, not yet public", index.Name)
+			// This error should be caught in MakeIndexDescriptor.
+			return errors.HandleAsAssertionFailure(fmt.Errorf(
+				"duplicate: index %q in the middle of being added, not yet public", index.Name))
 		}
 		indexNames[index.Name] = struct{}{}
 
@@ -2029,6 +2053,10 @@ func (desc *TableDescriptor) validateTableIndexes(columnNames map[string]ColumnI
 		if index.IsSharded() {
 			if err := desc.ensureShardedIndexNotComputed(index); err != nil {
 				return err
+			}
+			if _, exists := columnNames[index.Sharded.Name]; !exists {
+				return fmt.Errorf("index %q refers to non-existent shard column %q",
+					index.Name, index.Sharded.Name)
 			}
 		}
 	}
@@ -2125,6 +2153,11 @@ func (desc *TableDescriptor) validatePartitioningDescriptor(
 		return nil
 	}
 
+	// Use the system-tenant SQL codec when validating the keys in the partition
+	// descriptor. We just want to know how the partitions relate to one another,
+	// so it's fine to ignore the tenant ID prefix.
+	codec := keys.SystemSQLCodec
+
 	if len(partDesc.List) > 0 {
 		listValues := make(map[string]struct{}, len(partDesc.List))
 		for _, p := range partDesc.List {
@@ -2139,7 +2172,7 @@ func (desc *TableDescriptor) validatePartitioningDescriptor(
 			// to match the behavior of the value when indexed.
 			for _, valueEncBuf := range p.Values {
 				tuple, keyPrefix, err := DecodePartitionTuple(
-					a, desc, idxDesc, partDesc, valueEncBuf, fakePrefixDatums)
+					a, codec, desc, idxDesc, partDesc, valueEncBuf, fakePrefixDatums)
 				if err != nil {
 					return fmt.Errorf("PARTITION %s: %v", p.Name, err)
 				}
@@ -2168,12 +2201,12 @@ func (desc *TableDescriptor) validatePartitioningDescriptor(
 			// NB: key encoding is used to check uniqueness because it has to match
 			// the behavior of the value when indexed.
 			fromDatums, fromKey, err := DecodePartitionTuple(
-				a, desc, idxDesc, partDesc, p.FromInclusive, fakePrefixDatums)
+				a, codec, desc, idxDesc, partDesc, p.FromInclusive, fakePrefixDatums)
 			if err != nil {
 				return fmt.Errorf("PARTITION %s: %v", p.Name, err)
 			}
 			toDatums, toKey, err := DecodePartitionTuple(
-				a, desc, idxDesc, partDesc, p.ToExclusive, fakePrefixDatums)
+				a, codec, desc, idxDesc, partDesc, p.ToExclusive, fakePrefixDatums)
 			if err != nil {
 				return fmt.Errorf("PARTITION %s: %v", p.Name, err)
 			}
@@ -2271,7 +2304,8 @@ func ColumnTypeIsIndexable(t *types.T) bool {
 // using an inverted index.
 func ColumnTypeIsInvertedIndexable(t *types.T) bool {
 	family := t.Family()
-	return family == types.JsonFamily || family == types.ArrayFamily
+	return family == types.JsonFamily || family == types.ArrayFamily ||
+		family == types.GeographyFamily || family == types.GeometryFamily
 }
 
 func notIndexableError(cols []ColumnDescriptor, inverted bool) error {
@@ -2300,7 +2334,7 @@ func notIndexableError(cols []ColumnDescriptor, inverted bool) error {
 			}
 		}
 	}
-	return unimplemented.NewWithIssueDetailf(35730, typInfo, msg)
+	return unimplemented.NewWithIssueDetailf(35730, typInfo, "%s", msg)
 }
 
 func checkColumnsValidForIndex(tableDesc *MutableTableDescriptor, indexColNames []string) error {
@@ -2308,7 +2342,7 @@ func checkColumnsValidForIndex(tableDesc *MutableTableDescriptor, indexColNames 
 	for _, indexCol := range indexColNames {
 		for _, col := range tableDesc.AllNonDropColumns() {
 			if col.Name == indexCol {
-				if !ColumnTypeIsIndexable(&col.Type) {
+				if !ColumnTypeIsIndexable(col.Type) {
 					invalidColumns = append(invalidColumns, col)
 				}
 			}
@@ -2324,13 +2358,14 @@ func checkColumnsValidForInvertedIndex(
 	tableDesc *MutableTableDescriptor, indexColNames []string,
 ) error {
 	if len((indexColNames)) > 1 {
-		return errors.New("indexing more than one column with an inverted index is not supported")
+		return unimplemented.NewWithIssue(48100,
+			"indexing more than one column with an inverted index is not supported")
 	}
 	invalidColumns := make([]ColumnDescriptor, 0, len(indexColNames))
 	for _, indexCol := range indexColNames {
 		for _, col := range tableDesc.AllNonDropColumns() {
 			if col.Name == indexCol {
-				if !ColumnTypeIsInvertedIndexable(&col.Type) {
+				if !ColumnTypeIsInvertedIndexable(col.Type) {
 					invalidColumns = append(invalidColumns, col)
 				}
 			}
@@ -2515,6 +2550,30 @@ func (desc *TableDescriptor) FindColumnByName(name tree.Name) (*ColumnDescriptor
 		}
 	}
 	return nil, false, NewUndefinedColumnError(string(name))
+}
+
+// FindActiveOrNewColumnByName finds the column with the specified name.
+// It returns either an active column or a column that was added in the
+// same transaction that is currently running.
+func (desc *MutableTableDescriptor) FindActiveOrNewColumnByName(
+	name tree.Name,
+) (*ColumnDescriptor, error) {
+	for i := range desc.Columns {
+		c := &desc.Columns[i]
+		if c.Name == string(name) {
+			return c, nil
+		}
+	}
+	currentMutationID := desc.ClusterVersion.NextMutationID
+	for i := range desc.Mutations {
+		mut := &desc.Mutations[i]
+		if col := mut.GetColumn(); col != nil &&
+			mut.MutationID == currentMutationID &&
+			mut.Direction == DescriptorMutation_ADD {
+			return col, nil
+		}
+	}
+	return nil, NewUndefinedColumnError(string(name))
 }
 
 // ColumnIdxMap returns a map from Column ID to the ordinal position of that
@@ -2734,6 +2793,7 @@ func (desc *MutableTableDescriptor) DropConstraint(
 	case ConstraintTypeFK:
 		if detail.FK.Validity == ConstraintValidity_Validating {
 			return unimplemented.NewWithIssueDetailf(42844,
+				"drop-constraint-fk-validating",
 				"constraint %q in the middle of being added, try again later", name)
 		}
 		if detail.FK.Validity == ConstraintValidity_Dropping {
@@ -3367,7 +3427,7 @@ func (desc *TableDescriptor) VisibleColumns() []ColumnDescriptor {
 }
 
 // ColumnTypes returns the types of all columns.
-func (desc *TableDescriptor) ColumnTypes() []types.T {
+func (desc *TableDescriptor) ColumnTypes() []*types.T {
 	return desc.ColumnTypesWithMutations(false)
 }
 
@@ -3388,9 +3448,9 @@ func (desc *TableDescriptor) ColumnsWithMutations(mutations bool) []ColumnDescri
 
 // ColumnTypesWithMutations returns the types of all columns, optionally
 // including mutation columns, which will be returned if the input bool is true.
-func (desc *TableDescriptor) ColumnTypesWithMutations(mutations bool) []types.T {
+func (desc *TableDescriptor) ColumnTypesWithMutations(mutations bool) []*types.T {
 	columns := desc.ColumnsWithMutations(mutations)
-	types := make([]types.T, len(columns))
+	types := make([]*types.T, len(columns))
 	for i := range columns {
 		types[i] = columns[i].Type
 	}
@@ -3555,10 +3615,10 @@ func (desc *TableDescriptor) InvalidateFKConstraints() {
 
 // AllIndexSpans returns the Spans for each index in the table, including those
 // being added in the mutations.
-func (desc *TableDescriptor) AllIndexSpans() roachpb.Spans {
+func (desc *TableDescriptor) AllIndexSpans(codec keys.SQLCodec) roachpb.Spans {
 	var spans roachpb.Spans
 	err := desc.ForeachNonDropIndex(func(index *IndexDescriptor) error {
-		spans = append(spans, desc.IndexSpan(index.ID))
+		spans = append(spans, desc.IndexSpan(codec, index.ID))
 		return nil
 	})
 	if err != nil {
@@ -3569,20 +3629,22 @@ func (desc *TableDescriptor) AllIndexSpans() roachpb.Spans {
 
 // PrimaryIndexSpan returns the Span that corresponds to the entire primary
 // index; can be used for a full table scan.
-func (desc *TableDescriptor) PrimaryIndexSpan() roachpb.Span {
-	return desc.IndexSpan(desc.PrimaryIndex.ID)
+func (desc *TableDescriptor) PrimaryIndexSpan(codec keys.SQLCodec) roachpb.Span {
+	return desc.IndexSpan(codec, desc.PrimaryIndex.ID)
 }
 
 // IndexSpan returns the Span that corresponds to an entire index; can be used
 // for a full index scan.
-func (desc *TableDescriptor) IndexSpan(indexID IndexID) roachpb.Span {
-	prefix := roachpb.Key(MakeIndexKeyPrefix(desc, indexID))
+func (desc *TableDescriptor) IndexSpan(codec keys.SQLCodec, indexID IndexID) roachpb.Span {
+	prefix := roachpb.Key(MakeIndexKeyPrefix(codec, desc, indexID))
 	return roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()}
 }
 
 // TableSpan returns the Span that corresponds to the entire table.
-func (desc *TableDescriptor) TableSpan() roachpb.Span {
-	prefix := roachpb.Key(keys.MakeTablePrefix(uint32(desc.ID)))
+func (desc *TableDescriptor) TableSpan(codec keys.SQLCodec) roachpb.Span {
+	// TODO(jordan): Why does IndexSpan consider interleaves but TableSpan does
+	// not? Should it?
+	prefix := codec.TablePrefix(uint32(desc.ID))
 	return roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()}
 }
 
@@ -3773,7 +3835,7 @@ func (desc *ColumnDescriptor) ColName() tree.Name {
 
 // DatumType is part of the cat.Column interface.
 func (desc *ColumnDescriptor) DatumType() *types.T {
-	return &desc.Type
+	return desc.Type
 }
 
 // ColTypePrecision is part of the cat.Column interface.
@@ -3965,10 +4027,49 @@ func (desc *MutableTableDescriptor) TableDesc() *TableDescriptor {
 	return &desc.TableDescriptor
 }
 
+// IsShardColumn returns true if col corresponds to a non-dropped hash sharded
+// index. This method assumes that col is currently a member of desc.
+func (desc *MutableTableDescriptor) IsShardColumn(col *ColumnDescriptor) bool {
+	for _, idx := range desc.AllNonDropIndexes() {
+		if idx.Sharded.IsSharded && idx.Sharded.Name == col.Name {
+			return true
+		}
+	}
+	return false
+}
+
 // TableDesc implements the ObjectDescriptor interface.
 func (desc *ImmutableTableDescriptor) TableDesc() *TableDescriptor {
 	return &desc.TableDescriptor
 }
+
+// GetAuditMode implements the DescriptorProto interface.
+func (desc *TypeDescriptor) GetAuditMode() TableDescriptor_AuditMode {
+	return TableDescriptor_DISABLED
+}
+
+// GetPrivileges implements the DescriptorProto interface.
+func (desc *TypeDescriptor) GetPrivileges() *PrivilegeDescriptor {
+	return nil
+}
+
+// SetID implements the DescriptorProto interface.
+func (desc *TypeDescriptor) SetID(id ID) {
+	desc.ID = id
+}
+
+// TypeName implements the DescriptorProto interface.
+func (desc *TypeDescriptor) TypeName() string {
+	return "type"
+}
+
+// SetName implements the DescriptorProto interface.
+func (desc *TypeDescriptor) SetName(name string) {
+	desc.Name = name
+}
+
+// NameResolutionResult implements the NameResolutionResult interface.
+func (desc *TypeDescriptor) NameResolutionResult() {}
 
 // DatabaseKey implements DescriptorKey.
 type DatabaseKey struct {
@@ -3981,8 +4082,8 @@ func NewDatabaseKey(name string) DatabaseKey {
 }
 
 // Key implements DescriptorKey interface.
-func (dk DatabaseKey) Key() roachpb.Key {
-	return MakeNameMetadataKey(keys.RootNamespaceID, keys.RootNamespaceID, dk.name)
+func (dk DatabaseKey) Key(codec keys.SQLCodec) roachpb.Key {
+	return MakeNameMetadataKey(codec, keys.RootNamespaceID, keys.RootNamespaceID, dk.name)
 }
 
 // Name implements DescriptorKey interface.
@@ -4008,8 +4109,8 @@ func NewTableKey(parentID ID, parentSchemaID ID, name string) TableKey {
 }
 
 // Key implements DescriptorKey interface.
-func (tk TableKey) Key() roachpb.Key {
-	return MakeNameMetadataKey(tk.parentID, tk.parentSchemaID, tk.name)
+func (tk TableKey) Key(codec keys.SQLCodec) roachpb.Key {
+	return MakeNameMetadataKey(codec, tk.parentID, tk.parentSchemaID, tk.name)
 }
 
 // Name implements DescriptorKey interface.
@@ -4034,8 +4135,8 @@ func NewPublicSchemaKey(parentID ID) SchemaKey {
 }
 
 // Key implements DescriptorKey interface.
-func (sk SchemaKey) Key() roachpb.Key {
-	return MakeNameMetadataKey(sk.parentID, keys.RootNamespaceID, sk.name)
+func (sk SchemaKey) Key(codec keys.SQLCodec) roachpb.Key {
+	return MakeNameMetadataKey(codec, sk.parentID, keys.RootNamespaceID, sk.name)
 }
 
 // Name implements DescriptorKey interface.
@@ -4055,8 +4156,8 @@ func NewDeprecatedTableKey(parentID ID, name string) DeprecatedTableKey {
 }
 
 // Key implements DescriptorKey interface.
-func (dtk DeprecatedTableKey) Key() roachpb.Key {
-	return MakeDeprecatedNameMetadataKey(dtk.parentID, dtk.name)
+func (dtk DeprecatedTableKey) Key(codec keys.SQLCodec) roachpb.Key {
+	return MakeDeprecatedNameMetadataKey(codec, dtk.parentID, dtk.name)
 }
 
 // Name implements DescriptorKey interface.
@@ -4075,8 +4176,8 @@ func NewDeprecatedDatabaseKey(name string) DeprecatedDatabaseKey {
 }
 
 // Key implements DescriptorKey interface.
-func (ddk DeprecatedDatabaseKey) Key() roachpb.Key {
-	return MakeDeprecatedNameMetadataKey(keys.RootNamespaceID, ddk.name)
+func (ddk DeprecatedDatabaseKey) Key(codec keys.SQLCodec) roachpb.Key {
+	return MakeDeprecatedNameMetadataKey(codec, keys.RootNamespaceID, ddk.name)
 }
 
 // Name implements DescriptorKey interface.
@@ -4094,4 +4195,15 @@ func GenerateUniqueConstraintName(prefix string, nameExistsFunc func(name string
 		name = fmt.Sprintf("%s_%d", prefix, i)
 	}
 	return name
+}
+
+// GetLogicalColumnID returns the LogicalColumnID of the ColumnDescriptor
+// if the LogicalColumnID is set (non-zero). Returns the ID of the
+// ColumnDescriptor if the LogicalColumnID is not set.
+func (desc ColumnDescriptor) GetLogicalColumnID() ColumnID {
+	if desc.LogicalColumnID != 0 {
+		return desc.LogicalColumnID
+	}
+
+	return desc.ID
 }

@@ -79,7 +79,7 @@ func parseValues(tableDesc *sqlbase.TableDescriptor, values string) ([]sqlbase.E
 		for colIdx, expr := range rowTuple {
 			col := &tableDesc.Columns[colIdx]
 			typedExpr, err := sqlbase.SanitizeVarFreeExpr(
-				expr, &col.Type, "avro", semaCtx, false /* allowImpure */)
+				expr, col.Type, "avro", semaCtx, false /* allowImpure */)
 			if err != nil {
 				return nil, err
 			}
@@ -87,7 +87,7 @@ func parseValues(tableDesc *sqlbase.TableDescriptor, values string) ([]sqlbase.E
 			if err != nil {
 				return nil, errors.Wrap(err, typedExpr.String())
 			}
-			row = append(row, sqlbase.DatumToEncDatum(&col.Type, datum))
+			row = append(row, sqlbase.DatumToEncDatum(col.Type, datum))
 		}
 		rows = append(rows, row)
 	}
@@ -125,7 +125,7 @@ func avroFieldMetadataToColDesc(metadata string) (*sqlbase.ColumnDescriptor, err
 		return nil, err
 	}
 	def := parsed.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTableAddColumn).ColumnDef
-	col, _, _, err := sqlbase.MakeColumnDefDescs(def, &tree.SemaContext{})
+	col, _, _, err := sqlbase.MakeColumnDefDescs(def, &tree.SemaContext{}, &tree.EvalContext{})
 	return col, err
 }
 
@@ -190,11 +190,11 @@ func TestAvroSchema(t *testing.T) {
 			// whose nanosecond representation overflows an
 			// int64, so restrict input to fit.
 			t := randTime(rng).Truncate(time.Millisecond)
-			datum = tree.MakeDTimestamp(t, time.Microsecond)
+			datum = tree.MustMakeDTimestamp(t, time.Microsecond)
 		case types.TimestampTZFamily:
 			// See comments above for TimestampFamily.
 			t := randTime(rng).Truncate(time.Millisecond)
-			datum = tree.MakeDTimestampTZ(t, time.Microsecond)
+			datum = tree.MustMakeDTimestampTZ(t, time.Microsecond)
 		case types.DecimalFamily:
 			// TODO(dan): Make RandDatum respect Precision and Width instead.
 			// TODO(dan): The precision is really meant to be in [1,10], but it
@@ -288,20 +288,22 @@ func TestAvroSchema(t *testing.T) {
 	// reference.
 	t.Run("type_goldens", func(t *testing.T) {
 		goldens := map[string]string{
-			`BOOL`:         `["null","boolean"]`,
-			`BYTES`:        `["null","bytes"]`,
-			`DATE`:         `["null",{"type":"int","logicalType":"date"}]`,
-			`FLOAT8`:       `["null","double"]`,
-			`INET`:         `["null","string"]`,
-			`INT8`:         `["null","long"]`,
-			`JSONB`:        `["null","string"]`,
-			`STRING`:       `["null","string"]`,
-			`TIME`:         `["null",{"type":"long","logicalType":"time-micros"}]`,
-			`TIMETZ`:       `["null","string"]`,
-			`TIMESTAMP`:    `["null",{"type":"long","logicalType":"timestamp-micros"}]`,
-			`TIMESTAMPTZ`:  `["null",{"type":"long","logicalType":"timestamp-micros"}]`,
-			`UUID`:         `["null","string"]`,
-			`DECIMAL(3,2)`: `["null",{"type":"bytes","logicalType":"decimal","precision":3,"scale":2}]`,
+			`BOOL`:                     `["null","boolean"]`,
+			`BYTES`:                    `["null","bytes"]`,
+			`DATE`:                     `["null",{"type":"int","logicalType":"date"}]`,
+			`FLOAT8`:                   `["null","double"]`,
+			`GEOGRAPHY(GEOMETRY,4326)`: `["null","bytes"]`,
+			`GEOMETRY`:                 `["null","bytes"]`,
+			`INET`:                     `["null","string"]`,
+			`INT8`:                     `["null","long"]`,
+			`JSONB`:                    `["null","string"]`,
+			`STRING`:                   `["null","string"]`,
+			`TIME`:                     `["null",{"type":"long","logicalType":"time-micros"}]`,
+			`TIMETZ`:                   `["null","string"]`,
+			`TIMESTAMP`:                `["null",{"type":"long","logicalType":"timestamp-micros"}]`,
+			`TIMESTAMPTZ`:              `["null",{"type":"long","logicalType":"timestamp-micros"}]`,
+			`UUID`:                     `["null","string"]`,
+			`DECIMAL(3,2)`:             `["null",{"type":"bytes","logicalType":"decimal","precision":3,"scale":2}]`,
 		}
 
 		for _, typ := range types.Scalar {
@@ -352,6 +354,15 @@ func TestAvroSchema(t *testing.T) {
 			{sqlType: `FLOAT`,
 				sql:  `1.2`,
 				avro: `{"double":1.2}`},
+
+			{sqlType: `GEOGRAPHY`, sql: `NULL`, avro: `null`},
+			{sqlType: `GEOGRAPHY`,
+				sql:  "'POINT(1.0 1.0)'",
+				avro: `{"bytes":"\u0001\u0001\u0000\u0000 \u00E6\u0010\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u00F0?\u0000\u0000\u0000\u0000\u0000\u0000\u00F0?"}`},
+			{sqlType: `GEOMETRY`, sql: `NULL`, avro: `null`},
+			{sqlType: `GEOMETRY`,
+				sql:  "'POINT(1.0 1.0)'",
+				avro: `{"bytes":"\u0001\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u00F0?\u0000\u0000\u0000\u0000\u0000\u0000\u00F0?"}`},
 
 			{sqlType: `STRING`, sql: `NULL`, avro: `null`},
 			{sqlType: `STRING`,

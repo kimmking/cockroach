@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -55,31 +56,31 @@ func TestCaseOp(t *testing.T) {
 		tuples     tuples
 		renderExpr string
 		expected   tuples
-		inputTypes []types.T
+		inputTypes []*types.T
 	}{
 		{
 			// Basic test.
 			tuples:     tuples{{1}, {2}, {nil}, {3}},
 			renderExpr: "CASE WHEN @1 = 2 THEN 1 ELSE 0 END",
 			expected:   tuples{{0}, {1}, {0}, {0}},
-			inputTypes: []types.T{*types.Int},
+			inputTypes: []*types.T{types.Int},
 		},
 		{
 			// Test "reordered when's."
 			tuples:     tuples{{1, 1}, {2, 0}, {nil, nil}, {3, 3}},
 			renderExpr: "CASE WHEN @1 + @2 > 3 THEN 0 WHEN @1 = 2 THEN 1 ELSE 2 END",
 			expected:   tuples{{2}, {1}, {2}, {0}},
-			inputTypes: []types.T{*types.Int, *types.Int},
+			inputTypes: []*types.T{types.Int, types.Int},
 		},
 		{
 			// Test the short-circuiting behavior.
 			tuples:     tuples{{1, 2}, {2, 0}, {nil, nil}, {3, 3}},
 			renderExpr: "CASE WHEN @1 = 2 THEN 0::DECIMAL WHEN @1 / @2 = 1 THEN 1::DECIMAL END",
 			expected:   tuples{{nil}, {zero}, {nil}, {one}},
-			inputTypes: []types.T{*types.Int, *types.Int},
+			inputTypes: []*types.T{types.Int, types.Int},
 		},
 	} {
-		runTests(t, []tuples{tc.tuples}, tc.expected, orderedVerifier, func(inputs []Operator) (Operator, error) {
+		runTests(t, []tuples{tc.tuples}, tc.expected, orderedVerifier, func(inputs []colexecbase.Operator) (colexecbase.Operator, error) {
 			spec.Input[0].ColumnTypes = tc.inputTypes
 			spec.Post.RenderExprs[0].Expr = tc.renderExpr
 			args := NewColOperatorArgs{

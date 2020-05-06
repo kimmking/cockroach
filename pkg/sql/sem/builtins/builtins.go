@@ -31,7 +31,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -51,7 +52,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -62,16 +62,12 @@ import (
 
 var (
 	errEmptyInputString = pgerror.New(pgcode.InvalidParameterValue, "the input string must not be empty")
-	errAbsOfMinInt64    = pgerror.New(pgcode.NumericValueOutOfRange, "abs of min integer value (-9223372036854775808) not defined")
-	errSqrtOfNegNumber  = pgerror.New(pgcode.InvalidArgumentForPowerFunction, "cannot take square root of a negative number")
-	errLogOfNegNumber   = pgerror.New(pgcode.InvalidArgumentForLogarithm, "cannot take logarithm of a negative number")
-	errLogOfZero        = pgerror.New(pgcode.InvalidArgumentForLogarithm, "cannot take logarithm of zero")
 	errZeroIP           = pgerror.New(pgcode.InvalidParameterValue, "zero length IP")
 	errChrValueTooSmall = pgerror.New(pgcode.InvalidParameterValue, "input value must be >= 0")
 	errChrValueTooLarge = pgerror.Newf(pgcode.InvalidParameterValue,
 		"input value must be <= %d (maximum Unicode code point)", utf8.MaxRune)
 	errStringTooLarge = pgerror.Newf(pgcode.ProgramLimitExceeded,
-		fmt.Sprintf("requested length too large, exceeds %s", humanizeutil.IBytes(maxAllocatedStringSize)))
+		"requested length too large, exceeds %s", humanizeutil.IBytes(maxAllocatedStringSize))
 )
 
 const maxAllocatedStringSize = 128 * 1024 * 1024
@@ -83,8 +79,8 @@ const (
 	categoryCompatibility = "Compatibility"
 	categoryDateAndTime   = "Date and time"
 	categoryIDGeneration  = "ID generation"
+	categoryGeospatial    = "Geospatial"
 	categorySequences     = "Sequence"
-	categoryMath          = "Math and numeric"
 	categoryString        = "String and byte"
 	categoryArray         = "Array"
 	categorySystemInfo    = "System info"
@@ -96,8 +92,6 @@ func categorizeType(t *types.T) string {
 	switch t.Family() {
 	case types.DateFamily, types.IntervalFamily, types.TimestampFamily, types.TimestampTZFamily:
 		return categoryDateAndTime
-	case types.IntFamily, types.DecimalFamily, types.FloatFamily:
-		return categoryMath
 	case types.StringFamily, types.BytesFamily:
 		return categoryString
 	default:
@@ -783,7 +777,7 @@ var builtins = map[string]builtinDefinition{
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (_ tree.Datum, err error) {
 				data, format := *args[0].(*tree.DBytes), string(tree.MustBeDString(args[1]))
-				be, ok := sessiondata.BytesEncodeFormatFromString(format)
+				be, ok := lex.BytesEncodeFormatFromString(format)
 				if !ok {
 					return nil, pgerror.New(pgcode.InvalidParameterValue,
 						"only 'hex', 'escape', and 'base64' formats are supported for encode()")
@@ -801,7 +795,7 @@ var builtins = map[string]builtinDefinition{
 			ReturnType: tree.FixedReturnType(types.Bytes),
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (_ tree.Datum, err error) {
 				data, format := string(tree.MustBeDString(args[0])), string(tree.MustBeDString(args[1]))
-				be, ok := sessiondata.BytesEncodeFormatFromString(format)
+				be, ok := lex.BytesEncodeFormatFromString(format)
 				if !ok {
 					return nil, pgerror.New(pgcode.InvalidParameterValue,
 						"only 'hex', 'escape', and 'base64' formats are supported for decode()")
@@ -975,7 +969,23 @@ var builtins = map[string]builtinDefinition{
 
 			return tree.NewDInt(tree.DInt(utf8.RuneCountInString(s[:index]) + 1)), nil
 		}, types.Int, "Calculates the position where the string `find` begins in `input`. \n\nFor"+
-			" example, `strpos('doggie', 'gie')` returns `4`.")),
+			" example, `strpos('doggie', 'gie')` returns `4`."),
+		bitsOverload2("input", "find",
+			func(_ *tree.EvalContext, bitString, bitSubstring *tree.DBitArray) (tree.Datum, error) {
+				index := strings.Index(bitString.BitArray.String(), bitSubstring.BitArray.String())
+				if index < 0 {
+					return tree.DZero, nil
+				}
+				return tree.NewDInt(tree.DInt(index + 1)), nil
+			}, types.Int, "Calculates the position where the bit subarray `find` begins in `input`."),
+		bytesOverload2("input", "find",
+			func(_ *tree.EvalContext, byteString, byteSubstring string) (tree.Datum, error) {
+				index := strings.Index(byteString, byteSubstring)
+				if index < 0 {
+					return tree.DZero, nil
+				}
+				return tree.NewDInt(tree.DInt(index + 1)), nil
+			}, types.Int, "Calculates the position where the byte subarray `find` begins in `input`.")),
 
 	"overlay": makeBuiltin(defProps(),
 		tree.Overload{
@@ -1522,7 +1532,7 @@ CockroachDB supports the following flags:
 			Types:      tree.ArgTypes{},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				return tree.NewDInt(GenerateUniqueInt(ctx.NodeID)), nil
+				return tree.NewDInt(GenerateUniqueInt(ctx.NodeID.SQLInstanceID())), nil
 			},
 			Info: "Returns a unique ID used by CockroachDB to generate unique row IDs if a " +
 				"Primary Key isn't defined for the table. The value is a combination of the " +
@@ -1760,7 +1770,7 @@ CockroachDB supports the following flags:
 				if err != nil {
 					return nil, err
 				}
-				return tree.MakeDTimestampTZ(t.UTC(), time.Microsecond), nil
+				return tree.MakeDTimestampTZ(t.UTC(), time.Microsecond)
 			},
 			Info: "Returns `input` as a timestamptz using `format` (which uses standard " +
 				"`strptime` formatting).",
@@ -1813,7 +1823,7 @@ CockroachDB supports the following flags:
 			ReturnType:        tree.FixedReturnType(types.TimestampTZ),
 			PreferredOverload: true,
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				return tree.MakeDTimestampTZ(ctx.GetStmtTimestamp(), time.Microsecond), nil
+				return tree.MakeDTimestampTZ(ctx.GetStmtTimestamp(), time.Microsecond)
 			},
 			Info: "Returns the start time of the current statement.",
 		},
@@ -1821,7 +1831,7 @@ CockroachDB supports the following flags:
 			Types:      tree.ArgTypes{},
 			ReturnType: tree.FixedReturnType(types.Timestamp),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				return tree.MakeDTimestamp(ctx.GetStmtTimestamp(), time.Microsecond), nil
+				return tree.MakeDTimestamp(ctx.GetStmtTimestamp(), time.Microsecond)
 			},
 			Info: "Returns the start time of the current statement.",
 		},
@@ -1837,7 +1847,7 @@ CockroachDB supports the following flags:
 				if err != nil {
 					return nil, err
 				}
-				return tree.MakeDTimestampTZ(ts, time.Microsecond), nil
+				return tree.MakeDTimestampTZ(ts, time.Microsecond)
 			},
 			Info: `Returns a timestamp which is very likely to be safe to perform
 against a follower replica.
@@ -1880,7 +1890,7 @@ may increase either contention or retry errors, or both.`,
 			ReturnType:        tree.FixedReturnType(types.TimestampTZ),
 			PreferredOverload: true,
 			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				return tree.MakeDTimestampTZ(timeutil.Now(), time.Microsecond), nil
+				return tree.MakeDTimestampTZ(timeutil.Now(), time.Microsecond)
 			},
 			Info: "Returns the current system time on one of the cluster nodes.",
 		},
@@ -1888,7 +1898,7 @@ may increase either contention or retry errors, or both.`,
 			Types:      tree.ArgTypes{},
 			ReturnType: tree.FixedReturnType(types.Timestamp),
 			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				return tree.MakeDTimestamp(timeutil.Now(), time.Microsecond), nil
+				return tree.MakeDTimestamp(timeutil.Now(), time.Microsecond)
 			},
 			Info: "Returns the current system time on one of the cluster nodes.",
 		},
@@ -2078,7 +2088,7 @@ may increase either contention or retry errors, or both.`,
 				if err != nil {
 					return nil, err
 				}
-				return tree.MakeDTimestamp(tsTZ.Time, time.Microsecond), nil
+				return tree.MakeDTimestamp(tsTZ.Time, time.Microsecond)
 			},
 			Info: "Truncates `input` to precision `element`.  Sets all fields that are less\n" +
 				"significant than `element` to zero (or one, for day and month)\n\n" +
@@ -2134,324 +2144,6 @@ may increase either contention or retry errors, or both.`,
 		},
 	),
 
-	// Math functions
-	"abs": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Abs(x))), nil
-		}, "Calculates the absolute value of `val`."),
-		decimalOverload1(func(x *apd.Decimal) (tree.Datum, error) {
-			dd := &tree.DDecimal{}
-			dd.Abs(x)
-			return dd, nil
-		}, "Calculates the absolute value of `val`."),
-		tree.Overload{
-			Types:      tree.ArgTypes{{"val", types.Int}},
-			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				x := tree.MustBeDInt(args[0])
-				switch {
-				case x == math.MinInt64:
-					return nil, errAbsOfMinInt64
-				case x < 0:
-					return tree.NewDInt(-x), nil
-				}
-				return args[0], nil
-			},
-			Info: "Calculates the absolute value of `val`.",
-		},
-	),
-
-	"acos": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Acos(x))), nil
-		}, "Calculates the inverse cosine of `val`."),
-	),
-
-	"asin": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Asin(x))), nil
-		}, "Calculates the inverse sine of `val`."),
-	),
-
-	"atan": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Atan(x))), nil
-		}, "Calculates the inverse tangent of `val`."),
-	),
-
-	"atan2": makeBuiltin(defProps(),
-		floatOverload2("x", "y", func(x, y float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Atan2(x, y))), nil
-		}, "Calculates the inverse tangent of `x`/`y`."),
-	),
-
-	"cbrt": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Cbrt(x))), nil
-		}, "Calculates the cube root (∛) of `val`."),
-		decimalOverload1(func(x *apd.Decimal) (tree.Datum, error) {
-			dd := &tree.DDecimal{}
-			_, err := tree.DecimalCtx.Cbrt(&dd.Decimal, x)
-			return dd, err
-		}, "Calculates the cube root (∛) of `val`."),
-	),
-
-	"ceil":    ceilImpl,
-	"ceiling": ceilImpl,
-
-	"cos": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Cos(x))), nil
-		}, "Calculates the cosine of `val`."),
-	),
-
-	"cot": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(1 / math.Tan(x))), nil
-		}, "Calculates the cotangent of `val`."),
-	),
-
-	"degrees": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(180.0 * x / math.Pi)), nil
-		}, "Converts `val` as a radian value to a degree value."),
-	),
-
-	"div": makeBuiltin(defProps(),
-		floatOverload2("x", "y", func(x, y float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Trunc(x / y))), nil
-		}, "Calculates the integer quotient of `x`/`y`."),
-		decimalOverload2("x", "y", func(x, y *apd.Decimal) (tree.Datum, error) {
-			if y.Sign() == 0 {
-				return nil, tree.ErrDivByZero
-			}
-			dd := &tree.DDecimal{}
-			_, err := tree.HighPrecisionCtx.QuoInteger(&dd.Decimal, x, y)
-			return dd, err
-		}, "Calculates the integer quotient of `x`/`y`."),
-		tree.Overload{
-			Types:      tree.ArgTypes{{"x", types.Int}, {"y", types.Int}},
-			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				y := tree.MustBeDInt(args[1])
-				if y == 0 {
-					return nil, tree.ErrDivByZero
-				}
-				x := tree.MustBeDInt(args[0])
-				return tree.NewDInt(x / y), nil
-			},
-			Info: "Calculates the integer quotient of `x`/`y`.",
-		},
-	),
-
-	"exp": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Exp(x))), nil
-		}, "Calculates *e* ^ `val`."),
-		decimalOverload1(func(x *apd.Decimal) (tree.Datum, error) {
-			dd := &tree.DDecimal{}
-			_, err := tree.DecimalCtx.Exp(&dd.Decimal, x)
-			return dd, err
-		}, "Calculates *e* ^ `val`."),
-	),
-
-	"floor": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Floor(x))), nil
-		}, "Calculates the largest integer not greater than `val`."),
-		decimalOverload1(func(x *apd.Decimal) (tree.Datum, error) {
-			dd := &tree.DDecimal{}
-			_, err := tree.ExactCtx.Floor(&dd.Decimal, x)
-			return dd, err
-		}, "Calculates the largest integer not greater than `val`."),
-		tree.Overload{
-			Types:      tree.ArgTypes{{"val", types.Int}},
-			ReturnType: tree.FixedReturnType(types.Float),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				return tree.NewDFloat(tree.DFloat(float64(*args[0].(*tree.DInt)))), nil
-			},
-			Info: "Calculates the largest integer not greater than `val`.",
-		},
-	),
-
-	"isnan": makeBuiltin(defProps(),
-		tree.Overload{
-			// Can't use floatBuiltin1 here because this one returns
-			// a boolean.
-			Types:      tree.ArgTypes{{"val", types.Float}},
-			ReturnType: tree.FixedReturnType(types.Bool),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				return tree.MakeDBool(tree.DBool(math.IsNaN(float64(*args[0].(*tree.DFloat))))), nil
-			},
-			Info: "Returns true if `val` is NaN, false otherwise.",
-		},
-		tree.Overload{
-			Types:      tree.ArgTypes{{"val", types.Decimal}},
-			ReturnType: tree.FixedReturnType(types.Bool),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				isNaN := args[0].(*tree.DDecimal).Decimal.Form == apd.NaN
-				return tree.MakeDBool(tree.DBool(isNaN)), nil
-			},
-			Info: "Returns true if `val` is NaN, false otherwise.",
-		},
-	),
-
-	"ln": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Log(x))), nil
-		}, "Calculates the natural log of `val`."),
-		decimalLogFn(tree.DecimalCtx.Ln, "Calculates the natural log of `val`."),
-	),
-
-	"log": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Log10(x))), nil
-		}, "Calculates the base 10 log of `val`."),
-		floatOverload2("b", "x", func(b, x float64) (tree.Datum, error) {
-			switch {
-			case x < 0.0:
-				return nil, errLogOfNegNumber
-			case x == 0.0:
-				return nil, errLogOfZero
-			}
-			switch {
-			case b < 0.0:
-				return nil, errLogOfNegNumber
-			case b == 0.0:
-				return nil, errLogOfZero
-			}
-			return tree.NewDFloat(tree.DFloat(math.Log10(x) / math.Log10(b))), nil
-		}, "Calculates the base `b` log of `val`."),
-		decimalLogFn(tree.DecimalCtx.Log10, "Calculates the base 10 log of `val`."),
-		decimalOverload2("b", "x", func(b, x *apd.Decimal) (tree.Datum, error) {
-			switch x.Sign() {
-			case -1:
-				return nil, errLogOfNegNumber
-			case 0:
-				return nil, errLogOfZero
-			}
-			switch b.Sign() {
-			case -1:
-				return nil, errLogOfNegNumber
-			case 0:
-				return nil, errLogOfZero
-			}
-
-			top := new(apd.Decimal)
-			if _, err := tree.IntermediateCtx.Ln(top, x); err != nil {
-				return nil, err
-			}
-			bot := new(apd.Decimal)
-			if _, err := tree.IntermediateCtx.Ln(bot, b); err != nil {
-				return nil, err
-			}
-
-			dd := &tree.DDecimal{}
-			_, err := tree.DecimalCtx.Quo(&dd.Decimal, top, bot)
-			return dd, err
-		}, "Calculates the base `b` log of `val`."),
-	),
-
-	"mod": makeBuiltin(defProps(),
-		floatOverload2("x", "y", func(x, y float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Mod(x, y))), nil
-		}, "Calculates `x`%`y`."),
-		decimalOverload2("x", "y", func(x, y *apd.Decimal) (tree.Datum, error) {
-			if y.Sign() == 0 {
-				return nil, tree.ErrZeroModulus
-			}
-			dd := &tree.DDecimal{}
-			_, err := tree.HighPrecisionCtx.Rem(&dd.Decimal, x, y)
-			return dd, err
-		}, "Calculates `x`%`y`."),
-		tree.Overload{
-			Types:      tree.ArgTypes{{"x", types.Int}, {"y", types.Int}},
-			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				y := tree.MustBeDInt(args[1])
-				if y == 0 {
-					return nil, tree.ErrZeroModulus
-				}
-				x := tree.MustBeDInt(args[0])
-				return tree.NewDInt(x % y), nil
-			},
-			Info: "Calculates `x`%`y`.",
-		},
-	),
-
-	"pi": makeBuiltin(defProps(),
-		tree.Overload{
-			Types:      tree.ArgTypes{},
-			ReturnType: tree.FixedReturnType(types.Float),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				return tree.NewDFloat(math.Pi), nil
-			},
-			Info: "Returns the value for pi (3.141592653589793).",
-		},
-	),
-
-	"pow":   powImpls,
-	"power": powImpls,
-
-	"radians": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(x * math.Pi / 180.0)), nil
-		}, "Converts `val` as a degree value to a radians value."),
-	),
-
-	"round": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.RoundToEven(x))), nil
-		}, "Rounds `val` to the nearest integer using half to even (banker's) rounding."),
-		decimalOverload1(func(x *apd.Decimal) (tree.Datum, error) {
-			return roundDecimal(x, 0)
-		}, "Rounds `val` to the nearest integer, half away from zero: "+
-			"round(+/-2.4) = +/-2, round(+/-2.5) = +/-3."),
-		tree.Overload{
-			Types:      tree.ArgTypes{{"input", types.Float}, {"decimal_accuracy", types.Int}},
-			ReturnType: tree.FixedReturnType(types.Float),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				f := float64(*args[0].(*tree.DFloat))
-				if math.IsInf(f, 0) || math.IsNaN(f) {
-					return args[0], nil
-				}
-				var x apd.Decimal
-				if _, err := x.SetFloat64(f); err != nil {
-					return nil, err
-				}
-
-				// TODO(mjibson): make sure this fits in an int32.
-				scale := int32(tree.MustBeDInt(args[1]))
-
-				var d apd.Decimal
-				if _, err := tree.RoundCtx.Quantize(&d, &x, -scale); err != nil {
-					return nil, err
-				}
-
-				f, err := d.Float64()
-				if err != nil {
-					return nil, err
-				}
-
-				return tree.NewDFloat(tree.DFloat(f)), nil
-			},
-			Info: "Keeps `decimal_accuracy` number of figures to the right of the zero position " +
-				" in `input` using half to even (banker's) rounding.",
-		},
-		tree.Overload{
-			Types:      tree.ArgTypes{{"input", types.Decimal}, {"decimal_accuracy", types.Int}},
-			ReturnType: tree.FixedReturnType(types.Decimal),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				// TODO(mjibson): make sure this fits in an int32.
-				scale := int32(tree.MustBeDInt(args[1]))
-				return roundDecimal(&args[0].(*tree.DDecimal).Decimal, scale)
-			},
-			Info: "Keeps `decimal_accuracy` number of figures to the right of the zero position " +
-				"in `input` using half away from zero rounding. If `decimal_accuracy` " +
-				"is not in the range -2^31...(2^31-1), the results are undefined.",
-		},
-	),
-
 	"row_to_json": makeBuiltin(defProps(),
 		tree.Overload{
 			Types:      tree.ArgTypes{{"row", types.AnyTuple}},
@@ -2481,71 +2173,6 @@ may increase either contention or retry errors, or both.`,
 		},
 	),
 
-	"sin": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Sin(x))), nil
-		}, "Calculates the sine of `val`."),
-	),
-
-	"sign": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			switch {
-			case x < 0:
-				return tree.NewDFloat(-1), nil
-			case x == 0:
-				return tree.NewDFloat(0), nil
-			}
-			return tree.NewDFloat(1), nil
-		}, "Determines the sign of `val`: **1** for positive; **0** for 0 values; **-1** for "+
-			"negative."),
-		decimalOverload1(func(x *apd.Decimal) (tree.Datum, error) {
-			d := &tree.DDecimal{}
-			d.Decimal.SetFinite(int64(x.Sign()), 0)
-			return d, nil
-		}, "Determines the sign of `val`: **1** for positive; **0** for 0 values; **-1** for "+
-			"negative."),
-		tree.Overload{
-			Types:      tree.ArgTypes{{"val", types.Int}},
-			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				x := tree.MustBeDInt(args[0])
-				switch {
-				case x < 0:
-					return tree.NewDInt(-1), nil
-				case x == 0:
-					return tree.DZero, nil
-				}
-				return tree.NewDInt(1), nil
-			},
-			Info: "Determines the sign of `val`: **1** for positive; **0** for 0 values; **-1** " +
-				"for negative.",
-		},
-	),
-
-	"sqrt": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			// TODO(mjibson): see #13642
-			if x < 0 {
-				return nil, errSqrtOfNegNumber
-			}
-			return tree.NewDFloat(tree.DFloat(math.Sqrt(x))), nil
-		}, "Calculates the square root of `val`."),
-		decimalOverload1(func(x *apd.Decimal) (tree.Datum, error) {
-			if x.Sign() < 0 {
-				return nil, errSqrtOfNegNumber
-			}
-			dd := &tree.DDecimal{}
-			_, err := tree.DecimalCtx.Sqrt(&dd.Decimal, x)
-			return dd, err
-		}, "Calculates the square root of `val`."),
-	),
-
-	"tan": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Tan(x))), nil
-		}, "Calculates the tangent of `val`."),
-	),
-
 	// https://www.postgresql.org/docs/9.6/functions-datetime.html
 	"timezone": makeBuiltin(defProps(),
 		// NOTE(otan): this should be deleted and replaced with the correct
@@ -2567,7 +2194,7 @@ may increase either contention or retry errors, or both.`,
 				if err != nil {
 					return nil, err
 				}
-				return ts.EvalAtTimeZone(ctx, loc), nil
+				return ts.EvalAtTimeZone(ctx, loc)
 			},
 			Info: "Convert given time stamp with time zone to the new time zone, with no time zone designation.",
 		},
@@ -2591,7 +2218,7 @@ may increase either contention or retry errors, or both.`,
 				_, beforeOffsetSecs := ts.Time.Zone()
 				_, afterOffsetSecs := ts.Time.In(loc).Zone()
 				durationDelta := time.Duration(beforeOffsetSecs-afterOffsetSecs) * time.Second
-				return tree.MakeDTimestampTZ(ts.Time.Add(durationDelta), time.Microsecond), nil
+				return tree.MakeDTimestampTZ(ts.Time.Add(durationDelta), time.Microsecond)
 			},
 			Info: "Treat given time stamp without time zone as located in the specified time zone.",
 		},
@@ -2611,7 +2238,7 @@ may increase either contention or retry errors, or both.`,
 				if err != nil {
 					return nil, err
 				}
-				return ts.EvalAtTimeZone(ctx, loc), nil
+				return ts.EvalAtTimeZone(ctx, loc)
 			},
 			Info: "Convert given time stamp with time zone to the new time zone, with no time zone designation.",
 		},
@@ -2659,71 +2286,6 @@ may increase either contention or retry errors, or both.`,
 				return tree.NewDTimeTZ(timetz.MakeTimeTZFromTime(tTime.In(loc))), nil
 			},
 			Info: "Convert given time with time zone to the new time zone.",
-		},
-	),
-
-	"trunc": makeBuiltin(defProps(),
-		floatOverload1(func(x float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Trunc(x))), nil
-		}, "Truncates the decimal values of `val`."),
-		decimalOverload1(func(x *apd.Decimal) (tree.Datum, error) {
-			dd := &tree.DDecimal{}
-			x.Modf(&dd.Decimal, nil)
-			return dd, nil
-		}, "Truncates the decimal values of `val`."),
-	),
-
-	"width_bucket": makeBuiltin(defProps(),
-		tree.Overload{
-			Types: tree.ArgTypes{{"operand", types.Decimal}, {"b1", types.Decimal},
-				{"b2", types.Decimal}, {"count", types.Int}},
-			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				operand, _ := args[0].(*tree.DDecimal).Float64()
-				b1, _ := args[1].(*tree.DDecimal).Float64()
-				b2, _ := args[2].(*tree.DDecimal).Float64()
-				count := int(tree.MustBeDInt(args[3]))
-				return tree.NewDInt(tree.DInt(widthBucket(operand, b1, b2, count))), nil
-			},
-			Info: "return the bucket number to which operand would be assigned in a histogram having count " +
-				"equal-width buckets spanning the range b1 to b2.",
-		},
-		tree.Overload{
-			Types: tree.ArgTypes{{"operand", types.Int}, {"b1", types.Int},
-				{"b2", types.Int}, {"count", types.Int}},
-			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				operand := float64(tree.MustBeDInt(args[0]))
-				b1 := float64(tree.MustBeDInt(args[1]))
-				b2 := float64(tree.MustBeDInt(args[2]))
-				count := int(tree.MustBeDInt(args[3]))
-				return tree.NewDInt(tree.DInt(widthBucket(operand, b1, b2, count))), nil
-			},
-			Info: "return the bucket number to which operand would be assigned in a histogram having count " +
-				"equal-width buckets spanning the range b1 to b2.",
-		},
-		tree.Overload{
-			Types:      tree.ArgTypes{{"operand", types.Any}, {"thresholds", types.AnyArray}},
-			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				operand := args[0]
-				thresholds := tree.MustBeDArray(args[1])
-
-				if !operand.ResolvedType().Equivalent(thresholds.ParamTyp) {
-					return tree.NewDInt(0), errors.New("Operand and thresholds must be of the same type")
-				}
-
-				for i, v := range thresholds.Array {
-					if operand.Compare(ctx, v) < 0 {
-						return tree.NewDInt(tree.DInt(i)), nil
-					}
-				}
-
-				return tree.NewDInt(tree.DInt(thresholds.Len())), nil
-			},
-			Info: "return the bucket number to which operand would be assigned given an array listing the " +
-				"lower bounds of the buckets; returns 0 for an input less than the first lower bound; the " +
-				"thresholds array must be sorted, smallest first, or unexpected results will be obtained",
 		},
 	),
 
@@ -3260,7 +2822,7 @@ may increase either contention or retry errors, or both.`,
 					return nil, pgerror.Newf(pgcode.DatatypeMismatch, "expected tuple argument for row_tuple, found %s", args[2])
 				}
 
-				tableDesc, err := sqlbase.GetTableDescFromID(ctx.Context, ctx.Txn, sqlbase.ID(tableID))
+				tableDesc, err := sqlbase.GetTableDescFromID(ctx.Context, ctx.Txn, ctx.Codec, sqlbase.ID(tableID))
 				if err != nil {
 					return nil, err
 				}
@@ -3303,7 +2865,7 @@ may increase either contention or retry errors, or both.`,
 				}
 
 				if indexDesc.ID == tableDesc.PrimaryIndex.ID {
-					keyPrefix := tableDesc.IndexSpan(indexDesc.ID).Key
+					keyPrefix := sqlbase.MakeIndexKeyPrefix(ctx.Codec, tableDesc, indexDesc.ID)
 					res, _, err := sqlbase.EncodeIndexKey(tableDesc, indexDesc, colMap, datums, keyPrefix)
 					if err != nil {
 						return nil, err
@@ -3311,7 +2873,7 @@ may increase either contention or retry errors, or both.`,
 					return tree.NewDBytes(tree.DBytes(res)), err
 				}
 				// We have a secondary index.
-				res, err := sqlbase.EncodeSecondaryIndex(tableDesc, indexDesc, colMap, datums, true /* includeEmpty */)
+				res, err := sqlbase.EncodeSecondaryIndex(ctx.Codec, tableDesc, indexDesc, colMap, datums, true /* includeEmpty */)
 				if err != nil {
 					return nil, err
 				}
@@ -3337,10 +2899,12 @@ may increase either contention or retry errors, or both.`,
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				errCode := string(*args[0].(*tree.DString))
 				msg := string(*args[1].(*tree.DString))
+				// We construct the errors below via %s as the
+				// message may contain PII.
 				if errCode == "" {
-					return nil, errors.New(msg)
+					return nil, errors.Newf("%s", msg)
 				}
-				return nil, pgerror.New(errCode, msg)
+				return nil, pgerror.Newf(errCode, "%s", msg)
 			},
 			Info: "This function is used only by CockroachDB's developers for testing purposes.",
 		},
@@ -3355,12 +2919,21 @@ may increase either contention or retry errors, or both.`,
 			Types:      tree.ArgTypes{{"msg", types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				if ctx.ClientNoticeSender == nil {
-					return nil, errors.AssertionFailedf("notice sender not set")
-				}
 				msg := string(*args[0].(*tree.DString))
-				ctx.ClientNoticeSender.SendClientNotice(ctx.Context, pgerror.Noticef("%s", msg))
-				return tree.NewDInt(0), nil
+				return crdbInternalSendNotice(ctx, "NOTICE", msg)
+			},
+			Info: "This function is used only by CockroachDB's developers for testing purposes.",
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"severity", types.String}, {"msg", types.String}},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				severityString := string(*args[0].(*tree.DString))
+				msg := string(*args[1].(*tree.DString))
+				if _, ok := pgnotice.ParseDisplaySeverity(severityString); !ok {
+					return nil, pgerror.Newf(pgcode.InvalidParameterValue, "severity %s is invalid", severityString)
+				}
+				return crdbInternalSendNotice(ctx, severityString, msg)
 			},
 			Info: "This function is used only by CockroachDB's developers for testing purposes.",
 		},
@@ -3623,7 +3196,79 @@ may increase either contention or retry errors, or both.`,
 				"Raising the verbosity can severely affect performance.",
 		},
 	),
-
+	// Returns the number of distinct inverted index entries that would be
+	// generated for a value.
+	"crdb_internal.num_geo_inverted_index_entries": makeBuiltin(
+		tree.FunctionProperties{
+			Category:     categorySystemInfo,
+			NullableArgs: true,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"table_id", types.Int},
+				{"index_id", types.Int},
+				{"val", types.Geography},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull || args[1] == tree.DNull || args[2] == tree.DNull {
+					return tree.DZero, nil
+				}
+				tableID := int(tree.MustBeDInt(args[0]))
+				indexID := int(tree.MustBeDInt(args[1]))
+				g := tree.MustBeDGeography(args[2])
+				tableDesc, err := sqlbase.GetTableDescFromID(ctx.Context, ctx.Txn, ctx.Codec, sqlbase.ID(tableID))
+				if err != nil {
+					return nil, err
+				}
+				indexDesc, err := tableDesc.FindIndexByID(sqlbase.IndexID(indexID))
+				if err != nil {
+					return nil, err
+				}
+				if indexDesc.GeoConfig.S2Geography == nil {
+					return nil, errors.Errorf("index_id %d is not a geography inverted index", indexID)
+				}
+				keys, err := sqlbase.EncodeGeoInvertedIndexTableKeys(g, nil, indexDesc)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDInt(tree.DInt(len(keys))), nil
+			},
+			Info: "This function is used only by CockroachDB's developers for testing purposes.",
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"table_id", types.Int},
+				{"index_id", types.Int},
+				{"val", types.Geometry},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull || args[1] == tree.DNull || args[2] == tree.DNull {
+					return tree.DZero, nil
+				}
+				tableID := int(tree.MustBeDInt(args[0]))
+				indexID := int(tree.MustBeDInt(args[1]))
+				g := tree.MustBeDGeometry(args[2])
+				tableDesc, err := sqlbase.GetTableDescFromID(ctx.Context, ctx.Txn, ctx.Codec, sqlbase.ID(tableID))
+				if err != nil {
+					return nil, err
+				}
+				indexDesc, err := tableDesc.FindIndexByID(sqlbase.IndexID(indexID))
+				if err != nil {
+					return nil, err
+				}
+				if indexDesc.GeoConfig.S2Geometry == nil {
+					return nil, errors.Errorf("index_id %d is not a geometry inverted index", indexID)
+				}
+				keys, err := sqlbase.EncodeGeoInvertedIndexTableKeys(g, nil, indexDesc)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDInt(tree.DInt(len(keys))), nil
+			},
+			Info: "This function is used only by CockroachDB's developers for testing purposes.",
+		}),
 	// Returns the number of distinct inverted index entries that would be
 	// generated for a value.
 	"crdb_internal.num_inverted_index_entries": makeBuiltin(
@@ -3668,8 +3313,7 @@ may increase either contention or retry errors, or both.`,
 				return tree.NewDInt(tree.DInt(len(keys))), nil
 			},
 			Info: "This function is used only by CockroachDB's developers for testing purposes.",
-		},
-	),
+		}),
 
 	// Returns true iff the current user has admin role.
 	// Note: it would be a privacy leak to extend this to check arbitrary usernames.
@@ -3972,28 +3616,6 @@ var uuidV4Impl = makeBuiltin(
 	},
 )
 
-var ceilImpl = makeBuiltin(defProps(),
-	floatOverload1(func(x float64) (tree.Datum, error) {
-		return tree.NewDFloat(tree.DFloat(math.Ceil(x))), nil
-	}, "Calculates the smallest integer not smaller than `val`."),
-	decimalOverload1(func(x *apd.Decimal) (tree.Datum, error) {
-		dd := &tree.DDecimal{}
-		_, err := tree.ExactCtx.Ceil(&dd.Decimal, x)
-		if dd.IsZero() {
-			dd.Negative = false
-		}
-		return dd, err
-	}, "Calculates the smallest integer not smaller than `val`."),
-	tree.Overload{
-		Types:      tree.ArgTypes{{"val", types.Int}},
-		ReturnType: tree.FixedReturnType(types.Float),
-		Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(float64(*args[0].(*tree.DInt)))), nil
-		},
-		Info: "Calculates the smallest integer not smaller than `val`.",
-	},
-)
-
 const txnTSContextDoc = `
 
 The value is based on a timestamp picked when the transaction starts
@@ -4167,28 +3789,6 @@ func currentDate(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 	t = t.In(ctx.GetLocation())
 	return tree.NewDDateFromTime(t)
 }
-
-var powImpls = makeBuiltin(defProps(),
-	floatOverload2("x", "y", func(x, y float64) (tree.Datum, error) {
-		return tree.NewDFloat(tree.DFloat(math.Pow(x, y))), nil
-	}, "Calculates `x`^`y`."),
-	decimalOverload2("x", "y", func(x, y *apd.Decimal) (tree.Datum, error) {
-		dd := &tree.DDecimal{}
-		_, err := tree.DecimalCtx.Pow(&dd.Decimal, x, y)
-		return dd, err
-	}, "Calculates `x`^`y`."),
-	tree.Overload{
-		Types: tree.ArgTypes{
-			{"x", types.Int},
-			{"y", types.Int},
-		},
-		ReturnType: tree.FixedReturnType(types.Int),
-		Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-			return tree.IntPow(tree.MustBeDInt(args[0]), tree.MustBeDInt(args[1]))
-		},
-		Info: "Calculates `x`^`y`.",
-	},
-)
 
 var (
 	jsonNullDString    = tree.NewDString("null")
@@ -4587,70 +4187,14 @@ func setProps(props tree.FunctionProperties, d builtinDefinition) builtinDefinit
 	return d
 }
 
-func decimalLogFn(
-	logFn func(*apd.Decimal, *apd.Decimal) (apd.Condition, error), info string,
-) tree.Overload {
-	return decimalOverload1(func(x *apd.Decimal) (tree.Datum, error) {
-		// TODO(mjibson): see #13642
-		switch x.Sign() {
-		case -1:
-			return nil, errLogOfNegNumber
-		case 0:
-			return nil, errLogOfZero
-		}
-		dd := &tree.DDecimal{}
-		_, err := logFn(&dd.Decimal, x)
-		return dd, err
-	}, info)
-}
-
-func floatOverload1(f func(float64) (tree.Datum, error), info string) tree.Overload {
-	return tree.Overload{
-		Types:      tree.ArgTypes{{"val", types.Float}},
-		ReturnType: tree.FixedReturnType(types.Float),
-		Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-			return f(float64(*args[0].(*tree.DFloat)))
-		},
-		Info: info,
-	}
-}
-
-func floatOverload2(
-	a, b string, f func(float64, float64) (tree.Datum, error), info string,
+func jsonOverload1(
+	f func(*tree.EvalContext, json.JSON) (tree.Datum, error), returnType *types.T, info string,
 ) tree.Overload {
 	return tree.Overload{
-		Types:      tree.ArgTypes{{a, types.Float}, {b, types.Float}},
-		ReturnType: tree.FixedReturnType(types.Float),
-		Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-			return f(float64(*args[0].(*tree.DFloat)),
-				float64(*args[1].(*tree.DFloat)))
-		},
-		Info: info,
-	}
-}
-
-func decimalOverload1(f func(*apd.Decimal) (tree.Datum, error), info string) tree.Overload {
-	return tree.Overload{
-		Types:      tree.ArgTypes{{"val", types.Decimal}},
-		ReturnType: tree.FixedReturnType(types.Decimal),
-		Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-			dec := &args[0].(*tree.DDecimal).Decimal
-			return f(dec)
-		},
-		Info: info,
-	}
-}
-
-func decimalOverload2(
-	a, b string, f func(*apd.Decimal, *apd.Decimal) (tree.Datum, error), info string,
-) tree.Overload {
-	return tree.Overload{
-		Types:      tree.ArgTypes{{a, types.Decimal}, {b, types.Decimal}},
-		ReturnType: tree.FixedReturnType(types.Decimal),
-		Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-			dec1 := &args[0].(*tree.DDecimal).Decimal
-			dec2 := &args[1].(*tree.DDecimal).Decimal
-			return f(dec1, dec2)
+		Types:      tree.ArgTypes{{"val", types.Jsonb}},
+		ReturnType: tree.FixedReturnType(returnType),
+		Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+			return f(evalCtx, tree.MustBeDJSON(args[0]).JSON)
 		},
 		Info: info,
 	}
@@ -4714,6 +4258,22 @@ func bytesOverload1(
 	}
 }
 
+func bytesOverload2(
+	a, b string,
+	f func(*tree.EvalContext, string, string) (tree.Datum, error),
+	returnType *types.T,
+	info string,
+) tree.Overload {
+	return tree.Overload{
+		Types:      tree.ArgTypes{{a, types.Bytes}, {b, types.Bytes}},
+		ReturnType: tree.FixedReturnType(returnType),
+		Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+			return f(evalCtx, string(*args[0].(*tree.DBytes)), string(*args[1].(*tree.DBytes)))
+		},
+		Info: info,
+	}
+}
+
 func bitsOverload1(
 	f func(*tree.EvalContext, *tree.DBitArray) (tree.Datum, error), returnType *types.T, info string,
 ) tree.Overload {
@@ -4722,6 +4282,22 @@ func bitsOverload1(
 		ReturnType: tree.FixedReturnType(returnType),
 		Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 			return f(evalCtx, args[0].(*tree.DBitArray))
+		},
+		Info: info,
+	}
+}
+
+func bitsOverload2(
+	a, b string,
+	f func(*tree.EvalContext, *tree.DBitArray, *tree.DBitArray) (tree.Datum, error),
+	returnType *types.T,
+	info string,
+) tree.Overload {
+	return tree.Overload{
+		Types:      tree.ArgTypes{{a, types.VarBit}, {b, types.VarBit}},
+		ReturnType: tree.FixedReturnType(returnType),
+		Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+			return f(evalCtx, args[0].(*tree.DBitArray), args[1].(*tree.DBitArray))
 		},
 		Info: info,
 	}
@@ -5040,48 +4616,24 @@ func overlay(s, to string, pos, size int) (tree.Datum, error) {
 	return tree.NewDString(string(runes[:pos]) + to + string(runes[after:])), nil
 }
 
-// roundDDecimal avoids creation of a new DDecimal in common case where no
-// rounding is necessary.
-func roundDDecimal(d *tree.DDecimal, scale int32) (tree.Datum, error) {
-	// Fast path: check if number of digits after decimal point is already low
-	// enough.
-	if -d.Exponent <= scale {
-		return d, nil
-	}
-	return roundDecimal(&d.Decimal, scale)
-}
-
-func roundDecimal(x *apd.Decimal, scale int32) (tree.Datum, error) {
-	dd := &tree.DDecimal{}
-	_, err := tree.HighPrecisionCtx.Quantize(&dd.Decimal, x, -scale)
-	return dd, err
-}
-
-var uniqueIntState struct {
-	syncutil.Mutex
-	timestamp uint64
-}
-
-var uniqueIntEpoch = time.Date(2015, time.January, 1, 0, 0, 0, 0, time.UTC).UnixNano()
-
 // NodeIDBits is the number of bits stored in the lower portion of
 // GenerateUniqueInt.
 const NodeIDBits = 15
 
 // GenerateUniqueInt creates a unique int composed of the current time at a
-// 10-microsecond granularity and the node-id. The node-id is stored in the
+// 10-microsecond granularity and the instance-id. The instance-id is stored in the
 // lower 15 bits of the returned value and the timestamp is stored in the upper
 // 48 bits. The top-bit is left empty so that negative values are not returned.
 // The 48-bit timestamp field provides for 89 years of timestamps. We use a
 // custom epoch (Jan 1, 2015) in order to utilize the entire timestamp range.
 //
-// Note that GenerateUniqueInt() imposes a limit on node IDs while
+// Note that GenerateUniqueInt() imposes a limit on instance IDs while
 // generateUniqueBytes() does not.
 //
 // TODO(pmattis): Do we have to worry about persisting the milliseconds value
 // periodically to avoid the clock ever going backwards (e.g. due to NTP
 // adjustment)?
-func GenerateUniqueInt(nodeID roachpb.NodeID) tree.DInt {
+func GenerateUniqueInt(instanceID base.SQLInstanceID) tree.DInt {
 	const precision = uint64(10 * time.Microsecond)
 
 	nowNanos := timeutil.Now().UnixNano()
@@ -5098,15 +4650,15 @@ func GenerateUniqueInt(nodeID roachpb.NodeID) tree.DInt {
 	uniqueIntState.timestamp = timestamp
 	uniqueIntState.Unlock()
 
-	return GenerateUniqueID(int32(nodeID), timestamp)
+	return GenerateUniqueID(int32(instanceID), timestamp)
 }
 
 // GenerateUniqueID encapsulates the logic to generate a unique number from
 // a nodeID and timestamp.
-func GenerateUniqueID(nodeID int32, timestamp uint64) tree.DInt {
-	// We xor in the nodeID so that nodeIDs larger than 32K will flip bits in the
-	// timestamp portion of the final value instead of always setting them.
-	id := (timestamp << NodeIDBits) ^ uint64(nodeID)
+func GenerateUniqueID(instanceID int32, timestamp uint64) tree.DInt {
+	// We xor in the instanceID so that instanceIDs larger than 32K will flip bits
+	// in the timestamp portion of the final value instead of always setting them.
+	id := (timestamp << NodeIDBits) ^ uint64(instanceID)
 	return tree.DInt(id)
 }
 
@@ -5613,7 +5165,7 @@ func truncateTimestamp(
 	}
 
 	toTime := time.Date(year, month, day, hour, min, sec, nsec, loc)
-	return tree.MakeDTimestampTZ(toTime, time.Microsecond), nil
+	return tree.MakeDTimestampTZ(toTime, time.Microsecond)
 }
 
 // Converts a scalar Datum to its string representation
@@ -5627,13 +5179,17 @@ func asJSONBuildObjectKey(d tree.Datum, loc *time.Location) (string, error) {
 	case *tree.DCollatedString:
 		return t.Contents, nil
 	case *tree.DTimestampTZ:
+		ts, err := tree.MakeDTimestampTZ(t.Time.In(loc), time.Microsecond)
+		if err != nil {
+			return "", err
+		}
 		return tree.AsStringWithFlags(
-			tree.MakeDTimestampTZ(t.Time.In(loc), time.Microsecond),
+			ts,
 			tree.FmtBareStrings,
 		), nil
 	case *tree.DBool, *tree.DInt, *tree.DFloat, *tree.DDecimal, *tree.DTimestamp,
 		*tree.DDate, *tree.DUuid, *tree.DInterval, *tree.DBytes, *tree.DIPAddr, *tree.DOid,
-		*tree.DTime, *tree.DTimeTZ, *tree.DBitArray:
+		*tree.DTime, *tree.DTimeTZ, *tree.DBitArray, *tree.DGeography, *tree.DGeometry:
 		return tree.AsStringWithFlags(d, tree.FmtBareStrings), nil
 	default:
 		return "", errors.AssertionFailedf("unexpected type %T for key value", d)
@@ -5720,25 +5276,6 @@ func rpad(s string, length int, fill string) (string, error) {
 	}
 
 	return buf.String(), nil
-}
-
-// widthBucket returns the bucket number to which operand would be assigned in a histogram having count
-// equal-width buckets spanning the range b1 to b2
-func widthBucket(operand float64, b1 float64, b2 float64, count int) int {
-	bucket := 0
-	if (b1 < b2 && operand > b2) || (b1 > b2 && operand < b2) {
-		return count + 1
-	}
-
-	if (b1 < b2 && operand < b1) || (b1 > b2 && operand > b1) {
-		return 0
-	}
-
-	width := (b2 - b1) / float64(count)
-	difference := operand - b1
-	bucket = int(math.Floor(difference/width) + 1)
-
-	return bucket
 }
 
 // CleanEncodingName sanitizes the string meant to represent a

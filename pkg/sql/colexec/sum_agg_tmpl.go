@@ -22,9 +22,10 @@ package colexec
 import (
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/pkg/errors"
 )
@@ -41,26 +42,37 @@ var _ tree.Datum
 // Dummy import to pull in "duration" package.
 var _ duration.Duration
 
+// _CANONICAL_TYPE_FAMILY is the template variable.
+const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _TYPE_WIDTH is the template variable.
+const _TYPE_WIDTH = 0
+
 // _ASSIGN_ADD is the template addition function for assigning the first input
 // to the result of the second input + the third input.
 func _ASSIGN_ADD(_, _, _ string) {
-	execerror.VectorizedInternalPanic("")
+	colexecerror.InternalError("")
 }
 
 // */}}
 
-func newSumAgg(t coltypes.T) (aggregateFunc, error) {
-	switch t {
+func newSumAgg(t *types.T) (aggregateFunc, error) {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
 	// {{range .}}
-	case _TYPES_T:
-		return &sum_TYPEAgg{}, nil
-	// {{end}}
-	default:
-		return nil, errors.Errorf("unsupported sum agg type %s", t)
+	case _CANONICAL_TYPE_FAMILY:
+		switch t.Width() {
+		// {{range .WidthOverloads}}
+		case _TYPE_WIDTH:
+			return &sum_TYPEAgg{}, nil
+			// {{end}}
+		}
+		// {{end}}
 	}
+	return nil, errors.Errorf("unsupported sum agg type %s", t)
 }
 
 // {{range .}}
+// {{range .WidthOverloads}}
 
 type sum_TYPEAgg struct {
 	done bool
@@ -85,7 +97,7 @@ var _ aggregateFunc = &sum_TYPEAgg{}
 
 func (a *sum_TYPEAgg) Init(groups []bool, v coldata.Vec) {
 	a.groups = groups
-	a.scratch.vec = v._TemplateType()
+	a.scratch.vec = v.TemplateType()
 	a.scratch.nulls = v.Nulls()
 	a.Reset()
 }
@@ -127,7 +139,7 @@ func (a *sum_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 		return
 	}
 	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
-	col, nulls := vec._TemplateType(), vec.Nulls()
+	col, nulls := vec.TemplateType(), vec.Nulls()
 	if nulls.MaybeHasNulls() {
 		if sel != nil {
 			sel = sel[:inputLen]
@@ -160,6 +172,7 @@ func (a *sum_TYPEAgg) HandleEmptyInputScalar() {
 }
 
 // {{end}}
+// {{end}}
 
 // {{/*
 // _ACCUMULATE_SUM adds the value of the ith row to the output for the current
@@ -189,16 +202,16 @@ func _ACCUMULATE_SUM(a *sum_TYPEAgg, nulls *coldata.Nulls, i int, _HAS_NULLS boo
 		// We only need to reset this flag if there are nulls. If there are no
 		// nulls, this will be updated unconditionally below.
 		// */}}
-		// {{ if .HasNulls }}
+		// {{if .HasNulls}}
 		a.scratch.foundNonNullForCurrentGroup = false
-		// {{ end }}
+		// {{end}}
 	}
 	var isNull bool
-	// {{ if .HasNulls }}
+	// {{if .HasNulls}}
 	isNull = nulls.NullAt(i)
-	// {{ else }}
+	// {{else}}
 	isNull = false
-	// {{ end }}
+	// {{end}}
 	if !isNull {
 		_ASSIGN_ADD(a.scratch.curAgg, a.scratch.curAgg, col[i])
 		a.scratch.foundNonNullForCurrentGroup = true

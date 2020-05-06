@@ -206,11 +206,12 @@ func (sb *statisticsBuilder) availabilityFromInput(e RelExpr) bool {
 	case *ScanExpr:
 		return sb.makeTableStatistics(t.Table).Available
 
-	case *VirtualScanExpr:
-		return sb.makeTableStatistics(t.Table).Available
-
 	case *LookupJoinExpr:
 		ensureLookupJoinInputProps(t, sb)
+		return t.lookupProps.Stats.Available && t.Input.Relational().Stats.Available
+
+	case *GeoLookupJoinExpr:
+		ensureGeoLookupJoinInputProps(t, sb)
 		return t.lookupProps.Stats.Available && t.Input.Relational().Stats.Available
 
 	case *ZigzagJoinExpr:
@@ -239,13 +240,11 @@ func (sb *statisticsBuilder) colStatFromInput(
 	colSet opt.ColSet, e RelExpr,
 ) (*props.ColumnStatistic, *props.Statistics) {
 	var lookupJoin *LookupJoinExpr
+	var geospatialLookupJoin *GeoLookupJoinExpr
 	var zigzagJoin *ZigzagJoinExpr
 
 	switch t := e.(type) {
 	case *ScanExpr:
-		return sb.colStatTable(t.Table, colSet), sb.makeTableStatistics(t.Table)
-
-	case *VirtualScanExpr:
 		return sb.colStatTable(t.Table, colSet), sb.makeTableStatistics(t.Table)
 
 	case *SelectExpr:
@@ -255,12 +254,17 @@ func (sb *statisticsBuilder) colStatFromInput(
 		lookupJoin = t
 		ensureLookupJoinInputProps(lookupJoin, sb)
 
+	case *GeoLookupJoinExpr:
+		geospatialLookupJoin = t
+		ensureGeoLookupJoinInputProps(geospatialLookupJoin, sb)
+
 	case *ZigzagJoinExpr:
 		zigzagJoin = t
 		ensureZigzagJoinInputProps(zigzagJoin, sb)
 	}
 
-	if lookupJoin != nil || zigzagJoin != nil || opt.IsJoinOp(e) || e.Op() == opt.MergeJoinOp {
+	if lookupJoin != nil || geospatialLookupJoin != nil || zigzagJoin != nil ||
+		opt.IsJoinOp(e) || e.Op() == opt.MergeJoinOp {
 		var leftProps *props.Relational
 		if zigzagJoin != nil {
 			leftProps = &zigzagJoin.leftProps
@@ -272,6 +276,8 @@ func (sb *statisticsBuilder) colStatFromInput(
 		var intersectsRight bool
 		if lookupJoin != nil {
 			intersectsRight = lookupJoin.lookupProps.OutputCols.Intersects(colSet)
+		} else if geospatialLookupJoin != nil {
+			intersectsRight = geospatialLookupJoin.lookupProps.OutputCols.Intersects(colSet)
 		} else if zigzagJoin != nil {
 			intersectsRight = zigzagJoin.rightProps.OutputCols.Intersects(colSet)
 		} else {
@@ -293,6 +299,11 @@ func (sb *statisticsBuilder) colStatFromInput(
 			if lookupJoin != nil {
 				return sb.colStatTable(lookupJoin.Table, colSet),
 					sb.makeTableStatistics(lookupJoin.Table)
+			}
+			if geospatialLookupJoin != nil {
+				// TODO(rytaft): use inverted index stats when available.
+				return sb.colStatTable(geospatialLookupJoin.Table, colSet),
+					sb.makeTableStatistics(geospatialLookupJoin.Table)
 			}
 			if zigzagJoin != nil {
 				return sb.colStatTable(zigzagJoin.RightTable, colSet),
@@ -337,9 +348,6 @@ func (sb *statisticsBuilder) colStat(colSet opt.ColSet, e RelExpr) *props.Column
 	case opt.ScanOp:
 		return sb.colStatScan(colSet, e.(*ScanExpr))
 
-	case opt.VirtualScanOp:
-		return sb.colStatVirtualScan(colSet, e.(*VirtualScanExpr))
-
 	case opt.SelectOp:
 		return sb.colStatSelect(colSet, e.(*SelectExpr))
 
@@ -352,7 +360,7 @@ func (sb *statisticsBuilder) colStat(colSet opt.ColSet, e RelExpr) *props.Column
 	case opt.InnerJoinOp, opt.LeftJoinOp, opt.RightJoinOp, opt.FullJoinOp,
 		opt.SemiJoinOp, opt.AntiJoinOp, opt.InnerJoinApplyOp, opt.LeftJoinApplyOp,
 		opt.SemiJoinApplyOp, opt.AntiJoinApplyOp, opt.MergeJoinOp, opt.LookupJoinOp,
-		opt.ZigzagJoinOp:
+		opt.GeoLookupJoinOp, opt.ZigzagJoinOp:
 		return sb.colStatJoin(colSet, e)
 
 	case opt.IndexJoinOp:
@@ -362,7 +370,8 @@ func (sb *statisticsBuilder) colStat(colSet opt.ColSet, e RelExpr) *props.Column
 		opt.UnionAllOp, opt.IntersectAllOp, opt.ExceptAllOp:
 		return sb.colStatSetNode(colSet, e)
 
-	case opt.GroupByOp, opt.ScalarGroupByOp, opt.DistinctOnOp, opt.UpsertDistinctOnOp:
+	case opt.GroupByOp, opt.ScalarGroupByOp, opt.DistinctOnOp, opt.EnsureDistinctOnOp,
+		opt.UpsertDistinctOnOp:
 		return sb.colStatGroupBy(colSet, e)
 
 	case opt.LimitOp:
@@ -515,14 +524,20 @@ func (sb *statisticsBuilder) makeTableStatistics(tabID opt.TableID) *props.Stati
 		// column set. Stats are ordered with most recent first.
 		for i := 0; i < tab.StatisticCount(); i++ {
 			stat := tab.Statistic(i)
+			if stat.ColumnCount() > 1 && !sb.evalCtx.SessionData.OptimizerUseMultiColStats {
+				continue
+			}
+
 			var cols opt.ColSet
 			for i := 0; i < stat.ColumnCount(); i++ {
 				cols.Add(tabID.ColumnID(stat.ColumnOrdinal(i)))
 			}
+
 			if colStat, ok := stats.ColStats.Add(cols); ok {
 				colStat.DistinctCount = float64(stat.DistinctCount())
 				colStat.NullCount = float64(stat.NullCount())
-				if cols.Len() == 1 && stat.Histogram() != nil {
+				if cols.Len() == 1 && stat.Histogram() != nil &&
+					sb.evalCtx.SessionData.OptimizerUseHistograms {
 					col, _ := cols.Next(0)
 					colStat.Histogram = &props.Histogram{}
 					colStat.Histogram.Init(sb.evalCtx, col, stat.Histogram())
@@ -623,33 +638,6 @@ func (sb *statisticsBuilder) colStatScan(colSet opt.ColSet, scan *ScanExpr) *pro
 		colStat.NullCount = 0
 	}
 
-	sb.finalizeFromRowCount(colStat, s.RowCount)
-	return colStat
-}
-
-// +-------------+
-// | VirtualScan |
-// +-------------+
-
-func (sb *statisticsBuilder) buildVirtualScan(scan *VirtualScanExpr, relProps *props.Relational) {
-	s := &relProps.Stats
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
-		// Short cut if cardinality is 0.
-		return
-	}
-	s.Available = sb.availabilityFromInput(scan)
-
-	inputStats := sb.makeTableStatistics(scan.Table)
-
-	s.RowCount = inputStats.RowCount
-	sb.finalizeFromCardinality(relProps)
-}
-
-func (sb *statisticsBuilder) colStatVirtualScan(
-	colSet opt.ColSet, scan *VirtualScanExpr,
-) *props.ColumnStatistic {
-	s := &scan.Relational().Stats
-	colStat := sb.copyColStat(colSet, s, sb.colStatTable(scan.Table, colSet))
 	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
@@ -945,6 +933,9 @@ func (sb *statisticsBuilder) buildJoin(
 		s.ApplySelectivity(sb.selectivityFromEquivalencies(equivReps, &h.filtersFD, join, s))
 	}
 
+	if join.Op() == opt.GeoLookupJoinOp {
+		s.ApplySelectivity(sb.selectivityFromGeoRelationship(join, s))
+	}
 	s.ApplySelectivity(sb.selectivityFromHistograms(histCols, join, s))
 	s.ApplySelectivity(sb.selectivityFromDistinctCounts(constrainedCols.Difference(histCols), join, s))
 	s.ApplySelectivity(sb.selectivityFromUnappliedConjuncts(numUnappliedConjuncts))
@@ -1075,6 +1066,12 @@ func (sb *statisticsBuilder) colStatJoin(colSet opt.ColSet, join RelExpr) *props
 		joinType = j.JoinType
 		leftProps = j.Input.Relational()
 		ensureLookupJoinInputProps(j, sb)
+		rightProps = &j.lookupProps
+
+	case *GeoLookupJoinExpr:
+		joinType = j.JoinType
+		leftProps = j.Input.Relational()
+		ensureGeoLookupJoinInputProps(j, sb)
 		rightProps = &j.lookupProps
 
 	case *ZigzagJoinExpr:
@@ -1497,7 +1494,7 @@ func (sb *statisticsBuilder) buildGroupBy(groupNode RelExpr, relProps *props.Rel
 	} else {
 		inputStats := sb.statsFromChild(groupNode, 0 /* childIdx */)
 
-		if groupingPrivate.ErrorOnDup {
+		if groupingPrivate.ErrorOnDup != "" {
 			// If any input group has more than one row, then the distinct operator
 			// will raise an error, so in non-error cases it has the same number of
 			// rows as its input.
@@ -1546,7 +1543,7 @@ func (sb *statisticsBuilder) colStatGroupBy(
 		colStat = sb.copyColStatFromChild(colSet, groupNode, s)
 		inputColStat = sb.colStatFromChild(colSet, groupNode, 0 /* childIdx */)
 
-		if groupingPrivate.ErrorOnDup && colSet.Equals(groupingColSet) {
+		if groupingPrivate.ErrorOnDup != "" && colSet.Equals(groupingColSet) {
 			// If any input group has more than one row, then the distinct operator
 			// will raise an error, so in non-error cases its distinct count is the
 			// same as its row count.
@@ -2518,6 +2515,11 @@ const (
 	// This is the minimum cardinality an expression should have in order to make
 	// it worth adding the overhead of using a histogram.
 	minCardinalityForHistogram = 100
+
+	// This is the default selectivity estimated for geospatial lookup joins
+	// until we can get better statistics on inverted indexes and geospatial
+	// columns.
+	unknownGeoRelationshipSelectivity = 1.0 / 100.0
 )
 
 // countJSONPaths returns the number of JSON paths in the specified
@@ -2672,17 +2674,22 @@ func (sb *statisticsBuilder) applyIndexConstraint(
 		return constrainedCols, histCols
 	}
 
-	// Calculate histogram.
-	inputStat, _ := sb.colStatFromInput(constrainedCols, e)
-	inputHist := inputStat.Histogram
-	if inputHist != nil && inputHist.CanFilter(c) {
-		s := &relProps.Stats
-		if colStat, ok := s.ColStats.Lookup(constrainedCols); ok {
-			colStat.Histogram = inputHist.Filter(c)
-			histCols = constrainedCols
-			sb.updateDistinctCountFromHistogram(colStat, inputStat.DistinctCount)
+	// Calculate histograms.
+	constrainedCols.ForEach(func(col opt.ColumnID) {
+		colSet := opt.MakeColSet(col)
+		inputStat, _ := sb.colStatFromInput(colSet, e)
+		inputHist := inputStat.Histogram
+		if inputHist != nil {
+			if _, ok := inputHist.CanFilter(c); ok {
+				s := &relProps.Stats
+				if colStat, ok := s.ColStats.Lookup(colSet); ok {
+					colStat.Histogram = inputHist.Filter(c)
+					histCols.Add(col)
+					sb.updateDistinctCountFromHistogram(colStat, inputStat.DistinctCount)
+				}
+			}
 		}
-	}
+	})
 
 	return constrainedCols, histCols
 }
@@ -2735,11 +2742,13 @@ func (sb *statisticsBuilder) applyConstraintSet(
 		cols := opt.MakeColSet(col)
 		inputStat, _ := sb.colStatFromInput(cols, e)
 		inputHist := inputStat.Histogram
-		if inputHist != nil && inputHist.CanFilter(c) {
-			if colStat, ok := s.ColStats.Lookup(cols); ok {
-				colStat.Histogram = inputHist.Filter(c)
-				histCols.UnionWith(cols)
-				sb.updateDistinctCountFromHistogram(colStat, inputStat.DistinctCount)
+		if inputHist != nil {
+			if _, ok := inputHist.CanFilter(c); ok {
+				if colStat, ok := s.ColStats.Lookup(cols); ok {
+					colStat.Histogram = inputHist.Filter(c)
+					histCols.UnionWith(cols)
+					sb.updateDistinctCountFromHistogram(colStat, inputStat.DistinctCount)
+				}
 			}
 		}
 	}
@@ -3222,6 +3231,12 @@ func (sb *statisticsBuilder) selectivityFromEquivalencySemiJoin(
 	}
 
 	return fraction(minDistinctCountRight, maxDistinctCountLeft)
+}
+
+func (sb *statisticsBuilder) selectivityFromGeoRelationship(
+	e RelExpr, s *props.Statistics,
+) (selectivity float64) {
+	return unknownGeoRelationshipSelectivity
 }
 
 func (sb *statisticsBuilder) selectivityFromUnappliedConjuncts(

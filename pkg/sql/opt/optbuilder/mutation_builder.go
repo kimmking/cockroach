@@ -124,11 +124,14 @@ type mutationBuilder struct {
 	// from the table schema. These are parsed once and cached for reuse.
 	parsedExprs []tree.Expr
 
-	// checks contains foreign key check queries; see buildFKChecks* methods.
+	// checks contains foreign key check queries; see buildFK* methods.
 	checks memo.FKChecksExpr
 
+	// cascades contains foreign key check cascades; see buildFK* methods.
+	cascades memo.FKCascades
+
 	// fkFallback is true if we need to fall back on the legacy path for
-	// FK checks / cascades. See buildFKChecks methods.
+	// FK checks / cascades. See buildFK* methods.
 	fkFallback bool
 
 	// withID is nonzero if we need to buffer the input for FK checks.
@@ -300,7 +303,7 @@ func (mb *mutationBuilder) buildInputForUpdate(
 
 		if !pkCols.Empty() {
 			mb.outScope = mb.b.buildDistinctOn(
-				pkCols, mb.outScope, false /* nullsAreDistinct */, false /* errorOnDup */)
+				pkCols, mb.outScope, false /* nullsAreDistinct */, "" /* errorOnDup */)
 		}
 	}
 
@@ -746,12 +749,12 @@ func (mb *mutationBuilder) makeMutationPrivate(needResults bool) *memo.MutationP
 		UpdateCols: makeColList(mb.updateOrds),
 		CanaryCol:  mb.canaryColID,
 		CheckCols:  makeColList(mb.checkOrds),
+		FKCascades: mb.cascades,
 		FKFallback: mb.fkFallback,
 	}
 
-	// If we didn't actually plan any checks (e.g. because of cascades), don't
-	// buffer the input.
-	if len(mb.checks) > 0 {
+	// If we didn't actually plan any checks or cascades, don't buffer the input.
+	if len(mb.checks) > 0 || len(mb.cascades) > 0 {
 		private.WithID = mb.withID
 	}
 
@@ -814,7 +817,9 @@ func (mb *mutationBuilder) mapToReturnScopeOrd(tabOrd int) scopeOrdinal {
 func (mb *mutationBuilder) buildReturning(returning tree.ReturningExprs) {
 	// Handle case of no RETURNING clause.
 	if returning == nil {
-		mb.outScope = &scope{builder: mb.b, expr: mb.outScope.expr}
+		expr := mb.outScope.expr
+		mb.outScope = mb.b.allocScope()
+		mb.outScope.expr = expr
 		return
 	}
 

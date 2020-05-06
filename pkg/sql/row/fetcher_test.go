@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -69,9 +70,11 @@ func initFetcher(
 ) (fetcher *Fetcher, err error) {
 	fetcher = &Fetcher{}
 
+	fetcherCodec := keys.SystemSQLCodec
 	fetcherArgs := makeFetcherArgs(entries)
 
 	if err := fetcher.Init(
+		fetcherCodec,
 		reverseScan,
 		sqlbase.ScanLockingStrength_FOR_NONE,
 		false, /* returnRangeInfo */
@@ -145,7 +148,7 @@ func TestNextRowSingle(t *testing.T) {
 	// We try to read rows from each table.
 	for tableName, table := range tables {
 		t.Run(tableName, func(t *testing.T) {
-			tableDesc := sqlbase.GetImmutableTableDescriptor(kvDB, sqlutils.TestDB, tableName)
+			tableDesc := sqlbase.GetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, tableName)
 
 			var valNeededForCol util.FastIntSet
 			valNeededForCol.AddRange(0, table.nCols-1)
@@ -166,7 +169,7 @@ func TestNextRowSingle(t *testing.T) {
 			if err := rf.StartScan(
 				context.TODO(),
 				kv.NewTxn(ctx, kvDB, 0),
-				roachpb.Spans{tableDesc.IndexSpan(tableDesc.PrimaryIndex.ID)},
+				roachpb.Spans{tableDesc.IndexSpan(keys.SystemSQLCodec, tableDesc.PrimaryIndex.ID)},
 				false, /*limitBatches*/
 				0,     /*limitHint*/
 				false, /*traceKV*/
@@ -265,7 +268,7 @@ func TestNextRowBatchLimiting(t *testing.T) {
 	// We try to read rows from each table.
 	for tableName, table := range tables {
 		t.Run(tableName, func(t *testing.T) {
-			tableDesc := sqlbase.GetImmutableTableDescriptor(kvDB, sqlutils.TestDB, tableName)
+			tableDesc := sqlbase.GetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, tableName)
 
 			var valNeededForCol util.FastIntSet
 			valNeededForCol.AddRange(0, table.nCols-1)
@@ -286,7 +289,7 @@ func TestNextRowBatchLimiting(t *testing.T) {
 			if err := rf.StartScan(
 				context.TODO(),
 				kv.NewTxn(ctx, kvDB, 0),
-				roachpb.Spans{tableDesc.IndexSpan(tableDesc.PrimaryIndex.ID)},
+				roachpb.Spans{tableDesc.IndexSpan(keys.SystemSQLCodec, tableDesc.PrimaryIndex.ID)},
 				true,  /*limitBatches*/
 				10,    /*limitHint*/
 				false, /*traceKV*/
@@ -377,7 +380,7 @@ INDEX(c)
 
 	alloc := &sqlbase.DatumAlloc{}
 
-	tableDesc := sqlbase.GetImmutableTableDescriptor(kvDB, sqlutils.TestDB, tableName)
+	tableDesc := sqlbase.GetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, tableName)
 
 	var valNeededForCol util.FastIntSet
 	valNeededForCol.AddRange(0, table.nCols-1)
@@ -406,7 +409,7 @@ INDEX(c)
 	// We'll make the first span go to some random key in the middle of the
 	// key space (by appending a number to the index's start key) and the
 	// second span go from that key to the end of the index.
-	indexSpan := tableDesc.IndexSpan(tableDesc.PrimaryIndex.ID)
+	indexSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, tableDesc.PrimaryIndex.ID)
 	endKey := indexSpan.EndKey
 	midKey := encoding.EncodeUvarintAscending(indexSpan.Key, uint64(100))
 	indexSpan.EndKey = midKey
@@ -556,7 +559,7 @@ func TestNextRowSecondaryIndex(t *testing.T) {
 	// We try to read rows from each index.
 	for tableName, table := range tables {
 		t.Run(tableName, func(t *testing.T) {
-			tableDesc := sqlbase.GetImmutableTableDescriptor(kvDB, sqlutils.TestDB, tableName)
+			tableDesc := sqlbase.GetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, tableName)
 
 			var valNeededForCol util.FastIntSet
 			valNeededForCol.AddRange(0, table.nVals-1)
@@ -578,7 +581,7 @@ func TestNextRowSecondaryIndex(t *testing.T) {
 			if err := rf.StartScan(
 				context.TODO(),
 				kv.NewTxn(ctx, kvDB, 0),
-				roachpb.Spans{tableDesc.IndexSpan(tableDesc.Indexes[0].ID)},
+				roachpb.Spans{tableDesc.IndexSpan(keys.SystemSQLCodec, tableDesc.Indexes[0].ID)},
 				false, /*limitBatches*/
 				0,     /*limitHint*/
 				false, /*traceKV*/
@@ -849,6 +852,7 @@ func TestNextRowInterleaved(t *testing.T) {
 	ggc1idx.indexName = "ggc1_unique_idx"
 	ggc1idx.indexIdx = 1
 	// Last column v (idx 4) is not stored in this index.
+	ggc1idx.valNeededForCol = ggc1idx.valNeededForCol.Copy()
 	ggc1idx.valNeededForCol.Remove(4)
 	ggc1idx.nVals = 4
 
@@ -908,7 +912,7 @@ func TestNextRowInterleaved(t *testing.T) {
 			// RowFetcher.
 			idLookups := make(map[uint64]*fetcherEntryArgs, len(entries))
 			for i, entry := range entries {
-				tableDesc := sqlbase.GetImmutableTableDescriptor(kvDB, sqlutils.TestDB, entry.tableName)
+				tableDesc := sqlbase.GetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, entry.tableName)
 				var indexID sqlbase.IndexID
 				if entry.indexIdx == 0 {
 					indexID = tableDesc.PrimaryIndex.ID
@@ -919,7 +923,7 @@ func TestNextRowInterleaved(t *testing.T) {
 
 				// We take every entry's index span (primary or
 				// secondary) and use it to start our scan.
-				lookupSpans[i] = tableDesc.IndexSpan(indexID)
+				lookupSpans[i] = tableDesc.IndexSpan(keys.SystemSQLCodec, indexID)
 
 				args[i] = initFetcherArgs{
 					tableDesc:       tableDesc,
@@ -1027,7 +1031,7 @@ func TestRowFetcherReset(t *testing.T) {
 		0,
 		sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(1)),
 	)
-	tableDesc := sqlbase.GetImmutableTableDescriptor(kvDB, sqlutils.TestDB, "foo")
+	tableDesc := sqlbase.GetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "foo")
 	var valNeededForCol util.FastIntSet
 	valNeededForCol.AddRange(0, 1)
 	args := []initFetcherArgs{
@@ -1058,7 +1062,7 @@ func TestRowFetcherReset(t *testing.T) {
 
 	fetcherArgs := makeFetcherArgs(args)
 	if err := resetFetcher.Init(
-		false /*reverse*/, 0 /* todo */, false /* returnRangeInfo */, false /* isCheck */, &da, fetcherArgs...,
+		keys.SystemSQLCodec, false /*reverse*/, 0 /* todo */, false /* returnRangeInfo */, false /* isCheck */, &da, fetcherArgs...,
 	); err != nil {
 		t.Fatal(err)
 	}

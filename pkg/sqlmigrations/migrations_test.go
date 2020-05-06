@@ -469,6 +469,7 @@ func (mt *migrationTest) runMigration(ctx context.Context, m migrationDescriptor
 	}
 	return m.workFn(ctx, runner{
 		settings:    mt.server.ClusterSettings(),
+		codec:       keys.SystemSQLCodec,
 		db:          mt.kvDB,
 		sqlExecutor: mt.server.InternalExecutor().(*sql.InternalExecutor),
 	})
@@ -501,8 +502,8 @@ func TestCreateSystemTable(t *testing.T) {
 	sqlbase.SystemAllowedPrivileges[table.ID] = sqlbase.SystemAllowedPrivileges[keys.NamespaceTableID]
 
 	table.Name = "dummy"
-	nameKey := sqlbase.NewPublicTableKey(table.ParentID, table.Name).Key()
-	descKey := sqlbase.MakeDescMetadataKey(table.ID)
+	nameKey := sqlbase.NewPublicTableKey(table.ParentID, table.Name).Key(keys.SystemSQLCodec)
+	descKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, table.ID)
 	descVal := sqlbase.WrapDescriptor(&table)
 
 	mt := makeMigrationTest(ctx, t)
@@ -719,17 +720,15 @@ func TestMigrateNamespaceTableDescriptors(t *testing.T) {
 	mt.start(t, base.TestServerArgs{})
 
 	// Since we're already on 20.1, mimic the beginning state by deleting the
-	// new namespace descriptor and changing the old one's name to "namespace".
-	key := sqlbase.MakeDescMetadataKey(keys.NamespaceTableID)
+	// new namespace descriptor.
+	key := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, keys.NamespaceTableID)
 	require.NoError(t, mt.kvDB.Del(ctx, key))
 
-	deprecatedKey := sqlbase.MakeDescMetadataKey(keys.DeprecatedNamespaceTableID)
+	deprecatedKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, keys.DeprecatedNamespaceTableID)
 	desc := &sqlbase.Descriptor{}
 	require.NoError(t, mt.kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		ts, err := txn.GetProtoTs(ctx, deprecatedKey, desc)
-		require.NoError(t, err)
-		desc.Table(ts).Name = sqlbase.NamespaceTable.Name
-		return txn.Put(ctx, deprecatedKey, desc)
+		_, err := txn.GetProtoTs(ctx, deprecatedKey, desc)
+		return err
 	}))
 
 	// Run the migration.

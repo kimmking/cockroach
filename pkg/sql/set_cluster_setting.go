@@ -173,6 +173,20 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			case "false":
 				telemetry.Inc(sqltelemetry.TurnAutoStatsOffUseCounter)
 			}
+		case ConnAuditingClusterSettingName:
+			switch expectedEncodedValue {
+			case "true":
+				telemetry.Inc(sqltelemetry.TurnConnAuditingOnUseCounter)
+			case "false":
+				telemetry.Inc(sqltelemetry.TurnConnAuditingOffUseCounter)
+			}
+		case AuthAuditingClusterSettingName:
+			switch expectedEncodedValue {
+			case "true":
+				telemetry.Inc(sqltelemetry.TurnAuthAuditingOnUseCounter)
+			case "false":
+				telemetry.Inc(sqltelemetry.TurnAuthAuditingOffUseCounter)
+			}
 		case ReorderJoinsLimitClusterSettingName:
 			val, err := strconv.ParseInt(expectedEncodedValue, 10, 64)
 			if err != nil {
@@ -196,7 +210,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			txn,
 			EventLogSetClusterSetting,
 			0, /* no target */
-			int32(params.extendedEvalCtx.NodeID),
+			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
 			EventLogSetClusterSettingDetail{n.name, reportedValue, params.SessionData().User},
 		)
 	}); err != nil {
@@ -290,14 +304,14 @@ func toSettingString(
 			if ok {
 				return settings.EncodeInt(v), nil
 			}
-			return "", errors.Errorf("invalid integer value '%d' for enum setting", *i)
+			return "", errors.WithHintf(errors.Errorf("invalid integer value '%d' for enum setting", *i), setting.GetAvailableValuesAsHint())
 		} else if s, ok := d.(*tree.DString); ok {
 			str := string(*s)
 			v, ok := setting.ParseEnum(str)
 			if ok {
 				return settings.EncodeInt(v), nil
 			}
-			return "", errors.Errorf("invalid string value '%s' for enum setting", str)
+			return "", errors.WithHintf(errors.Errorf("invalid string value '%s' for enum setting", str), setting.GetAvailableValuesAsHint())
 		}
 		return "", errors.Errorf("cannot use %s %T value for enum setting, must be int or string", d.ResolvedType(), d)
 	case *settings.ByteSizeSetting:

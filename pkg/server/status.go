@@ -1038,7 +1038,7 @@ func (s *statusServer) Nodes(
 	b := &kv.Batch{}
 	b.Scan(startKey, endKey)
 	if err := s.db.Run(ctx, b); err != nil {
-		log.Error(ctx, err)
+		log.Errorf(ctx, "%v", err)
 		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
 	}
 	rows := b.Results[0].Rows
@@ -1048,7 +1048,7 @@ func (s *statusServer) Nodes(
 	}
 	for i, row := range rows {
 		if err := row.ValueProto(&resp.Nodes[i]); err != nil {
-			log.Error(ctx, err)
+			log.Errorf(ctx, "%v", err)
 			return nil, grpcstatus.Errorf(codes.Internal, err.Error())
 		}
 	}
@@ -1107,14 +1107,14 @@ func (s *statusServer) Node(
 	b := &kv.Batch{}
 	b.Get(key)
 	if err := s.db.Run(ctx, b); err != nil {
-		log.Error(ctx, err)
+		log.Errorf(ctx, "%v", err)
 		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
 	}
 
 	var nodeStatus statuspb.NodeStatus
 	if err := b.Results[0].Rows[0].ValueProto(&nodeStatus); err != nil {
 		err = errors.Errorf("could not unmarshal NodeStatus from %s: %s", key, err)
-		log.Error(ctx, err)
+		log.Errorf(ctx, "%v", err)
 		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
 	}
 	return &nodeStatus, nil
@@ -1239,7 +1239,7 @@ func (s *statusServer) handleVars(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set(httputil.ContentTypeHeader, httputil.PlaintextContentType)
 	err := s.metricSource.PrintAsText(w)
 	if err != nil {
-		log.Error(r.Context(), err)
+		log.Errorf(r.Context(), "%v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 	telemetry.Inc(telemetryPrometheusVars)
@@ -2041,7 +2041,7 @@ func (s *statusServer) JobRegistryStatus(
 	resp := &serverpb.JobRegistryStatusResponse{
 		NodeID: remoteNodeID,
 	}
-	for _, jID := range s.admin.server.jobRegistry.CurrentlyRunningJobs() {
+	for _, jID := range s.admin.server.sqlServer.jobRegistry.CurrentlyRunningJobs() {
 		job := serverpb.JobRegistryStatusResponse_Job{
 			Id: jID,
 		}
@@ -2061,7 +2061,7 @@ func (s *statusServer) JobStatus(
 
 	ctx = s.AnnotateCtx(propagateGatewayMetadata(ctx))
 
-	j, err := s.admin.server.jobRegistry.LoadJob(ctx, req.JobId)
+	j, err := s.admin.server.sqlServer.jobRegistry.LoadJob(ctx, req.JobId)
 	if err != nil {
 		return nil, err
 	}

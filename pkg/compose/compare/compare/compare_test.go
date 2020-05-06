@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/cmd/smithcmp/cmpconn"
+	"github.com/cockroachdb/cockroach/pkg/cmd/cmpconn"
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
 	"github.com/cockroachdb/cockroach/pkg/sql/mutations"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -41,24 +41,24 @@ func TestCompare(t *testing.T) {
 		init []string
 	}{
 		"postgres": {
-			addr: "postgresql://postgres@postgres:5432/",
+			addr: "postgresql://postgres@postgres:5432/postgres",
 			init: []string{
 				"drop schema if exists public cascade",
 				"create schema public",
 			},
 		},
 		"cockroach1": {
-			addr: "postgresql://root@cockroach1:26257/?sslmode=disable",
+			addr: "postgresql://root@cockroach1:26257/postgres?sslmode=disable",
 			init: []string{
-				"drop database if exists defaultdb",
-				"create database defaultdb",
+				"drop database if exists postgres",
+				"create database postgres",
 			},
 		},
 		"cockroach2": {
-			addr: "postgresql://root@cockroach2:26257/?sslmode=disable",
+			addr: "postgresql://root@cockroach2:26257/postgres?sslmode=disable",
 			init: []string{
-				"drop database if exists defaultdb",
-				"create database defaultdb",
+				"drop database if exists postgres",
+				"create database postgres",
 			},
 		},
 	}
@@ -107,13 +107,13 @@ func TestCompare(t *testing.T) {
 			setup := config.setup(rng)
 			setup, _ = mutations.ApplyString(rng, setup, config.setupMutators...)
 
-			conns := map[string]*cmpconn.Conn{}
+			conns := map[string]cmpconn.Conn{}
 			for _, testCn := range config.conns {
 				uri, ok := uris[testCn.name]
 				if !ok {
 					t.Fatalf("bad connection name: %s", testCn.name)
 				}
-				conn, err := cmpconn.NewConn(uri.addr, rng, testCn.mutators)
+				conn, err := cmpconn.NewConnWithMutators(uri.addr, rng, testCn.mutators)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -130,7 +130,7 @@ func TestCompare(t *testing.T) {
 				}
 				conns[testCn.name] = conn
 			}
-			smither, err := sqlsmith.NewSmither(conns[config.conns[0].name].DB, rng, config.opts...)
+			smither, err := sqlsmith.NewSmither(conns[config.conns[0].name].DB(), rng, config.opts...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -144,7 +144,9 @@ func TestCompare(t *testing.T) {
 				}
 				query := smither.Generate()
 				query, _ = mutations.ApplyString(rng, query, mutations.PostgresMutator)
-				if err := cmpconn.CompareConns(ctx, time.Second*30, conns, "" /* prep */, query); err != nil {
+				if err := cmpconn.CompareConns(
+					ctx, time.Second*30, conns, "" /* prep */, query, true, /* ignoreSQLErrors */
+				); err != nil {
 					path := filepath.Join(*flagArtifacts, confName+".log")
 					if err := ioutil.WriteFile(path, []byte(err.Error()), 0666); err != nil {
 						t.Log(err)

@@ -16,13 +16,15 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -31,7 +33,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func createSpecForMergeJoiner(tc joinTestCase) *execinfrapb.ProcessorSpec {
+func createSpecForMergeJoiner(tc *joinTestCase) *execinfrapb.ProcessorSpec {
 	leftOrdering := execinfrapb.Ordering{}
 	for i, eqCol := range tc.leftEqCols {
 		leftOrdering.Columns = append(
@@ -66,8 +68,8 @@ func createSpecForMergeJoiner(tc joinTestCase) *execinfrapb.ProcessorSpec {
 	}
 	return &execinfrapb.ProcessorSpec{
 		Input: []execinfrapb.InputSyncSpec{
-			{ColumnTypes: typeconv.ToColumnTypes(tc.leftTypes)},
-			{ColumnTypes: typeconv.ToColumnTypes(tc.rightTypes)},
+			{ColumnTypes: tc.leftTypes},
+			{ColumnTypes: tc.rightTypes},
 		},
 		Core: execinfrapb.ProcessorCoreUnion{
 			MergeJoiner: mjSpec,
@@ -79,11 +81,11 @@ func createSpecForMergeJoiner(tc joinTestCase) *execinfrapb.ProcessorSpec {
 	}
 }
 
-var mjTestCases = []joinTestCase{
+var mjTestCases = []*joinTestCase{
 	{
 		description:  "basic test",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {2}, {3}, {4}},
 		rightTuples:  tuples{{1}, {2}, {3}, {4}},
 		leftOutCols:  []uint32{0},
@@ -94,8 +96,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "basic test, no out cols",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {2}, {3}, {4}},
 		rightTuples:  tuples{{1}, {2}, {3}, {4}},
 		leftOutCols:  []uint32{},
@@ -106,8 +108,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "basic test, out col on left",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {2}, {3}, {4}},
 		rightTuples:  tuples{{1}, {2}, {3}, {4}},
 		leftOutCols:  []uint32{0},
@@ -118,8 +120,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "basic test, out col on right",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {2}, {3}, {4}},
 		rightTuples:  tuples{{1}, {2}, {3}, {4}},
 		leftOutCols:  []uint32{},
@@ -130,8 +132,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "basic test, L missing",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {3}, {4}},
 		rightTuples:  tuples{{1}, {2}, {3}, {4}},
 		leftOutCols:  []uint32{0},
@@ -142,8 +144,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "basic test, R missing",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {2}, {3}, {4}},
 		rightTuples:  tuples{{1}, {3}, {4}},
 		leftOutCols:  []uint32{},
@@ -154,8 +156,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "basic test, L duplicate",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {1}, {2}, {3}, {4}},
 		rightTuples:  tuples{{1}, {2}, {3}, {4}},
 		leftOutCols:  []uint32{0},
@@ -166,8 +168,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "basic test, R duplicate",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {2}, {3}, {4}},
 		rightTuples:  tuples{{1}, {1}, {2}, {3}, {4}},
 		leftOutCols:  []uint32{},
@@ -178,8 +180,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "basic test, R duplicate 2",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {2}},
 		rightTuples:  tuples{{1}, {1}, {2}},
 		leftOutCols:  []uint32{0},
@@ -190,8 +192,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "basic test, L+R duplicates",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {1}, {2}, {3}, {4}},
 		rightTuples:  tuples{{1}, {1}, {2}, {3}, {4}},
 		leftOutCols:  []uint32{},
@@ -202,8 +204,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "basic test, L+R duplicate, multiple runs",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {2}, {2}, {2}, {3}, {4}},
 		rightTuples:  tuples{{1}, {1}, {2}, {3}, {4}},
 		leftOutCols:  []uint32{},
@@ -214,8 +216,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "cross product test, batch size = col.BatchSize()",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {1}, {1}, {1}},
 		rightTuples:  tuples{{1}, {1}, {1}, {1}},
 		leftOutCols:  []uint32{0},
@@ -226,8 +228,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:     "cross product test, batch size = 4 (small even)",
-		leftTypes:       []coltypes.T{coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64},
+		leftTypes:       []*types.T{types.Int},
+		rightTypes:      []*types.T{types.Int},
 		leftTuples:      tuples{{1}, {1}, {1}, {1}},
 		rightTuples:     tuples{{1}, {1}, {1}, {1}},
 		leftOutCols:     []uint32{0},
@@ -239,8 +241,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:     "cross product test, batch size = 3 (small odd)",
-		leftTypes:       []coltypes.T{coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64},
+		leftTypes:       []*types.T{types.Int},
+		rightTypes:      []*types.T{types.Int},
 		leftTuples:      tuples{{1}, {1}, {1}, {1}},
 		rightTuples:     tuples{{1}, {1}, {1}, {1}},
 		leftOutCols:     []uint32{},
@@ -252,8 +254,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:     "cross product test, batch size = 1 (unit)",
-		leftTypes:       []coltypes.T{coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64},
+		leftTypes:       []*types.T{types.Int},
+		rightTypes:      []*types.T{types.Int},
 		leftTuples:      tuples{{1}, {1}, {1}, {1}},
 		rightTuples:     tuples{{1}, {1}, {1}, {1}},
 		leftOutCols:     []uint32{},
@@ -265,8 +267,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "multi output column test, basic",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
 		rightTuples:  tuples{{1, 11}, {2, 12}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{0, 1},
@@ -277,8 +279,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:     "multi output column test, batch size = 1",
-		leftTypes:       []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:       []*types.T{types.Int, types.Int},
+		rightTypes:      []*types.T{types.Int, types.Int},
 		leftTuples:      tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
 		rightTuples:     tuples{{1, 11}, {2, 12}, {3, 13}, {4, 14}},
 		leftOutCols:     []uint32{0, 1},
@@ -290,8 +292,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "multi output column test, test output coldata projection",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
 		rightTuples:  tuples{{1, 11}, {2, 12}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{0},
@@ -302,8 +304,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "multi output column test, test output coldata projection",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
 		rightTuples:  tuples{{1, 11}, {2, 12}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{1},
@@ -314,8 +316,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "multi output column test, L run",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 10}, {2, 20}, {2, 21}, {3, 30}, {4, 40}},
 		rightTuples:  tuples{{1, 11}, {2, 12}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{0, 1},
@@ -326,8 +328,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:     "multi output column test, L run, batch size = 1",
-		leftTypes:       []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:       []*types.T{types.Int, types.Int},
+		rightTypes:      []*types.T{types.Int, types.Int},
 		leftTuples:      tuples{{1, 10}, {2, 20}, {2, 21}, {3, 30}, {4, 40}},
 		rightTuples:     tuples{{1, 11}, {2, 12}, {3, 13}, {4, 14}},
 		leftOutCols:     []uint32{0, 1},
@@ -339,8 +341,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "multi output column test, R run",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
 		rightTuples:  tuples{{1, 11}, {1, 111}, {2, 12}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{0, 1},
@@ -351,8 +353,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:     "multi output column test, R run, batch size = 1",
-		leftTypes:       []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:       []*types.T{types.Int, types.Int},
+		rightTypes:      []*types.T{types.Int, types.Int},
 		leftTuples:      tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
 		rightTuples:     tuples{{1, 11}, {1, 111}, {2, 12}, {3, 13}, {4, 14}},
 		leftOutCols:     []uint32{0, 1},
@@ -364,8 +366,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "logic test",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{-1, -1}, {0, 4}, {2, 1}, {3, 4}, {5, 4}},
 		rightTuples:  tuples{{0, 5}, {1, 3}, {3, 2}, {4, 6}},
 		leftOutCols:  []uint32{1},
@@ -376,8 +378,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "multi output column test, batch size = 1 and runs (to test saved output), reordered out columns",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 10}, {1, 10}, {1, 10}, {2, 20}, {3, 30}, {4, 40}},
 		rightTuples:  tuples{{1, 11}, {1, 11}, {2, 12}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{1, 0},
@@ -399,8 +401,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "multi output column test, batch size = 1 and runs (to test saved output), reordered out columns that dont start at 0",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 10}, {1, 10}, {1, 10}, {2, 20}, {3, 30}, {4, 40}},
 		rightTuples:  tuples{{1, 11}, {1, 11}, {2, 12}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{1, 0},
@@ -422,8 +424,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "equality column is correctly indexed",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{10, 1}, {10, 1}, {10, 1}, {20, 2}, {30, 3}, {40, 4}},
 		rightTuples:  tuples{{1, 11}, {1, 11}, {2, 12}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{1, 0},
@@ -444,8 +446,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "multi column equality basic test",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
 		rightTuples:  tuples{{1, 10}, {2, 20}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{0, 1},
@@ -459,8 +461,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "multi column equality runs",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 10}, {1, 10}, {1, 10}, {2, 20}, {3, 30}, {4, 40}},
 		rightTuples:  tuples{{1, 10}, {1, 10}, {2, 20}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{0, 1},
@@ -479,8 +481,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "multi column non-consecutive equality cols",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int, types.Int},
 		leftTuples:   tuples{{1, 123, 1}, {1, 234, 10}},
 		rightTuples:  tuples{{1, 1, 345}, {1, 10, 456}},
 		leftOutCols:  []uint32{0, 2, 1},
@@ -494,8 +496,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "multi column equality: new batch ends run",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 1}, {1, 1}, {3, 3}, {4, 3}},
 		rightTuples:  tuples{{1, 1}, {1, 2}, {3, 3}, {3, 3}},
 		leftOutCols:  []uint32{0, 1},
@@ -511,8 +513,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "multi column equality: reordered eq columns",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 1}, {1, 1}, {3, 3}, {4, 3}},
 		rightTuples:  tuples{{1, 1}, {1, 2}, {3, 3}, {3, 3}},
 		leftOutCols:  []uint32{0, 1},
@@ -528,8 +530,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "cross batch, distinct group",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 2}, {1, 2}, {1, 2}, {2, 2}},
 		rightTuples:  tuples{{1, 2}},
 		leftOutCols:  []uint32{0, 1},
@@ -544,8 +546,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "templating basic test",
-		leftTypes:    []coltypes.T{coltypes.Bool, coltypes.Int16, coltypes.Float64},
-		rightTypes:   []coltypes.T{coltypes.Bool, coltypes.Int16, coltypes.Float64},
+		leftTypes:    []*types.T{types.Bool, types.Int2, types.Float},
+		rightTypes:   []*types.T{types.Bool, types.Int2, types.Float},
 		leftTuples:   tuples{{true, int16(10), 1.2}, {true, int16(20), 2.2}, {true, int16(30), 3.2}},
 		rightTuples:  tuples{{true, int16(10), 1.2}, {false, int16(20), 2.2}, {true, int16(30), 3.9}},
 		leftOutCols:  []uint32{0, 1, 2},
@@ -558,8 +560,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "templating cross product test",
-		leftTypes:    []coltypes.T{coltypes.Bool, coltypes.Int16, coltypes.Float64},
-		rightTypes:   []coltypes.T{coltypes.Bool, coltypes.Int16, coltypes.Float64},
+		leftTypes:    []*types.T{types.Bool, types.Int2, types.Float},
+		rightTypes:   []*types.T{types.Bool, types.Int2, types.Float},
 		leftTuples:   tuples{{false, int16(10), 1.2}, {true, int16(20), 2.2}, {true, int16(30), 3.2}},
 		rightTuples:  tuples{{false, int16(10), 1.2}, {true, int16(20), 2.3}, {true, int16(20), 2.4}, {true, int16(31), 3.9}},
 		leftOutCols:  []uint32{0, 1, 2},
@@ -574,8 +576,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "templating cross product test, output batch size 1",
-		leftTypes:    []coltypes.T{coltypes.Bool, coltypes.Int16, coltypes.Float64},
-		rightTypes:   []coltypes.T{coltypes.Bool, coltypes.Int16, coltypes.Float64},
+		leftTypes:    []*types.T{types.Bool, types.Int2, types.Float},
+		rightTypes:   []*types.T{types.Bool, types.Int2, types.Float},
 		leftTuples:   tuples{{false, int16(10), 1.2}, {true, int16(20), 2.2}, {true, int16(30), 3.2}},
 		rightTuples:  tuples{{false, int16(10), 1.2}, {true, int16(20), 2.3}, {true, int16(20), 2.4}, {true, int16(31), 3.9}},
 		leftOutCols:  []uint32{0, 1, 2},
@@ -591,8 +593,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "templating cross product test, output batch size 2",
-		leftTypes:    []coltypes.T{coltypes.Bool, coltypes.Int16, coltypes.Float64},
-		rightTypes:   []coltypes.T{coltypes.Bool, coltypes.Int16, coltypes.Float64},
+		leftTypes:    []*types.T{types.Bool, types.Int2, types.Float},
+		rightTypes:   []*types.T{types.Bool, types.Int2, types.Float},
 		leftTuples:   tuples{{false, int16(10), 1.2}, {true, int16(20), 2.2}, {true, int16(30), 3.2}},
 		rightTuples:  tuples{{false, int16(10), 1.2}, {true, int16(20), 2.3}, {true, int16(20), 2.4}, {true, int16(31), 3.9}},
 		leftOutCols:  []uint32{0, 1, 2},
@@ -608,8 +610,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "templating reordered eq columns",
-		leftTypes:    []coltypes.T{coltypes.Bool, coltypes.Int16, coltypes.Float64},
-		rightTypes:   []coltypes.T{coltypes.Bool, coltypes.Int16, coltypes.Float64},
+		leftTypes:    []*types.T{types.Bool, types.Int2, types.Float},
+		rightTypes:   []*types.T{types.Bool, types.Int2, types.Float},
 		leftTuples:   tuples{{false, int16(10), 1.2}, {true, int16(20), 2.2}, {true, int16(30), 3.2}},
 		rightTuples:  tuples{{false, int16(10), 1.2}, {true, int16(20), 2.3}, {true, int16(20), 2.4}, {true, int16(31), 3.9}},
 		leftOutCols:  []uint32{0, 1, 2},
@@ -624,8 +626,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "templating reordered eq columns non symmetrical",
-		leftTypes:    []coltypes.T{coltypes.Bool, coltypes.Int16, coltypes.Float64},
-		rightTypes:   []coltypes.T{coltypes.Int16, coltypes.Float64, coltypes.Bool},
+		leftTypes:    []*types.T{types.Bool, types.Int2, types.Float},
+		rightTypes:   []*types.T{types.Int2, types.Float, types.Bool},
 		leftTuples:   tuples{{false, int16(10), 1.2}, {true, int16(20), 2.2}, {true, int16(30), 3.2}},
 		rightTuples:  tuples{{int16(10), 1.2, false}, {int16(20), 2.2, true}, {int16(21), 2.2, true}, {int16(30), 3.2, false}},
 		leftOutCols:  []uint32{0, 1, 2},
@@ -640,8 +642,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "null handling",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{nil}, {0}},
 		rightTuples:  tuples{{nil}, {0}},
 		leftOutCols:  []uint32{0},
@@ -654,8 +656,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "null handling multi column, nulls on left",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{nil, 0}, {0, nil}},
 		rightTuples:  tuples{{nil, nil}, {0, 1}},
 		leftOutCols:  []uint32{0, 1},
@@ -668,8 +670,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "null handling multi column, nulls on right",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{nil, 0}, {0, 1}},
 		rightTuples:  tuples{{nil, nil}, {0, nil}},
 		leftOutCols:  []uint32{0, 1},
@@ -682,8 +684,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "desc test",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{4}, {3}, {2}, {1}},
 		rightTuples:  tuples{{4}, {2}, {1}},
 		leftOutCols:  []uint32{0},
@@ -697,8 +699,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "desc nulls test",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{4}, {3}, {nil}, {1}},
 		rightTuples:  tuples{{4}, {nil}, {2}, {1}},
 		leftOutCols:  []uint32{0},
@@ -712,8 +714,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "desc nulls test end on 0",
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{9}, {9}, {8}, {0}, {nil}},
 		rightTuples:  tuples{{9}, {9}, {8}, {0}, {nil}},
 		leftOutCols:  []uint32{0},
@@ -727,8 +729,8 @@ var mjTestCases = []joinTestCase{
 	},
 	{
 		description:  "non-equality columns with nulls",
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, nil}, {2, 2}, {2, 2}, {3, nil}, {4, nil}},
 		rightTuples:  tuples{{1, 1}, {2, nil}, {2, nil}, {3, nil}, {4, 4}, {4, 4}},
 		leftOutCols:  []uint32{0, 1},
@@ -740,8 +742,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "basic LEFT OUTER JOIN test, L and R exhausted at the same time",
 		joinType:     sqlbase.JoinType_LEFT_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {2}, {3}, {4}, {4}},
 		rightTuples:  tuples{{0}, {2}, {3}, {4}, {4}},
 		leftOutCols:  []uint32{0},
@@ -753,8 +755,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "basic LEFT OUTER JOIN test, R exhausted first",
 		joinType:     sqlbase.JoinType_LEFT_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {1}, {3}, {5}, {6}, {7}},
 		rightTuples:  tuples{{2}, {3}, {4}},
 		leftOutCols:  []uint32{0},
@@ -766,8 +768,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "basic LEFT OUTER JOIN test, L exhausted first",
 		joinType:     sqlbase.JoinType_LEFT_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{3}, {5}, {6}, {7}},
 		rightTuples:  tuples{{2}, {3}, {4}, {6}, {8}, {9}},
 		leftOutCols:  []uint32{0},
@@ -779,8 +781,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "multi output column LEFT OUTER JOIN test with nulls",
 		joinType:     sqlbase.JoinType_LEFT_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 10}, {2, 20}, {3, nil}, {4, 40}},
 		rightTuples:  tuples{{1, nil}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{0, 1},
@@ -792,8 +794,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "null in equality column LEFT OUTER JOIN",
 		joinType:     sqlbase.JoinType_LEFT_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{nil}, {nil}, {1}, {3}},
 		rightTuples:  tuples{{nil, 1}, {1, 1}, {2, 2}, {3, 3}},
 		leftOutCols:  []uint32{0},
@@ -805,8 +807,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "multi equality column LEFT OUTER JOIN test with nulls",
 		joinType:     sqlbase.JoinType_LEFT_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {2, 20}, {4, 40}},
 		rightTuples:  tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, nil}, {2, 20}, {3, 30}},
 		leftOutCols:  []uint32{0, 1},
@@ -818,8 +820,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "multi equality column (long runs on left) LEFT OUTER JOIN test with nulls",
 		joinType:     sqlbase.JoinType_LEFT_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 9}, {1, 10}, {1, 10}, {1, 11}, {2, 20}, {2, 20}, {2, 21}, {2, 22}, {2, 22}},
 		rightTuples:  tuples{{1, 8}, {1, 11}, {1, 11}, {2, 21}, {2, 23}},
 		leftOutCols:  []uint32{0, 1},
@@ -831,8 +833,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:     "3 equality column LEFT OUTER JOIN test with nulls DESC ordering",
 		joinType:        sqlbase.JoinType_LEFT_OUTER,
-		leftTypes:       []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
+		leftTypes:       []*types.T{types.Int, types.Int, types.Int},
+		rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 		leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 		rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 		leftTuples:      tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
@@ -846,8 +848,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:     "3 equality column LEFT OUTER JOIN test with nulls mixed ordering",
 		joinType:        sqlbase.JoinType_LEFT_OUTER,
-		leftTypes:       []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
+		leftTypes:       []*types.T{types.Int, types.Int, types.Int},
+		rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 		leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_ASC},
 		rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_ASC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 		leftTuples:      tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
@@ -861,8 +863,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:     "single column DESC with nulls on the left LEFT OUTER JOIN",
 		joinType:        sqlbase.JoinType_LEFT_OUTER,
-		leftTypes:       []coltypes.T{coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64},
+		leftTypes:       []*types.T{types.Int},
+		rightTypes:      []*types.T{types.Int},
 		leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 		rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 		leftTuples:      tuples{{1}, {1}, {1}, {nil}, {nil}, {nil}},
@@ -876,8 +878,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "basic RIGHT OUTER JOIN test, L and R exhausted at the same time",
 		joinType:     sqlbase.JoinType_RIGHT_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{-1}, {2}, {3}, {4}, {4}},
 		rightTuples:  tuples{{1}, {2}, {3}, {4}, {4}},
 		leftOutCols:  []uint32{0},
@@ -889,8 +891,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "basic RIGHT OUTER JOIN test, R exhausted first",
 		joinType:     sqlbase.JoinType_RIGHT_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {1}, {3}, {5}, {6}, {7}},
 		rightTuples:  tuples{{2}, {3}, {4}},
 		leftOutCols:  []uint32{0},
@@ -902,8 +904,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "basic RIGHT OUTER JOIN test, L exhausted first",
 		joinType:     sqlbase.JoinType_RIGHT_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{3}, {5}, {6}, {7}},
 		rightTuples:  tuples{{2}, {3}, {4}, {6}, {8}, {9}},
 		leftOutCols:  []uint32{0},
@@ -915,8 +917,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "multi output column RIGHT OUTER JOIN test with nulls",
 		joinType:     sqlbase.JoinType_RIGHT_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, nil}, {3, 13}, {4, 14}},
 		rightTuples:  tuples{{1, 10}, {2, 20}, {3, nil}, {4, 40}},
 		leftOutCols:  []uint32{0, 1},
@@ -928,8 +930,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "null in equality column RIGHT OUTER JOIN",
 		joinType:     sqlbase.JoinType_RIGHT_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{nil, 1}, {1, 1}, {2, 2}, {3, 3}},
 		rightTuples:  tuples{{nil}, {nil}, {1}, {3}},
 		leftOutCols:  []uint32{0, 1},
@@ -941,8 +943,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "multi equality column RIGHT OUTER JOIN test with nulls",
 		joinType:     sqlbase.JoinType_RIGHT_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, nil}, {2, 20}, {3, 30}},
 		rightTuples:  tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {2, 20}, {4, 40}},
 		leftOutCols:  []uint32{0, 1},
@@ -954,8 +956,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "multi equality column (long runs on right) RIGHT OUTER JOIN test with nulls",
 		joinType:     sqlbase.JoinType_RIGHT_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 8}, {1, 11}, {1, 11}, {2, 21}, {2, 23}},
 		rightTuples:  tuples{{1, 9}, {1, 10}, {1, 10}, {1, 11}, {2, 20}, {2, 20}, {2, 21}, {2, 22}, {2, 22}},
 		leftOutCols:  []uint32{0, 1},
@@ -967,8 +969,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:     "3 equality column RIGHT OUTER JOIN test with nulls DESC ordering",
 		joinType:        sqlbase.JoinType_RIGHT_OUTER,
-		leftTypes:       []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
+		leftTypes:       []*types.T{types.Int, types.Int, types.Int},
+		rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 		leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 		rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 		leftTuples:      tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
@@ -982,8 +984,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:     "3 equality column RIGHT OUTER JOIN test with nulls mixed ordering",
 		joinType:        sqlbase.JoinType_RIGHT_OUTER,
-		leftTypes:       []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
+		leftTypes:       []*types.T{types.Int, types.Int, types.Int},
+		rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 		leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_ASC},
 		rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_ASC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 		leftTuples:      tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
@@ -997,8 +999,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:     "single column DESC with nulls on the right RIGHT OUTER JOIN",
 		joinType:        sqlbase.JoinType_RIGHT_OUTER,
-		leftTypes:       []coltypes.T{coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64},
+		leftTypes:       []*types.T{types.Int},
+		rightTypes:      []*types.T{types.Int},
 		leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 		rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 		leftTuples:      tuples{{1}},
@@ -1012,8 +1014,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "basic FULL OUTER JOIN test, L and R exhausted at the same time",
 		joinType:     sqlbase.JoinType_FULL_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{-1}, {2}, {3}, {4}, {4}},
 		rightTuples:  tuples{{1}, {2}, {3}, {4}, {4}},
 		leftOutCols:  []uint32{0},
@@ -1025,8 +1027,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "basic FULL OUTER JOIN test, R exhausted first",
 		joinType:     sqlbase.JoinType_FULL_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {1}, {3}, {5}, {6}, {7}},
 		rightTuples:  tuples{{2}, {3}, {4}},
 		leftOutCols:  []uint32{0},
@@ -1038,8 +1040,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "basic FULL OUTER JOIN test, L exhausted first",
 		joinType:     sqlbase.JoinType_FULL_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{3}, {5}, {6}, {7}},
 		rightTuples:  tuples{{2}, {3}, {4}, {6}, {8}, {9}},
 		leftOutCols:  []uint32{0},
@@ -1051,8 +1053,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "multi output column FULL OUTER JOIN test with nulls",
 		joinType:     sqlbase.JoinType_FULL_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, nil}, {3, 13}, {4, 14}},
 		rightTuples:  tuples{{1, 10}, {2, 20}, {3, nil}, {4, 40}},
 		leftOutCols:  []uint32{0, 1},
@@ -1064,8 +1066,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "null in equality column FULL OUTER JOIN",
 		joinType:     sqlbase.JoinType_FULL_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{nil, 1}, {1, 1}, {2, 2}, {3, 3}},
 		rightTuples:  tuples{{nil}, {nil}, {1}, {3}},
 		leftOutCols:  []uint32{0, 1},
@@ -1077,8 +1079,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "multi equality column FULL OUTER JOIN test with nulls",
 		joinType:     sqlbase.JoinType_FULL_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, nil}, {2, 20}, {3, 30}},
 		rightTuples:  tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {2, 20}, {4, 40}},
 		leftOutCols:  []uint32{0, 1},
@@ -1090,8 +1092,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "multi equality column (long runs on right) FULL OUTER JOIN test with nulls",
 		joinType:     sqlbase.JoinType_FULL_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 8}, {1, 11}, {1, 11}, {2, 21}, {2, 23}},
 		rightTuples:  tuples{{1, 9}, {1, 10}, {1, 10}, {1, 11}, {2, 20}, {2, 20}, {2, 21}, {2, 22}, {2, 22}},
 		leftOutCols:  []uint32{0, 1},
@@ -1103,8 +1105,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:     "3 equality column FULL OUTER JOIN test with nulls DESC ordering",
 		joinType:        sqlbase.JoinType_FULL_OUTER,
-		leftTypes:       []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
+		leftTypes:       []*types.T{types.Int, types.Int, types.Int},
+		rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 		leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 		rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 		leftTuples:      tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
@@ -1118,8 +1120,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:     "3 equality column FULL OUTER JOIN test with nulls mixed ordering",
 		joinType:        sqlbase.JoinType_FULL_OUTER,
-		leftTypes:       []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
+		leftTypes:       []*types.T{types.Int, types.Int, types.Int},
+		rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 		leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_ASC},
 		rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_ASC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 		leftTuples:      tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
@@ -1133,8 +1135,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:     "single column DESC with nulls on the right FULL OUTER JOIN",
 		joinType:        sqlbase.JoinType_FULL_OUTER,
-		leftTypes:       []coltypes.T{coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64},
+		leftTypes:       []*types.T{types.Int},
+		rightTypes:      []*types.T{types.Int},
 		leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 		rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 		leftTuples:      tuples{{1}},
@@ -1148,8 +1150,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "FULL OUTER JOIN test with nulls and Bytes",
 		joinType:     sqlbase.JoinType_FULL_OUTER,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Bytes},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Bytes},
+		leftTypes:    []*types.T{types.Int, types.Bytes},
+		rightTypes:   []*types.T{types.Int, types.Bytes},
 		leftTuples:   tuples{{nil, "0"}, {1, "10"}, {2, "20"}, {3, nil}, {4, "40"}},
 		rightTuples:  tuples{{1, nil}, {3, "13"}, {4, nil}},
 		leftOutCols:  []uint32{0, 1},
@@ -1161,8 +1163,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "basic LEFT SEMI JOIN test, L and R exhausted at the same time",
 		joinType:     sqlbase.JoinType_LEFT_SEMI,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {2}, {3}, {4}, {4}},
 		rightTuples:  tuples{{-1}, {2}, {3}, {4}, {4}},
 		leftOutCols:  []uint32{0},
@@ -1174,8 +1176,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "basic LEFT SEMI JOIN test, R exhausted first",
 		joinType:     sqlbase.JoinType_LEFT_SEMI,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {1}, {3}, {5}, {6}, {7}},
 		rightTuples:  tuples{{2}, {3}, {4}},
 		leftOutCols:  []uint32{0},
@@ -1187,8 +1189,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "basic LEFT SEMI JOIN test, L exhausted first",
 		joinType:     sqlbase.JoinType_LEFT_SEMI,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{3}, {5}, {6}, {7}},
 		rightTuples:  tuples{{2}, {3}, {3}, {3}, {4}, {6}, {8}, {9}},
 		leftOutCols:  []uint32{0},
@@ -1200,8 +1202,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "multi output column LEFT SEMI JOIN test with nulls",
 		joinType:     sqlbase.JoinType_LEFT_SEMI,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 10}, {2, 20}, {3, nil}, {4, 40}},
 		rightTuples:  tuples{{1, nil}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{0, 1},
@@ -1213,8 +1215,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "null in equality column LEFT SEMI JOIN",
 		joinType:     sqlbase.JoinType_LEFT_SEMI,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{nil}, {nil}, {1}, {3}},
 		rightTuples:  tuples{{nil, 1}, {1, 1}, {2, 2}, {3, 3}},
 		leftOutCols:  []uint32{0},
@@ -1226,8 +1228,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "multi equality column LEFT SEMI JOIN test with nulls",
 		joinType:     sqlbase.JoinType_LEFT_SEMI,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {2, 20}, {4, 40}},
 		rightTuples:  tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, nil}, {2, 20}, {3, 30}},
 		leftOutCols:  []uint32{0, 1},
@@ -1239,8 +1241,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "multi equality column (long runs on left) LEFT SEMI JOIN test with nulls",
 		joinType:     sqlbase.JoinType_LEFT_SEMI,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 9}, {1, 10}, {1, 10}, {1, 11}, {1, 11}, {1, 11}, {2, 20}, {2, 20}, {2, 21}, {2, 22}, {2, 22}},
 		rightTuples:  tuples{{1, 8}, {1, 11}, {1, 11}, {2, 21}, {2, 23}},
 		leftOutCols:  []uint32{0, 1},
@@ -1252,8 +1254,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:     "3 equality column LEFT SEMI JOIN test with nulls DESC ordering",
 		joinType:        sqlbase.JoinType_LEFT_SEMI,
-		leftTypes:       []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
+		leftTypes:       []*types.T{types.Int, types.Int, types.Int},
+		rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 		leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 		rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 		leftTuples:      tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
@@ -1270,8 +1272,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:     "3 equality column LEFT SEMI JOIN test with nulls mixed ordering",
 		joinType:        sqlbase.JoinType_LEFT_SEMI,
-		leftTypes:       []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
+		leftTypes:       []*types.T{types.Int, types.Int, types.Int},
+		rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 		leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_ASC},
 		rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_ASC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 		leftTuples:      tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
@@ -1288,8 +1290,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:     "single column DESC with nulls on the left LEFT SEMI JOIN",
 		joinType:        sqlbase.JoinType_LEFT_SEMI,
-		leftTypes:       []coltypes.T{coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64},
+		leftTypes:       []*types.T{types.Int},
+		rightTypes:      []*types.T{types.Int},
 		leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 		rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 		leftTuples:      tuples{{1}, {1}, {1}, {nil}, {nil}, {nil}},
@@ -1303,8 +1305,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "basic LEFT ANTI JOIN test, L and R exhausted at the same time",
 		joinType:     sqlbase.JoinType_LEFT_ANTI,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {2}, {3}, {4}, {4}},
 		rightTuples:  tuples{{-1}, {2}, {4}, {4}},
 		leftOutCols:  []uint32{0},
@@ -1316,8 +1318,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "basic LEFT ANTI JOIN test, R exhausted first",
 		joinType:     sqlbase.JoinType_LEFT_ANTI,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{1}, {1}, {3}, {5}, {6}, {7}},
 		rightTuples:  tuples{{2}, {3}, {4}},
 		leftOutCols:  []uint32{0},
@@ -1329,8 +1331,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "basic LEFT ANTI JOIN test, L exhausted first",
 		joinType:     sqlbase.JoinType_LEFT_ANTI,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int},
 		leftTuples:   tuples{{3}, {5}, {6}, {7}},
 		rightTuples:  tuples{{2}, {3}, {3}, {3}, {4}, {6}, {8}, {9}},
 		leftOutCols:  []uint32{0},
@@ -1342,8 +1344,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "multi output column LEFT ANTI JOIN test with nulls",
 		joinType:     sqlbase.JoinType_LEFT_ANTI,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 10}, {2, 20}, {3, nil}, {4, 40}},
 		rightTuples:  tuples{{1, nil}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{0, 1},
@@ -1355,8 +1357,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "null in equality column LEFT ANTI JOIN",
 		joinType:     sqlbase.JoinType_LEFT_ANTI,
-		leftTypes:    []coltypes.T{coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{nil}, {nil}, {1}, {3}},
 		rightTuples:  tuples{{nil, 1}, {1, 1}, {2, 2}, {3, 3}},
 		leftOutCols:  []uint32{0},
@@ -1368,8 +1370,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "multi equality column LEFT ANTI JOIN test with nulls",
 		joinType:     sqlbase.JoinType_LEFT_ANTI,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {2, 20}, {4, 40}},
 		rightTuples:  tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, nil}, {2, 20}, {3, 30}},
 		leftOutCols:  []uint32{0, 1},
@@ -1381,8 +1383,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "multi equality column (long runs on left) LEFT ANTI JOIN test with nulls",
 		joinType:     sqlbase.JoinType_LEFT_ANTI,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{1, 9}, {1, 10}, {1, 10}, {1, 11}, {1, 11}, {1, 11}, {2, 20}, {2, 20}, {2, 21}, {2, 22}, {2, 22}},
 		rightTuples:  tuples{{1, 8}, {1, 11}, {1, 11}, {2, 21}, {2, 23}},
 		leftOutCols:  []uint32{0, 1},
@@ -1394,8 +1396,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:     "3 equality column LEFT ANTI JOIN test with nulls DESC ordering",
 		joinType:        sqlbase.JoinType_LEFT_ANTI,
-		leftTypes:       []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
+		leftTypes:       []*types.T{types.Int, types.Int, types.Int},
+		rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 		leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 		rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 		leftTuples:      tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
@@ -1409,8 +1411,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:     "3 equality column LEFT ANTI JOIN test with nulls mixed ordering",
 		joinType:        sqlbase.JoinType_LEFT_ANTI,
-		leftTypes:       []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64},
+		leftTypes:       []*types.T{types.Int, types.Int, types.Int},
+		rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 		leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_ASC},
 		rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_ASC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 		leftTuples:      tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
@@ -1424,8 +1426,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:     "single column DESC with nulls on the left LEFT ANTI JOIN",
 		joinType:        sqlbase.JoinType_LEFT_ANTI,
-		leftTypes:       []coltypes.T{coltypes.Int64},
-		rightTypes:      []coltypes.T{coltypes.Int64},
+		leftTypes:       []*types.T{types.Int},
+		rightTypes:      []*types.T{types.Int},
 		leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 		rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 		leftTuples:      tuples{{1}, {1}, {1}, {nil}, {nil}, {nil}},
@@ -1439,8 +1441,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "INNER JOIN test with ON expression (filter only on left)",
 		joinType:     sqlbase.JoinType_INNER,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{nil, 0}, {1, 10}, {2, 20}, {3, nil}, {4, 40}},
 		rightTuples:  tuples{{1, nil}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{0, 1},
@@ -1453,8 +1455,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "INNER JOIN test with ON expression (filter only on right)",
 		joinType:     sqlbase.JoinType_INNER,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{nil, 0}, {1, 10}, {2, 20}, {3, nil}, {4, 40}},
 		rightTuples:  tuples{{1, nil}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{0, 1},
@@ -1467,8 +1469,8 @@ var mjTestCases = []joinTestCase{
 	{
 		description:  "INNER JOIN test with ON expression (filter on both)",
 		joinType:     sqlbase.JoinType_INNER,
-		leftTypes:    []coltypes.T{coltypes.Int64, coltypes.Int64},
-		rightTypes:   []coltypes.T{coltypes.Int64, coltypes.Int64},
+		leftTypes:    []*types.T{types.Int, types.Int},
+		rightTypes:   []*types.T{types.Int, types.Int},
 		leftTuples:   tuples{{nil, 0}, {1, 10}, {2, 20}, {3, nil}, {4, 40}},
 		rightTuples:  tuples{{1, nil}, {3, 13}, {4, 14}},
 		leftOutCols:  []uint32{0, 1},
@@ -1537,16 +1539,16 @@ func TestMergeJoiner(t *testing.T) {
 			for _, memoryLimit := range []int64{1, defaultMemoryLimit} {
 				t.Run(fmt.Sprintf("MemoryLimit=%s/%s", humanizeutil.IBytes(memoryLimit), tc.description), func(t *testing.T) {
 					runner(t, []tuples{tc.leftTuples, tc.rightTuples},
-						[][]coltypes.T{tc.leftTypes, tc.rightTypes},
+						[][]*types.T{tc.leftTypes, tc.rightTypes},
 						tc.expected, mergeJoinVerifier,
-						func(input []Operator) (Operator, error) {
+						func(input []colexecbase.Operator) (colexecbase.Operator, error) {
 							spec := createSpecForMergeJoiner(tc)
 							args := NewColOperatorArgs{
 								Spec:                spec,
 								Inputs:              input,
 								StreamingMemAccount: testMemAcc,
 								DiskQueueCfg:        queueCfg,
-								FDSemaphore:         NewTestingSemaphore(mjFDLimit),
+								FDSemaphore:         colexecbase.NewTestingSemaphore(mjFDLimit),
 							}
 							args.TestingKnobs.UseStreamingMemAccountForBuffering = true
 							flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = memoryLimit
@@ -1588,7 +1590,7 @@ func TestFullOuterMergeJoinWithMaximumNumberOfGroups(t *testing.T) {
 	for _, outBatchSize := range []int{1, 16, coldata.BatchSize() - 1, coldata.BatchSize(), coldata.BatchSize() + 1} {
 		t.Run(fmt.Sprintf("outBatchSize=%d", outBatchSize),
 			func(t *testing.T) {
-				typs := []coltypes.T{coltypes.Int64}
+				typs := []*types.T{types.Int}
 				colsLeft := []coldata.Vec{testAllocator.NewMemColumn(typs[0], nTuples)}
 				colsRight := []coldata.Vec{testAllocator.NewMemColumn(typs[0], nTuples)}
 				groupsLeft := colsLeft[0].Int64()
@@ -1601,7 +1603,7 @@ func TestFullOuterMergeJoinWithMaximumNumberOfGroups(t *testing.T) {
 				rightSource := newChunkingBatchSource(typs, colsRight, nTuples)
 				a, err := newMergeJoinOp(
 					testAllocator, defaultMemoryLimit, queueCfg,
-					NewTestingSemaphore(mjFDLimit), sqlbase.FullOuterJoin,
+					colexecbase.NewTestingSemaphore(mjFDLimit), sqlbase.FullOuterJoin,
 					leftSource, rightSource, typs, typs,
 					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
@@ -1673,7 +1675,7 @@ func TestMergeJoinCrossProduct(t *testing.T) {
 	for _, outBatchSize := range []int{1, 17, coldata.BatchSize() - 1, coldata.BatchSize(), coldata.BatchSize() + 1} {
 		t.Run(fmt.Sprintf("outBatchSize=%d", outBatchSize),
 			func(t *testing.T) {
-				typs := []coltypes.T{coltypes.Int64, coltypes.Bytes, coltypes.Decimal}
+				typs := []*types.T{types.Int, types.Bytes, types.Decimal}
 				colsLeft := make([]coldata.Vec, len(typs))
 				colsRight := make([]coldata.Vec, len(typs))
 				for i, typ := range typs {
@@ -1693,9 +1695,9 @@ func TestMergeJoinCrossProduct(t *testing.T) {
 					groupsLeft[i] = int64(leftGroupIdx)
 					groupsRight[i] = int64(rightGroupIdx)
 				}
-				for i, typ := range typs[1:] {
-					coldata.RandomVec(rng, typ, 0 /* bytesFixedLength */, colsLeft[i+1], nTuples, nullProbability)
-					coldata.RandomVec(rng, typ, 0 /* bytesFixedLength */, colsRight[i+1], nTuples, nullProbability)
+				for i := range typs[1:] {
+					coldatatestutils.RandomVec(rng, 0 /* bytesFixedLength */, colsLeft[i+1], nTuples, nullProbability)
+					coldatatestutils.RandomVec(rng, 0 /* bytesFixedLength */, colsRight[i+1], nTuples, nullProbability)
 				}
 				leftMJSource := newChunkingBatchSource(typs, colsLeft, nTuples)
 				rightMJSource := newChunkingBatchSource(typs, colsRight, nTuples)
@@ -1703,7 +1705,7 @@ func TestMergeJoinCrossProduct(t *testing.T) {
 				rightHJSource := newChunkingBatchSource(typs, colsRight, nTuples)
 				mj, err := newMergeJoinOp(
 					testAllocator, defaultMemoryLimit, queueCfg,
-					NewTestingSemaphore(mjFDLimit), sqlbase.InnerJoin,
+					colexecbase.NewTestingSemaphore(mjFDLimit), sqlbase.InnerJoin,
 					leftMJSource, rightMJSource, typs, typs,
 					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
@@ -1760,7 +1762,7 @@ func TestMergeJoinerMultiBatch(t *testing.T) {
 			t.Run(fmt.Sprintf("numInputBatches=%d", numInputBatches),
 				func(t *testing.T) {
 					nTuples := coldata.BatchSize() * numInputBatches
-					typs := []coltypes.T{coltypes.Int64}
+					typs := []*types.T{types.Int}
 					cols := []coldata.Vec{testAllocator.NewMemColumn(typs[0], nTuples)}
 					groups := cols[0].Int64()
 					for i := range groups {
@@ -1772,7 +1774,7 @@ func TestMergeJoinerMultiBatch(t *testing.T) {
 
 					a, err := newMergeJoinOp(
 						testAllocator, defaultMemoryLimit,
-						queueCfg, NewTestingSemaphore(mjFDLimit), sqlbase.InnerJoin,
+						queueCfg, colexecbase.NewTestingSemaphore(mjFDLimit), sqlbase.InnerJoin,
 						leftSource, rightSource, typs, typs,
 						[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 						[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
@@ -1837,7 +1839,7 @@ func TestMergeJoinerMultiBatchRuns(t *testing.T) {
 					// group will be of size 0.
 					lastGroupSize := nTuples % groupSize
 					expCount := nTuples/groupSize*(groupSize*groupSize) + lastGroupSize*lastGroupSize
-					typs := []coltypes.T{coltypes.Int64, coltypes.Int64}
+					typs := []*types.T{types.Int, types.Int}
 					cols := []coldata.Vec{
 						testAllocator.NewMemColumn(typs[0], nTuples),
 						testAllocator.NewMemColumn(typs[1], nTuples),
@@ -1852,7 +1854,7 @@ func TestMergeJoinerMultiBatchRuns(t *testing.T) {
 
 					a, err := newMergeJoinOp(
 						testAllocator, defaultMemoryLimit,
-						queueCfg, NewTestingSemaphore(mjFDLimit), sqlbase.InnerJoin,
+						queueCfg, colexecbase.NewTestingSemaphore(mjFDLimit), sqlbase.InnerJoin,
 						leftSource, rightSource, typs, typs,
 						[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}, {ColIdx: 1, Direction: execinfrapb.Ordering_Column_ASC}},
 						[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}, {ColIdx: 1, Direction: execinfrapb.Ordering_Column_ASC}},
@@ -1905,12 +1907,12 @@ type expectedGroup struct {
 }
 
 func newBatchesOfRandIntRows(
-	nTuples int, typs []coltypes.T, maxRunLength int64, skipValues bool, randomIncrement int64,
+	nTuples int, maxRunLength int64, skipValues bool, randomIncrement int64,
 ) ([]coldata.Vec, []coldata.Vec, []expectedGroup) {
 	rng, _ := randutil.NewPseudoRand()
-	lCols := []coldata.Vec{testAllocator.NewMemColumn(typs[0], nTuples)}
+	lCols := []coldata.Vec{testAllocator.NewMemColumn(types.Int, nTuples)}
 	lCol := lCols[0].Int64()
-	rCols := []coldata.Vec{testAllocator.NewMemColumn(typs[0], nTuples)}
+	rCols := []coldata.Vec{testAllocator.NewMemColumn(types.Int, nTuples)}
 	rCol := rCols[0].Int64()
 	exp := make([]expectedGroup, nTuples)
 	val := int64(0)
@@ -1972,17 +1974,17 @@ func TestMergeJoinerRandomized(t *testing.T) {
 		for _, maxRunLength := range []int64{2, 3, 100} {
 			for _, skipValues := range []bool{false, true} {
 				for _, randomIncrement := range []int64{0, 1} {
-					t.Run(fmt.Sprintf("numInputBatches=%dmaxRunLength=%dskipValues=%trandomIncrement=%d", numInputBatches, maxRunLength, skipValues, randomIncrement),
+					t.Run(fmt.Sprintf("numInputBatches=%d/maxRunLength=%d/skipValues=%t/randomIncrement=%d", numInputBatches, maxRunLength, skipValues, randomIncrement),
 						func(t *testing.T) {
 							nTuples := coldata.BatchSize() * numInputBatches
-							typs := []coltypes.T{coltypes.Int64}
-							lCols, rCols, exp := newBatchesOfRandIntRows(nTuples, typs, maxRunLength, skipValues, randomIncrement)
+							typs := []*types.T{types.Int}
+							lCols, rCols, exp := newBatchesOfRandIntRows(nTuples, maxRunLength, skipValues, randomIncrement)
 							leftSource := newChunkingBatchSource(typs, lCols, nTuples)
 							rightSource := newChunkingBatchSource(typs, rCols, nTuples)
 
 							a, err := newMergeJoinOp(
 								testAllocator, defaultMemoryLimit,
-								queueCfg, NewTestingSemaphore(mjFDLimit), sqlbase.InnerJoin,
+								queueCfg, colexecbase.NewTestingSemaphore(mjFDLimit), sqlbase.InnerJoin,
 								leftSource, rightSource, typs, typs,
 								[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 								[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
@@ -2060,10 +2062,10 @@ func newBatchOfRepeatedIntRows(nCols int, batch coldata.Batch, numRepeats int) c
 func BenchmarkMergeJoiner(b *testing.B) {
 	ctx := context.Background()
 	nCols := 4
-	sourceTypes := make([]coltypes.T, nCols)
+	sourceTypes := make([]*types.T, nCols)
 
 	for colIdx := 0; colIdx < nCols; colIdx++ {
-		sourceTypes[colIdx] = coltypes.Int64
+		sourceTypes[colIdx] = types.Int
 	}
 
 	batch := testAllocator.NewMemBatch(sourceTypes)
@@ -2080,12 +2082,12 @@ func BenchmarkMergeJoiner(b *testing.B) {
 			b.SetBytes(int64(8 * nBatches * coldata.BatchSize() * nCols * 2))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				leftSource := newFiniteBatchSource(newBatchOfIntRows(nCols, batch), nBatches)
-				rightSource := newFiniteBatchSource(newBatchOfIntRows(nCols, batch), nBatches)
+				leftSource := newFiniteBatchSource(newBatchOfIntRows(nCols, batch), sourceTypes, nBatches)
+				rightSource := newFiniteBatchSource(newBatchOfIntRows(nCols, batch), sourceTypes, nBatches)
 
 				benchMemAccount.Clear(ctx)
 				base, err := newMergeJoinBase(
-					NewAllocator(ctx, &benchMemAccount), defaultMemoryLimit, queueCfg, NewTestingSemaphore(mjFDLimit),
+					colmem.NewAllocator(ctx, &benchMemAccount), defaultMemoryLimit, queueCfg, colexecbase.NewTestingSemaphore(mjFDLimit),
 					sqlbase.InnerJoin, leftSource, rightSource, sourceTypes, sourceTypes,
 					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
@@ -2111,12 +2113,12 @@ func BenchmarkMergeJoiner(b *testing.B) {
 			b.SetBytes(int64(8 * nBatches * coldata.BatchSize() * nCols * 2))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				leftSource := newFiniteBatchSource(newBatchOfRepeatedIntRows(nCols, batch, nBatches), nBatches)
-				rightSource := newFiniteBatchSource(newBatchOfIntRows(nCols, batch), nBatches)
+				leftSource := newFiniteBatchSource(newBatchOfRepeatedIntRows(nCols, batch, nBatches), sourceTypes, nBatches)
+				rightSource := newFiniteBatchSource(newBatchOfIntRows(nCols, batch), sourceTypes, nBatches)
 
 				benchMemAccount.Clear(ctx)
 				base, err := newMergeJoinBase(
-					NewAllocator(ctx, &benchMemAccount), defaultMemoryLimit, queueCfg, NewTestingSemaphore(mjFDLimit),
+					colmem.NewAllocator(ctx, &benchMemAccount), defaultMemoryLimit, queueCfg, colexecbase.NewTestingSemaphore(mjFDLimit),
 					sqlbase.InnerJoin, leftSource, rightSource, sourceTypes, sourceTypes,
 					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
@@ -2144,12 +2146,12 @@ func BenchmarkMergeJoiner(b *testing.B) {
 			b.SetBytes(int64(8 * nBatches * coldata.BatchSize() * nCols * 2))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				leftSource := newFiniteBatchSource(newBatchOfRepeatedIntRows(nCols, batch, numRepeats), nBatches)
-				rightSource := newFiniteBatchSource(newBatchOfRepeatedIntRows(nCols, batch, numRepeats), nBatches)
+				leftSource := newFiniteBatchSource(newBatchOfRepeatedIntRows(nCols, batch, numRepeats), sourceTypes, nBatches)
+				rightSource := newFiniteBatchSource(newBatchOfRepeatedIntRows(nCols, batch, numRepeats), sourceTypes, nBatches)
 
 				benchMemAccount.Clear(ctx)
 				base, err := newMergeJoinBase(
-					NewAllocator(ctx, &benchMemAccount), defaultMemoryLimit, queueCfg, NewTestingSemaphore(mjFDLimit),
+					colmem.NewAllocator(ctx, &benchMemAccount), defaultMemoryLimit, queueCfg, colexecbase.NewTestingSemaphore(mjFDLimit),
 					sqlbase.InnerJoin, leftSource, rightSource, sourceTypes, sourceTypes,
 					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},

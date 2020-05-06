@@ -668,7 +668,7 @@ $(GEOS_DIR)/Makefile: $(C_DEPS_DIR)/geos-rebuild | bin/.submodules-initialized
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/geos-rebuild. See above for rationale.
 	cd $(GEOS_DIR) && \
-	  cmake $(xcmake-flags) $(GEOS_SRC_DIR) -DCMAKE_BUILD_TYPE=Release
+	  cmake $(xcmake-flags) $(GEOS_SRC_DIR) -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-fPIC -DCMAKE_CXX_FLAGS=-fPIC
 	@# Copy geos/export.h to the capi include directory to avoid needing multiple include
 	@# directories.
 	mkdir $(GEOS_DIR)/capi/geos
@@ -840,7 +840,7 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/mergejoiner_leftsemi.eg.go \
   pkg/sql/colexec/mergejoiner_rightouter.eg.go \
   pkg/sql/colexec/min_max_agg.eg.go \
-  pkg/sql/colexec/orderedsynchronizer.eg.go \
+  pkg/sql/colexec/ordered_synchronizer.eg.go \
   pkg/sql/colexec/overloads_test_utils.eg.go \
   pkg/sql/colexec/proj_const_left_ops.eg.go \
   pkg/sql/colexec/proj_const_right_ops.eg.go \
@@ -1020,14 +1020,15 @@ stress stressrace:
 .PHONY: roachprod-stress roachprod-stressrace
 roachprod-stress roachprod-stressrace: bin/roachprod-stress
 	# The bootstrap target creates, among other things, ./bin/stress.
+	@if [ -z "$(CLUSTER)" ]; then \
+		echo "ERROR: missing or empty CLUSTER; create one via:"; \
+		echo "roachprod create \$$USER-stress -n 20 --gce-machine-type=n1-standard-8 --local-ssd=false"; \
+		exit 1; \
+	fi
 	build/builder.sh make bin/.bootstrap
 	build/builder.sh mkrelease amd64-linux-gnu test GOFLAGS="$(GOFLAGS)" TESTFLAGS="-v -c -o $(notdir $(patsubst %/,%,$(PKG))).test" PKG=$(PKG)
-	@if [ -z "$(CLUSTER)" ]; then \
-	  echo "ERROR: missing or empty CLUSTER"; \
-	else \
-	  bin/roachprod-stress $(CLUSTER) $(patsubst github.com/cockroachdb/cockroach/%,./%,$(PKG)) $(STRESSFLAGS) -- \
-	    -test.run "$(TESTS)" $(filter-out -v,$(TESTFLAGS)) -test.v -test.timeout $(TESTTIMEOUT); \
-	fi
+	bin/roachprod-stress $(CLUSTER) $(patsubst github.com/cockroachdb/cockroach/%,./%,$(PKG)) $(STRESSFLAGS) -- \
+	  -test.run "$(TESTS)" $(filter-out -v,$(TESTFLAGS)) -test.v -test.timeout $(TESTTIMEOUT); \
 
 testlogic: testbaselogic testoptlogic testccllogic
 
@@ -1103,7 +1104,7 @@ lint lintshort: TESTTIMEOUT := $(LINTTIMEOUT)
 .PHONY: lint
 lint: override TAGS += lint
 lint: ## Run all style checkers and linters.
-lint: bin/returncheck bin/roachvet
+lint: bin/returncheck bin/roachvet bin/optfmt
 	@if [ -t 1 ]; then echo '$(yellow)NOTE: `make lint` is very slow! Perhaps `make lintshort`?$(term-reset)'; fi
 	@# Run 'go build -i' to ensure we have compiled object files available for all
 	@# packages. In Go 1.10, only 'go vet' recompiles on demand. For details:
@@ -1114,7 +1115,7 @@ lint: bin/returncheck bin/roachvet
 .PHONY: lintshort
 lintshort: override TAGS += lint
 lintshort: ## Run a fast subset of the style checkers and linters.
-lintshort: bin/roachvet
+lintshort: bin/roachvet bin/optfmt
 	$(xgo) test $(GOTESTFLAGS) ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -timeout $(TESTTIMEOUT) -run 'TestLint/$(TESTS)'
 
 .PHONY: protobuf
@@ -1660,6 +1661,7 @@ bins = \
   bin/protoc-gen-gogoroach \
   bin/publish-artifacts \
   bin/publish-provisional-artifacts \
+  bin/optfmt \
   bin/optgen \
   bin/returncheck \
   bin/roachvet \
@@ -1680,6 +1682,7 @@ testbins = \
 # Mappings for binaries that don't live in pkg/cmd.
 execgen-package = ./pkg/sql/colexec/execgen/cmd/execgen
 langgen-package = ./pkg/sql/opt/optgen/cmd/langgen
+optfmt-package = ./pkg/sql/opt/optgen/cmd/optfmt
 optgen-package = ./pkg/sql/opt/optgen/cmd/optgen
 logictest-package = ./pkg/sql/logictest
 logictestccl-package = ./pkg/ccl/logictestccl

@@ -85,6 +85,9 @@ var redactedQueryParams = map[string]struct{}{
 	CredentialsParam:     {},
 }
 
+// ErrListingUnsupported is a marker for indicating listing is unsupported.
+var ErrListingUnsupported = errors.New("listing is not supported")
+
 // ExternalStorageFactory describes a factory function for ExternalStorage.
 type ExternalStorageFactory func(ctx context.Context, dest roachpb.ExternalStorage) (ExternalStorage, error)
 
@@ -395,7 +398,9 @@ func delayedRetry(ctx context.Context, fn func() error) error {
 // happen if we didn't read from the connection too long due to e.g. load),
 // the same as unexpected eof errors.
 func isResumableHTTPError(err error) bool {
-	return errors.Is(err, io.ErrUnexpectedEOF) || sysutil.IsErrConnectionReset(err)
+	return errors.Is(err, io.ErrUnexpectedEOF) ||
+		sysutil.IsErrConnectionReset(err) ||
+		sysutil.IsErrConnectionRefused(err)
 }
 
 // Maximum number of times we can attempt to retry reading from external storage,

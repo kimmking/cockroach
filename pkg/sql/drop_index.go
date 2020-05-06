@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -73,7 +74,7 @@ func (n *dropIndexNode) startExec(params runParams) error {
 	if n.n.Concurrently {
 		params.p.SendClientNotice(
 			params.ctx,
-			pgerror.Noticef("CONCURRENTLY is not required as all indexes are dropped concurrently"),
+			pgnotice.Newf("CONCURRENTLY is not required as all indexes are dropped concurrently"),
 		)
 	}
 
@@ -245,6 +246,14 @@ func (p *planner) dropIndexByName(
 		return nil
 	}
 
+	if idx.Unique && behavior != tree.DropCascade && constraintBehavior != ignoreIdxConstraint && !idx.CreatedExplicitly {
+		return errors.WithHint(
+			pgerror.Newf(pgcode.DependentObjectsStillExist,
+				"index %q is in use as unique constraint", idx.Name),
+			"use CASCADE if you really want to drop it.",
+		)
+	}
+
 	// Check if requires CCL binary for eventual zone config removal.
 	_, zone, _, err := GetZoneConfigInTxn(ctx, p.txn, uint32(tableDesc.ID), nil, "", false)
 	if err != nil {
@@ -254,7 +263,13 @@ func (p *planner) dropIndexByName(
 	for _, s := range zone.Subzones {
 		if s.IndexID != uint32(idx.ID) {
 			_, err = GenerateSubzoneSpans(
-				p.ExecCfg().Settings, p.ExecCfg().ClusterID(), tableDesc.TableDesc(), zone.Subzones, false /* newSubzones */)
+				p.ExecCfg().Settings,
+				p.ExecCfg().ClusterID(),
+				p.ExecCfg().Codec,
+				tableDesc.TableDesc(),
+				zone.Subzones,
+				false, /* newSubzones */
+			)
 			if sqlbase.IsCCLRequiredError(err) {
 				return sqlbase.NewCCLRequiredError(fmt.Errorf("schema change requires a CCL binary "+
 					"because table %q has at least one remaining index or partition with a zone config",
@@ -390,10 +405,6 @@ func (p *planner) dropIndexByName(
 		}
 	}
 
-	if idx.Unique && behavior != tree.DropCascade && constraintBehavior != ignoreIdxConstraint && !idx.CreatedExplicitly {
-		return errors.Errorf("index %q is in use as unique constraint (use CASCADE if you really want to drop it)", idx.Name)
-	}
-
 	var droppedViews []string
 	for _, tableRef := range tableDesc.DependedOnBy {
 		if tableRef.IndexID == idx.ID {
@@ -409,7 +420,9 @@ func (p *planner) dropIndexByName(
 			if err != nil {
 				return err
 			}
-			cascadedViews, err := p.removeDependentView(ctx, tableDesc, viewDesc)
+			viewJobDesc := fmt.Sprintf("removing view %q dependent on index %q which is being dropped",
+				viewDesc.Name, idx.Name)
+			cascadedViews, err := p.removeDependentView(ctx, tableDesc, viewDesc, viewJobDesc)
 			if err != nil {
 				return err
 			}
@@ -427,7 +440,7 @@ func (p *planner) dropIndexByName(
 		if idxEntry.ID == idx.ID {
 			// Unsplit all manually split ranges in the index so they can be
 			// automatically merged by the merge queue.
-			span := tableDesc.IndexSpan(idxEntry.ID)
+			span := tableDesc.IndexSpan(p.ExecCfg().Codec, idxEntry.ID)
 			ranges, err := ScanMetaKVs(ctx, p.txn, span)
 			if err != nil {
 				return err
@@ -470,17 +483,20 @@ func (p *planner) dropIndexByName(
 		return err
 	}
 
-	if err := tableDesc.Validate(ctx, p.txn); err != nil {
+	if err := tableDesc.Validate(ctx, p.txn, p.ExecCfg().Codec); err != nil {
 		return err
 	}
 	mutationID := tableDesc.ClusterVersion.NextMutationID
 	if err := p.writeSchemaChange(ctx, tableDesc, mutationID, jobDesc); err != nil {
 		return err
 	}
-	p.SendClientNotice(ctx,
+	p.SendClientNotice(
+		ctx,
 		errors.WithHint(
-			pgerror.Noticef("the data for dropped indexes is reclaimed asynchronously"),
-			"The reclamation delay can be customized in the zone configuration for the table."))
+			pgnotice.Newf("the data for dropped indexes is reclaimed asynchronously"),
+			"The reclamation delay can be customized in the zone configuration for the table.",
+		),
+	)
 	// Record index drop in the event log. This is an auditable log event
 	// and is recorded in the same transaction as the table descriptor
 	// update.
@@ -489,7 +505,7 @@ func (p *planner) dropIndexByName(
 		p.txn,
 		EventLogDropIndex,
 		int32(tableDesc.ID),
-		int32(p.extendedEvalCtx.NodeID),
+		int32(p.extendedEvalCtx.NodeID.SQLInstanceID()),
 		struct {
 			TableName           string
 			IndexName           string

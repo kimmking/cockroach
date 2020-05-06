@@ -780,21 +780,50 @@ func (tc *TxnCoordSender) updateStateLocked(
 		return roachpb.NewError(tc.handleRetryableErrLocked(ctx, pErr))
 	}
 
-	// This is the non-retriable error case. The client is expected to send a
-	// rollback.
-	if errTxn := pErr.GetTxn(); errTxn != nil {
+	// This is the non-retriable error case.
+
+	// Most errors cause the transaction to not accept further requests (except a
+	// rollback), but some errors are safe to allow continuing (in particular
+	// ConditionFailedError). In particular, SQL can recover by rolling back to a
+	// savepoint.
+	if roachpb.ErrPriority(pErr.GetDetail()) != roachpb.ErrorScoreUnambiguousError {
 		tc.mu.txnState = txnError
 		tc.mu.storedErr = roachpb.NewError(&roachpb.TxnAlreadyEncounteredErrorError{
 			PrevError: pErr.String(),
 		})
-		tc.mu.txn.Update(errTxn)
-		if errTxn.Status != roachpb.PENDING {
-			// We only expect TransactionAbortedError to carry an aborted txn.
-			log.Errorf(ctx, "programming error: ABORTED txn in error: %s. txn: %s", pErr, errTxn)
-			tc.cleanupTxnLocked(ctx)
+	}
+
+	// Update our transaction with any information the error has.
+	if errTxn := pErr.GetTxn(); errTxn != nil {
+		if errTxn.Status == roachpb.COMMITTED {
+			sanityCheckCommittedErr(ctx, pErr, ba)
 		}
+		tc.mu.txn.Update(errTxn)
 	}
 	return pErr
+}
+
+// sanityCheckCommittedErr verifies the circumstances in which we're receiving
+// an error indicating a COMMITTED transaction. Only rollbacks should be
+// encountering such errors. Marking a transaction as explicitly-committed can
+// also encounter these errors, but those errors don't make it to the
+// TxnCoordSender.
+func sanityCheckCommittedErr(ctx context.Context, pErr *roachpb.Error, ba roachpb.BatchRequest) {
+	errTxn := pErr.GetTxn()
+	if errTxn == nil || errTxn.Status != roachpb.COMMITTED {
+		// We shouldn't have been called.
+		return
+	}
+	// The only case in which an error can have a COMMITTED transaction in it is
+	// when the request was a rollback. Rollbacks can race with commits if a
+	// context timeout expires while a commit request is in flight.
+	if ba.IsSingleAbortTxnRequest() {
+		return
+	}
+	// Finding out about our transaction being committed indicates a serious bug.
+	// Requests are not supposed to be sent on transactions after they are
+	// committed.
+	log.Fatalf(ctx, "transaction unexpectedly committed: %s. ba: %s. txn: %s.", pErr, ba, errTxn)
 }
 
 // setTxnAnchorKey sets the key at which to anchor the transaction record. The

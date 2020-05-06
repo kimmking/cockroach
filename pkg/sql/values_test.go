@@ -30,16 +30,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func makeTestPlanner() *planner {
 	// Initialize an Executorconfig sufficiently for the purposes of creating a
 	// planner.
-	var nodeID base.NodeIDContainer
-	nodeID.Set(context.TODO(), 1)
 	execCfg := ExecutorConfig{
 		NodeInfo: NodeInfo{
-			NodeID: &nodeID,
+			NodeID: base.TestingIDContainer,
 			ClusterID: func() uuid.UUID {
 				return uuid.MakeV4()
 			},
@@ -236,9 +235,10 @@ func TestGolangQueryArgs(t *testing.T) {
 	}
 
 	for i, tcase := range testCases {
-		datums := golangFillQueryArguments(tcase.value)
+		datums, err := golangFillQueryArguments(tcase.value)
+		require.NoError(t, err)
 		if len(datums) != 1 {
-			t.Fatalf("epected 1 datum, got: %d", len(datums))
+			t.Fatalf("expected 1 datum, got: %d", len(datums))
 		}
 		d := datums[0]
 		if a, e := reflect.TypeOf(d.ResolvedType()), tcase.expectedType; a != e {

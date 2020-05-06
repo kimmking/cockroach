@@ -27,16 +27,21 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	// {{/*
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	// */}}
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/pkg/errors"
+)
+
+// Remove unused warnings.
+var (
+	_ = execgen.UNSAFEGET
+	_ = colexecerror.InternalError
 )
 
 // {{/*
@@ -53,22 +58,25 @@ var _ time.Time
 // Dummy import to pull in "duration" package.
 var _ duration.Duration
 
-// Dummy import to pull in "coltypes" package
-var _ coltypes.T
-
 // Dummy import to pull in "bytes" package
 var _ bytes.Buffer
 
 // Dummy import to pull in "math" package.
 var _ = math.MaxInt64
 
+// _CANONICAL_TYPE_FAMILY is the template variable.
+const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _TYPE_WIDTH is the template variable.
+const _TYPE_WIDTH = 0
+
 func _ASSIGN_EQ(_, _, _ interface{}) int {
-	execerror.VectorizedInternalPanic("")
+	colexecerror.InternalError("")
 }
 
 // */}}
 
-// Enum used to represent comparison results
+// Enum used to represent comparison results.
 type comparisonResult int
 
 const (
@@ -78,60 +86,70 @@ const (
 )
 
 func GetInProjectionOperator(
-	allocator *Allocator,
-	ct *types.T,
-	input Operator,
+	allocator *colmem.Allocator,
+	t *types.T,
+	input colexecbase.Operator,
 	colIdx int,
 	resultIdx int,
 	datumTuple *tree.DTuple,
 	negate bool,
-) (Operator, error) {
+) (colexecbase.Operator, error) {
+	input = newVectorTypeEnforcer(allocator, input, types.Bool, resultIdx)
 	var err error
-	switch t := typeconv.FromColumnType(ct); t {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
 	// {{range .}}
-	case coltypes._TYPE:
-		obj := &projectInOp_TYPE{
-			OneInputNode: NewOneInputNode(input),
-			allocator:    allocator,
-			colIdx:       colIdx,
-			outputIdx:    resultIdx,
-			negate:       negate,
+	case _CANONICAL_TYPE_FAMILY:
+		switch t.Width() {
+		// {{range .WidthOverloads}}
+		case _TYPE_WIDTH:
+			obj := &projectInOp_TYPE{
+				OneInputNode: NewOneInputNode(input),
+				allocator:    allocator,
+				colIdx:       colIdx,
+				outputIdx:    resultIdx,
+				negate:       negate,
+			}
+			obj.filterRow, obj.hasNulls, err = fillDatumRow_TYPE(t, datumTuple)
+			if err != nil {
+				return nil, err
+			}
+			return obj, nil
+			// {{end}}
 		}
-		obj.filterRow, obj.hasNulls, err = fillDatumRow_TYPE(ct, datumTuple)
-		if err != nil {
-			return nil, err
-		}
-		return obj, nil
-	// {{end}}
-	default:
-		return nil, errors.Errorf("unhandled type: %s", t)
+		// {{end}}
 	}
+	return nil, errors.Errorf("unhandled type: %s", t.Name())
 }
 
 func GetInOperator(
-	ct *types.T, input Operator, colIdx int, datumTuple *tree.DTuple, negate bool,
-) (Operator, error) {
+	t *types.T, input colexecbase.Operator, colIdx int, datumTuple *tree.DTuple, negate bool,
+) (colexecbase.Operator, error) {
 	var err error
-	switch t := typeconv.FromColumnType(ct); t {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily[t.Family()] {
 	// {{range .}}
-	case coltypes._TYPE:
-		obj := &selectInOp_TYPE{
-			OneInputNode: NewOneInputNode(input),
-			colIdx:       colIdx,
-			negate:       negate,
+	case _CANONICAL_TYPE_FAMILY:
+		switch t.Width() {
+		// {{range .WidthOverloads}}
+		case _TYPE_WIDTH:
+			obj := &selectInOp_TYPE{
+				OneInputNode: NewOneInputNode(input),
+				colIdx:       colIdx,
+				negate:       negate,
+			}
+			obj.filterRow, obj.hasNulls, err = fillDatumRow_TYPE(t, datumTuple)
+			if err != nil {
+				return nil, err
+			}
+			return obj, nil
+			// {{end}}
 		}
-		obj.filterRow, obj.hasNulls, err = fillDatumRow_TYPE(ct, datumTuple)
-		if err != nil {
-			return nil, err
-		}
-		return obj, nil
-	// {{end}}
-	default:
-		return nil, errors.Errorf("unhandled type: %s", t)
+		// {{end}}
 	}
+	return nil, errors.Errorf("unhandled type: %s", t.Name())
 }
 
 // {{range .}}
+// {{range .WidthOverloads}}
 
 type selectInOp_TYPE struct {
 	OneInputNode
@@ -141,9 +159,11 @@ type selectInOp_TYPE struct {
 	negate    bool
 }
 
+var _ colexecbase.Operator = &selectInOp_TYPE{}
+
 type projectInOp_TYPE struct {
 	OneInputNode
-	allocator *Allocator
+	allocator *colmem.Allocator
 	colIdx    int
 	outputIdx int
 	filterRow []_GOTYPE
@@ -151,10 +171,10 @@ type projectInOp_TYPE struct {
 	negate    bool
 }
 
-var _ Operator = &projectInOp_TYPE{}
+var _ colexecbase.Operator = &projectInOp_TYPE{}
 
-func fillDatumRow_TYPE(ct *types.T, datumTuple *tree.DTuple) ([]_GOTYPE, bool, error) {
-	conv := typeconv.GetDatumToPhysicalFn(ct)
+func fillDatumRow_TYPE(t *types.T, datumTuple *tree.DTuple) ([]_GOTYPE, bool, error) {
+	conv := getDatumToPhysicalFn(t)
 	var result []_GOTYPE
 	hasNulls := false
 	for _, d := range datumTuple.D {
@@ -203,7 +223,7 @@ func (si *selectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 		}
 
 		vec := batch.ColVec(si.colIdx)
-		col := vec._TemplateType()
+		col := vec.TemplateType()
 		var idx int
 		n := batch.Length()
 
@@ -271,14 +291,18 @@ func (pi *projectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 	if batch.Length() == 0 {
 		return coldata.ZeroBatch
 	}
-	pi.allocator.MaybeAddColumn(batch, coltypes.Bool, pi.outputIdx)
 
 	vec := batch.ColVec(pi.colIdx)
-	col := vec._TemplateType()
+	col := vec.TemplateType()
 
 	projVec := batch.ColVec(pi.outputIdx)
 	projCol := projVec.Bool()
 	projNulls := projVec.Nulls()
+	if projVec.MaybeHasNulls() {
+		// We need to make sure that there are no left over null values in the
+		// output vector.
+		projNulls.UnsetNulls()
+	}
 
 	n := batch.Length()
 
@@ -348,4 +372,5 @@ func (pi *projectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 	return batch
 }
 
+// {{end}}
 // {{end}}

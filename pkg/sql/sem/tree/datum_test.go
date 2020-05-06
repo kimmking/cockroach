@@ -97,17 +97,18 @@ func TestDatumOrdering(t *testing.T) {
 		{`'0001-01-01':::date`, `'0001-12-31 BC'`, `'0001-01-02'`, `'-infinity'`, `'infinity'`},
 		{`'4000-01-01 BC':::date`, `'4001-12-31 BC'`, `'4000-01-02 BC'`, `'-infinity'`, `'infinity'`},
 		{`'2006-01-02 03:04:05.123123':::timestamp`,
-			`'2006-01-02 03:04:05.123122+00:00'`, `'2006-01-02 03:04:05.123124+00:00'`, noMin, noMax},
+			`'2006-01-02 03:04:05.123122+00:00'`, `'2006-01-02 03:04:05.123124+00:00'`, `'-4713-11-24 00:00:00+00:00'`, `'294276-12-31 23:59:59.999999+00:00'`},
+
+		// Geospatial types
+		{`'POINT(1.0 1.0)'::geometry`, noPrev, noNext, noMin, noMax},
+		{`'POINT(1.0 1.0)'::geography`, noPrev, noNext, noMin, noMax},
 
 		// Times
 		{`'00:00:00':::time`, valIsMin, `'00:00:00.000001'`,
-			`'00:00:00'`, `'23:59:59.999999'`},
+			`'00:00:00'`, `'24:00:00'`},
 		{`'12:00:00':::time`, `'11:59:59.999999'`, `'12:00:00.000001'`,
-			`'00:00:00'`, `'23:59:59.999999'`},
-		{`'23:59:59.999999':::time`, `'23:59:59.999998'`, valIsMax,
-			`'00:00:00'`, `'23:59:59.999999'`},
-		{`'24:00':::time`, `'23:59:59.999999'`, `'00:00:00.000001'`,
-			`'00:00:00'`, `'23:59:59.999999'`},
+			`'00:00:00'`, `'24:00:00'`},
+		{`'24:00:00':::time`, `'23:59:59.999999'`, valIsMax, `'00:00:00'`, `'24:00:00'`},
 
 		// Intervals
 		{`'1 day':::interval`, noPrev, noNext,
@@ -904,9 +905,9 @@ func TestNewDefaultDatum(t *testing.T) {
 		{t: types.Time, expected: "'00:00:00':::TIME"},
 		{t: types.Jsonb, expected: "'null':::JSONB"},
 		{t: types.TimeTZ, expected: "'00:00:00+00:00:00':::TIMETZ"},
-		{t: types.MakeTuple([]types.T{}), expected: "()"},
-		{t: types.MakeTuple([]types.T{*types.Int, *types.MakeChar(1)}), expected: "(0:::INT8, '':::STRING)"},
-		{t: types.MakeTuple([]types.T{*types.OidVector, *types.MakeTuple([]types.T{*types.Float})}), expected: "(ARRAY[]:::OID[], (0.0:::FLOAT8,))"},
+		{t: types.MakeTuple([]*types.T{}), expected: "()"},
+		{t: types.MakeTuple([]*types.T{types.Int, types.MakeChar(1)}), expected: "(0:::INT8, '':::STRING)"},
+		{t: types.MakeTuple([]*types.T{types.OidVector, types.MakeTuple([]*types.T{types.Float})}), expected: "(ARRAY[]:::OID[], (0.0:::FLOAT8,))"},
 		{t: types.VarBit, expected: "B''"},
 		{t: types.MakeBit(5), expected: "B''"},
 	}

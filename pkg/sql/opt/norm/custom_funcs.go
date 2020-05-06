@@ -11,6 +11,7 @@
 package norm
 
 import (
+	"fmt"
 	"math"
 	"sort"
 
@@ -113,9 +114,9 @@ func (c *CustomFuncs) ConstructSortedUniqueList(
 	newList = newList[:n]
 
 	// Construct the type of the tuple.
-	contents := make([]types.T, n)
+	contents := make([]*types.T, n)
 	for i := range newList {
-		contents[i] = *newList[i].DataType()
+		contents[i] = newList[i].DataType()
 	}
 	return newList, types.MakeTuple(contents)
 }
@@ -168,6 +169,11 @@ func (c *CustomFuncs) ArrayType(inCol opt.ColumnID) *types.T {
 func (c *CustomFuncs) BinaryType(op opt.Operator, left, right opt.ScalarExpr) *types.T {
 	o, _ := memo.FindBinaryOverload(op, left.DataType(), right.DataType())
 	return o.ReturnType
+}
+
+// TypeOf returns the type of the expression.
+func (c *CustomFuncs) TypeOf(e opt.ScalarExpr) *types.T {
+	return e.DataType()
 }
 
 // ----------------------------------------------------------------------
@@ -273,6 +279,11 @@ func (c *CustomFuncs) IsCorrelated(src, dst memo.RelExpr) bool {
 // HasNoCols returns true if the input expression has zero output columns.
 func (c *CustomFuncs) HasNoCols(input memo.RelExpr) bool {
 	return input.Relational().OutputCols.Empty()
+}
+
+// HasOneCol returns true if the input expression has exactly one output column.
+func (c *CustomFuncs) HasOneCol(input memo.RelExpr) bool {
+	return input.Relational().OutputCols.Len() == 1
 }
 
 // HasZeroRows returns true if the input expression never returns any rows.
@@ -382,6 +393,12 @@ func (c *CustomFuncs) AddColToSet(set opt.ColSet, col opt.ColumnID) opt.ColSet {
 	return newSet
 }
 
+// SingleColFromSet returns the single column in s. Panics if s does not contain
+// exactly one column.
+func (c *CustomFuncs) SingleColFromSet(s opt.ColSet) opt.ColumnID {
+	return s.SingleColumn()
+}
+
 // sharedProps returns the shared logical properties for the given expression.
 // Only relational expressions and certain scalar list items (e.g. FiltersItem,
 // ProjectionsItem, AggregationsItem) have shared properties.
@@ -391,8 +408,11 @@ func (c *CustomFuncs) sharedProps(e opt.Expr) *props.Shared {
 		return &t.Relational().Shared
 	case memo.ScalarPropsExpr:
 		return &t.ScalarProps().Shared
+	default:
+		var p props.Shared
+		memo.BuildSharedProps(e, &p)
+		return &p
 	}
-	panic(errors.AssertionFailedf("no logical properties available for node: %v", e))
 }
 
 // MutationTable returns the table upon which the mutation is applied.
@@ -1058,7 +1078,7 @@ func (c *CustomFuncs) MergeProjectWithValues(
 	projections memo.ProjectionsExpr, passthrough opt.ColSet, input memo.RelExpr,
 ) memo.RelExpr {
 	newExprs := make(memo.ScalarListExpr, 0, len(projections)+passthrough.Len())
-	newTypes := make([]types.T, 0, len(newExprs))
+	newTypes := make([]*types.T, 0, len(newExprs))
 	newCols := make(opt.ColList, 0, len(newExprs))
 
 	values := input.(*memo.ValuesExpr)
@@ -1066,7 +1086,7 @@ func (c *CustomFuncs) MergeProjectWithValues(
 	for i, colID := range values.Cols {
 		if passthrough.Contains(colID) {
 			newExprs = append(newExprs, tuple.Elems[i])
-			newTypes = append(newTypes, *tuple.Elems[i].DataType())
+			newTypes = append(newTypes, tuple.Elems[i].DataType())
 			newCols = append(newCols, colID)
 		}
 	}
@@ -1074,7 +1094,7 @@ func (c *CustomFuncs) MergeProjectWithValues(
 	for i := range projections {
 		item := &projections[i]
 		newExprs = append(newExprs, item.Element)
-		newTypes = append(newTypes, *item.Element.DataType())
+		newTypes = append(newTypes, item.Element.DataType())
 		newCols = append(newCols, item.Col)
 	}
 
@@ -1134,6 +1154,312 @@ func (c *CustomFuncs) ProjectExtraCol(
 	return c.f.ConstructProject(in, projections, in.Relational().OutputCols)
 }
 
+// CanUnnestTuplesFromValues returns true if the Values operator has a single
+// column containing tuples that can be unfolded into multiple columns.
+//
+// This is the case if:
+//
+// 	1. The Values operator has exactly one output column.
+//
+// 	2. The single output column is of type tuple.
+//
+// 	3. There is at least one row.
+//
+// 	4. All tuples in the single column are either TupleExpr's or ConstExpr's
+//     that wrap DTuples, as opposed to dynamically generated tuples.
+//
+func (c *CustomFuncs) CanUnnestTuplesFromValues(expr memo.RelExpr) bool {
+	values := expr.(*memo.ValuesExpr)
+	if !c.HasOneCol(expr) {
+		return false
+	}
+	colTypeFam := c.mem.Metadata().ColumnMeta(values.Cols[0]).Type.Family()
+	if colTypeFam != types.TupleFamily {
+		return false
+	}
+	if len(values.Rows) < 1 {
+		return false
+	}
+	for _, row := range values.Rows {
+		if !c.IsStaticTuple(row.(*memo.TupleExpr).Elems[0]) {
+			return false
+		}
+	}
+	return true
+}
+
+// OnlyTupleColumnsAccessed ensures that the input ProjectionsExpr contains no
+// direct references to the tuple represented by the given ColumnID.
+func (c *CustomFuncs) OnlyTupleColumnsAccessed(
+	projections memo.ProjectionsExpr, tupleCol opt.ColumnID,
+) bool {
+	var check func(expr opt.Expr) bool
+	check = func(expr opt.Expr) bool {
+		switch t := expr.(type) {
+		case *memo.ColumnAccessExpr:
+			switch t.Input.(type) {
+			case *memo.VariableExpr:
+				return true
+			}
+
+		case *memo.VariableExpr:
+			return t.Col != tupleCol
+		}
+		for i, n := 0, expr.ChildCount(); i < n; i++ {
+			if !check(expr.Child(i)) {
+				return false
+			}
+		}
+		return true
+	}
+
+	for i := range projections {
+		if !check(projections[i].Element) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// MakeColsForUnnestTuples takes in the ColumnID of a tuple column and adds new
+// columns to metadata corresponding to each field in the tuple. A ColList
+// containing these new columns is returned.
+func (c *CustomFuncs) MakeColsForUnnestTuples(tupleColID opt.ColumnID) opt.ColList {
+	mem := c.mem.Metadata()
+	tupleType := c.mem.Metadata().ColumnMeta(tupleColID).Type
+
+	// Create a new column for each position in the tuple. Add it to outColIDs.
+	tupleLen := len(tupleType.TupleContents())
+	tupleAlias := mem.ColumnMeta(tupleColID).Alias
+	outColIDs := make(opt.ColList, tupleLen)
+	for i := 0; i < tupleLen; i++ {
+		newAlias := fmt.Sprintf("%s_%d", tupleAlias, i+1)
+		newColID := mem.AddColumn(newAlias, tupleType.TupleContents()[i])
+		outColIDs[i] = newColID
+	}
+	return outColIDs
+}
+
+// UnnestTuplesFromValues takes in a Values operator that has a single column
+// of tuples and a ColList corresponding to each tuple field. It returns a new
+// Values operator with the tuple expanded out into the Values rows.
+// For example, these rows:
+//
+//   ((1, 2),)
+//   ((3, 4),)
+//
+// would be unnested as:
+//
+//   (1, 2)
+//   (3, 4)
+//
+func (c *CustomFuncs) UnnestTuplesFromValues(
+	expr memo.RelExpr, valuesCols opt.ColList,
+) memo.RelExpr {
+	values := expr.(*memo.ValuesExpr)
+	tupleColID := values.Cols[0]
+	tupleType := c.mem.Metadata().ColumnMeta(tupleColID).Type
+	outTuples := make(memo.ScalarListExpr, len(values.Rows))
+
+	// Pull the inner tuples out of the single column of the Values operator and
+	// put them into a ScalarListExpr to be used in the new Values operator.
+	for i, row := range values.Rows {
+		outerTuple := row.(*memo.TupleExpr)
+		switch t := outerTuple.Elems[0].(type) {
+		case *memo.TupleExpr:
+			outTuples[i] = t
+
+		case *memo.ConstExpr:
+			dTuple := t.Value.(*tree.DTuple)
+			tupleVals := make(memo.ScalarListExpr, len(dTuple.D))
+			for i, v := range dTuple.D {
+				val := c.f.ConstructConstVal(v, tupleType.TupleContents()[i])
+				tupleVals[i] = val
+			}
+			outTuples[i] = c.f.ConstructTuple(tupleVals, tupleType)
+
+		default:
+			panic(errors.AssertionFailedf("unhandled input op: %T", t))
+		}
+	}
+
+	// Return new ValuesExpr with new tuples.
+	valuesPrivate := &memo.ValuesPrivate{Cols: valuesCols, ID: c.mem.Metadata().NextUniqueID()}
+	return c.f.ConstructValues(outTuples, valuesPrivate)
+}
+
+// FoldTupleColumnAccess constructs a new ProjectionsExpr from the old one with
+// any ColumnAccess operators that refer to the original tuple column (oldColID)
+// replaced by new columns from the output of the given ValuesExpr.
+func (c *CustomFuncs) FoldTupleColumnAccess(
+	projections memo.ProjectionsExpr, valuesCols opt.ColList, oldColID opt.ColumnID,
+) memo.ProjectionsExpr {
+	newProjections := make(memo.ProjectionsExpr, len(projections))
+
+	// Recursively traverses a ProjectionsItem element and replaces references to
+	// positions in the tuple rows with one of the newly constructed columns.
+	var replace ReplaceFunc
+	replace = func(nd opt.Expr) opt.Expr {
+		if colAccess, ok := nd.(*memo.ColumnAccessExpr); ok {
+			if variable, ok := colAccess.Input.(*memo.VariableExpr); ok {
+				// Skip past references to columns other than the input tuple column.
+				if variable.Col == oldColID {
+					return c.f.ConstructVariable(valuesCols[int(colAccess.Idx)])
+				}
+			}
+		}
+		return c.f.Replace(nd, replace)
+	}
+
+	// Construct and return a new ProjectionsExpr using the new ColumnIDs.
+	for i := range projections {
+		projection := &projections[i]
+		newProjections[i] = c.f.ConstructProjectionsItem(
+			replace(projection.Element).(opt.ScalarExpr), projection.Col)
+	}
+	return newProjections
+}
+
+// CanPushColumnRemappingIntoValues returns true if there is at least one
+// ProjectionsItem for which the following conditions hold:
+//
+// 1. The ProjectionsItem remaps an output column from the given ValuesExpr.
+//
+// 2. The Values output column being remapped is not in the passthrough set.
+//
+func (c *CustomFuncs) CanPushColumnRemappingIntoValues(
+	projections memo.ProjectionsExpr, passthrough opt.ColSet, values memo.RelExpr,
+) bool {
+	outputCols := values.(*memo.ValuesExpr).Relational().OutputCols
+	for i := range projections {
+		if variable, ok := projections[i].Element.(*memo.VariableExpr); ok {
+			if !passthrough.Contains(variable.Col) && outputCols.Contains(variable.Col) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// PushColumnRemappingIntoValues folds ProjectionsItems into the passthrough set
+// if all they do is remap output columns from the ValuesExpr input. The Values
+// output columns are replaced by the corresponding columns from the folded
+// ProjectionsItems.
+//
+// Example:
+// project
+//  ├── columns: x:2!null
+//  ├── values
+//  │    ├── columns: column1:1!null
+//  │    ├── cardinality: [2 - 2]
+//  │    ├── (1,)
+//  │    └── (2,)
+//  └── projections
+//       └── column1:1 [as=x:2, outer=(1)]
+// =>
+// project
+//  ├── columns: x:2!null
+//  └── values
+//       ├── columns: x:2!null
+//       ├── cardinality: [2 - 2]
+//       ├── (1,)
+//       └── (2,)
+//
+// This allows other rules to fire. In the above example, EliminateProject can
+// now remove the Project altogether.
+func (c *CustomFuncs) PushColumnRemappingIntoValues(
+	oldInput memo.RelExpr, oldProjections memo.ProjectionsExpr, oldPassthrough opt.ColSet,
+) memo.RelExpr {
+	oldValues := oldInput.(*memo.ValuesExpr)
+	oldValuesCols := oldValues.Relational().OutputCols
+	newPassthrough := oldPassthrough.Copy()
+	replacementCols := make(map[opt.ColumnID]opt.ColumnID)
+	var newProjections memo.ProjectionsExpr
+
+	// Construct the new ProjectionsExpr and passthrough columns. Keep track of
+	// which Values columns are to be replaced.
+	for i := range oldProjections {
+		oldItem := &oldProjections[i]
+
+		// A column can be replaced if the following conditions hold:
+		// 1. The current ProjectionsItem contains a VariableExpr.
+		// 2. The VariableExpr references a column from the ValuesExpr.
+		// 3. The column has not already been assigned a replacement.
+		// 4. The column is not a passthrough column.
+		if v, ok := oldItem.Element.(*memo.VariableExpr); ok {
+			if targetCol := v.Col; oldValuesCols.Contains(targetCol) {
+				if replacementCols[targetCol] == 0 {
+					if !newPassthrough.Contains(targetCol) {
+						// The conditions for column replacement have been met. Map the old
+						// Values output column to its replacement and add the replacement
+						// to newPassthrough so it will become a passthrough column.
+						// Continue so that no corresponding ProjectionsItem is added to
+						// newProjections.
+						replacementCols[targetCol] = oldItem.Col
+						newPassthrough.Add(oldItem.Col)
+						continue
+					}
+				}
+			}
+		}
+		// The current ProjectionsItem cannot be folded into newPassthrough because
+		// the above conditions do not hold. Simply add it to newProjections. Later,
+		// every ProjectionsItem will be recursively traversed and any references to
+		// columns that are in replacementCols will be replaced.
+		newProjections = append(newProjections, *oldItem)
+	}
+
+	// Recursively traverses a ProjectionsItem element and replaces references to
+	// old ValuesExpr columns with the replacement columns. This ensures that any
+	// remaining references to old columns are replaced. For example:
+	//
+	//   WITH t AS (SELECT x, x FROM (VALUES (1)) f(x)) SELECT * FROM t;
+	//
+	// The "x" column of the Values operator will be mapped to the first column of
+	// t. This first column will become a passthrough column. Now, the remaining
+	// reference to "x" in the second column of t needs to be replaced by the new
+	// passthrough column.
+	var replace ReplaceFunc
+	replace = func(nd opt.Expr) opt.Expr {
+		switch t := nd.(type) {
+		case *memo.VariableExpr:
+			if replaceCol := replacementCols[t.Col]; replaceCol != 0 {
+				return c.f.ConstructVariable(replaceCol)
+			}
+		}
+		return c.f.Replace(nd, replace)
+	}
+
+	// Traverse each element in newProjections and replace col references as
+	// dictated by replacementCols.
+	for i := range newProjections {
+		item := &newProjections[i]
+		newProjections[i] = c.f.ConstructProjectionsItem(
+			replace(item.Element).(opt.ScalarExpr), item.Col)
+	}
+
+	// Replace all columns in newValuesColList that have been remapped by the old
+	// ProjectionsExpr.
+	oldValuesColList := oldValues.Cols
+	newValuesColList := make(opt.ColList, len(oldValuesColList))
+	for i := range newValuesColList {
+		if replaceCol := replacementCols[oldValuesColList[i]]; replaceCol != 0 {
+			newValuesColList[i] = replaceCol
+		} else {
+			newValuesColList[i] = oldValuesColList[i]
+		}
+	}
+
+	// Construct a new ValuesExpr with the replaced cols.
+	newValues := c.f.ConstructValues(
+		oldValues.Rows,
+		&memo.ValuesPrivate{Cols: newValuesColList, ID: c.f.Metadata().NextUniqueID()})
+
+	// Construct and return a new ProjectExpr with the new ValuesExpr as input.
+	return c.f.ConstructProject(newValues, newProjections, newPassthrough)
+}
+
 // ----------------------------------------------------------------------
 //
 // Select Rules
@@ -1178,6 +1504,19 @@ func (c *CustomFuncs) SimplifyFilters(filters memo.FiltersExpr) memo.FiltersExpr
 	return newFilters
 }
 
+// IsUnsimplifiableOr returns true if this is an OR where neither side is
+// NULL. SimplifyFilters simplifies ORs with a NULL on one side to its other
+// side. However other ORs don't simplify. This function is used to prevent
+// infinite recursion during ConstructFilterItem in SimplifyFilters. This
+// function must be kept in sync with SimplifyFilters.
+func (c *CustomFuncs) IsUnsimplifiableOr(item *memo.FiltersItem) bool {
+	or, ok := item.Condition.(*memo.OrExpr)
+	if !ok {
+		return false
+	}
+	return or.Left.Op() != opt.NullOp && or.Right.Op() != opt.NullOp
+}
+
 // addConjuncts recursively walks a scalar expression as long as it continues to
 // find nested And operators. It adds any conjuncts (ignoring True operators) to
 // the given FiltersExpr and returns true. If it finds a False or Null operator,
@@ -1200,6 +1539,16 @@ func (c *CustomFuncs) addConjuncts(
 
 	case *memo.TrueExpr:
 		// Filters operator skips True operands.
+
+	case *memo.OrExpr:
+		// If NULL is on either side, take the other side.
+		if t.Left.Op() == opt.NullOp {
+			filters = append(filters, c.f.ConstructFiltersItem(t.Right))
+		} else if t.Right.Op() == opt.NullOp {
+			filters = append(filters, c.f.ConstructFiltersItem(t.Left))
+		} else {
+			filters = append(filters, c.f.ConstructFiltersItem(t))
+		}
 
 	default:
 		filters = append(filters, c.f.ConstructFiltersItem(t))
@@ -1286,6 +1635,11 @@ func (c *CustomFuncs) GroupingCols(grouping *memo.GroupingPrivate) opt.ColSet {
 	return grouping.GroupingCols
 }
 
+// ExtractAggInputColumns returns the set of columns the aggregate depends on.
+func (c *CustomFuncs) ExtractAggInputColumns(e opt.ScalarExpr) opt.ColSet {
+	return memo.ExtractAggInputColumns(e)
+}
+
 // IsUnorderedGrouping returns true if the given grouping ordering is not
 // specified.
 func (c *CustomFuncs) IsUnorderedGrouping(grouping *memo.GroupingPrivate) bool {
@@ -1348,6 +1702,91 @@ func (c *CustomFuncs) ZipOuterCols(zip memo.ZipExpr) opt.ColSet {
 	return colSet
 }
 
+// CanConstructValuesFromZips takes in an input ZipExpr and returns true if the
+// ProjectSet to which the zip belongs can be converted to an InnerJoinApply
+// with a Values operator on the right input.
+func (c *CustomFuncs) CanConstructValuesFromZips(zip memo.ZipExpr) bool {
+	for _, zipItem := range zip {
+		fn, ok := zipItem.Fn.(*memo.FunctionExpr)
+		if !ok || fn.Name != "unnest" {
+			// Not an unnest function.
+			return false
+		}
+		if len(fn.Args) != 1 {
+			// Unnest has more than one argument.
+			return false
+		}
+		if !c.IsStaticArray(fn.Args[0]) {
+			// Unnest argument is not an ArrayExpr or ConstExpr wrapping a DArray.
+			return false
+		}
+	}
+	return true
+}
+
+// ConstructValuesFromZips constructs a Values operator with the elements from
+// the given ArrayExpr(s) (or ConstExpr(s) that wrap a DArray) in the given
+// ZipExpr.
+//
+// The functions contained in the ZipExpr must be unnest functions with a single
+// parameter each. The parameters of the unnest functions must be either
+// ArrayExpr's or ConstExpr's wrapping DArrays.
+func (c *CustomFuncs) ConstructValuesFromZips(zip memo.ZipExpr) memo.RelExpr {
+	numCols := len(zip)
+	outColTypes := make([]*types.T, numCols)
+	outColIDs := make(opt.ColList, numCols)
+	var outRows []memo.ScalarListExpr
+
+	// Get type and ColumnID of each column.
+	for i, zipItem := range zip {
+		arrExpr := zipItem.Fn.(*memo.FunctionExpr).Args[0]
+		outColTypes[i] = arrExpr.DataType().ArrayContents()
+		outColIDs[i] = zipItem.Cols[0]
+	}
+
+	// addValToOutRows inserts a value into outRows at the given index.
+	addValToOutRows := func(expr opt.ScalarExpr, rIndex, cIndex int) {
+		if rIndex >= len(outRows) {
+			// If this is the largest column encountered so far, make a new row and
+			// fill with NullExpr's.
+			outRows = append(outRows, make(memo.ScalarListExpr, numCols))
+			for i := 0; i < numCols; i++ {
+				outRows[rIndex][i] = c.f.ConstructNull(outColTypes[cIndex])
+			}
+		}
+		outRows[rIndex][cIndex] = expr // Insert value into outRows.
+	}
+
+	// Fill outRows with values from the arrays in the ZipExpr.
+	for i, zipItem := range zip {
+		arrExpr := zipItem.Fn.(*memo.FunctionExpr).Args[0]
+		switch t := arrExpr.(type) {
+		case *memo.ArrayExpr:
+			for j, val := range t.Elems {
+				addValToOutRows(val, j, i)
+			}
+
+		case *memo.ConstExpr:
+			dArray := t.Value.(*tree.DArray)
+			for j, elem := range dArray.Array {
+				val := c.f.ConstructConstVal(elem, dArray.ParamTyp)
+				addValToOutRows(val, j, i)
+			}
+		}
+	}
+
+	// Convert outRows (a slice of ScalarListExpr's) into a ScalarListExpr
+	// containing a tuple for each row.
+	tuples := make(memo.ScalarListExpr, len(outRows))
+	for i, row := range outRows {
+		tuples[i] = c.f.ConstructTuple(row, types.MakeTuple(outColTypes))
+	}
+
+	// Construct and return a Values operator.
+	valuesPrivate := &memo.ValuesPrivate{Cols: outColIDs, ID: c.f.Metadata().NextUniqueID()}
+	return c.f.ConstructValues(tuples, valuesPrivate)
+}
+
 // ----------------------------------------------------------------------
 //
 // Set Rules
@@ -1372,12 +1811,38 @@ func (c *CustomFuncs) ProjectColMapRight(set *memo.SetPrivate) memo.ProjectionsE
 // projectColMapSide implements the side-agnostic logic from ProjectColMapLeft
 // and ProjectColMapRight.
 func (c *CustomFuncs) projectColMapSide(toList, fromList opt.ColList) memo.ProjectionsExpr {
-	items := make(memo.ProjectionsExpr, len(toList))
+	items := make(memo.ProjectionsExpr, 0, len(toList))
 	for idx, fromCol := range fromList {
 		toCol := toList[idx]
-		items[idx] = c.f.ConstructProjectionsItem(c.f.ConstructVariable(fromCol), toCol)
+		// If the to and from col ids are the same, do not project them. They
+		// are passed-through instead. See opt.Metadata for more details about
+		// why some col ids could exist on one side and the output of a set
+		// operation.
+		if fromCol != toCol {
+			items = append(items, c.f.ConstructProjectionsItem(c.f.ConstructVariable(fromCol), toCol))
+		}
 	}
 	return items
+}
+
+// ProjectPassthroughLeft returns a ColSet that contains the columns that can
+// be passed-through from the left side in a SetPrivate when eliminating a set
+// operation, like in EliminateUnionAllLeft. Columns in both the output
+// ColList and the left ColList should be passed-through.
+func (c *CustomFuncs) ProjectPassthroughLeft(set *memo.SetPrivate) opt.ColSet {
+	out := set.OutCols.ToSet()
+	out.IntersectionWith(set.LeftCols.ToSet())
+	return out
+}
+
+// ProjectPassthroughRight returns a ColSet that contains the columns that can
+// be passed-through from the right side in a SetPrivate when eliminating a set
+// operation, like in EliminateUnionAllRight. Columns in both the output
+// ColList and the right ColList should be passed-through.
+func (c *CustomFuncs) ProjectPassthroughRight(set *memo.SetPrivate) opt.ColSet {
+	out := set.OutCols.ToSet()
+	out.IntersectionWith(set.RightCols.ToSet())
+	return out
 }
 
 // PruneSetPrivate returns a SetPrivate based on the given SetPrivate, but with
@@ -1431,7 +1896,8 @@ func (c *CustomFuncs) CanMapOnSetOp(src *memo.FiltersItem) bool {
 func (c *CustomFuncs) MapSetOpFilterLeft(
 	filter *memo.FiltersItem, set *memo.SetPrivate,
 ) opt.ScalarExpr {
-	return c.mapSetOpFilter(filter, set.OutCols, set.LeftCols)
+	colMap := makeMapFromColLists(set.OutCols, set.LeftCols)
+	return c.MapFiltersItemCols(filter, colMap)
 }
 
 // MapSetOpFilterRight maps the filter onto the right expression by replacing
@@ -1441,43 +1907,41 @@ func (c *CustomFuncs) MapSetOpFilterLeft(
 func (c *CustomFuncs) MapSetOpFilterRight(
 	filter *memo.FiltersItem, set *memo.SetPrivate,
 ) opt.ScalarExpr {
-	return c.mapSetOpFilter(filter, set.OutCols, set.RightCols)
+	colMap := makeMapFromColLists(set.OutCols, set.RightCols)
+	return c.MapFiltersItemCols(filter, colMap)
 }
 
-// mapSetOpFilter maps filter expressions to dst by replacing occurrences of
-// columns in src with corresponding columns in dst (the two lists must be of
-// equal length).
-//
-// For each column in src that is not an outer column, SetMap replaces it with
-// the corresponding column in dst.
-//
-// For example, consider this query:
-//
-//   SELECT * FROM (SELECT x FROM a UNION SELECT y FROM b) WHERE x < 5
-//
-// If mapSetOpFilter is called on the left subtree of the Union, the filter
-// x < 5 propagates to that side after mapping the column IDs appropriately.
-// WLOG, If setMap is called on the right subtree, the filter x < 5 will be
-// mapped similarly to y < 5 on the right side.
-func (c *CustomFuncs) mapSetOpFilter(
-	filter *memo.FiltersItem, src opt.ColList, dst opt.ColList,
-) opt.ScalarExpr {
-	// Map each column in src to one column in dst to map the
-	// filters appropriately.
+// makeMapFromColLists maps each column ID in src to a column ID in dst. The
+// columns IDs are mapped based on their relative positions in the column lists,
+// e.g. the third item in src maps to the third item in dst. The lists must be
+// of equal length.
+func makeMapFromColLists(src opt.ColList, dst opt.ColList) util.FastIntMap {
+	if len(src) != len(dst) {
+		panic(errors.AssertionFailedf("src and dst must have the same length, src: %v, dst: %v", src, dst))
+	}
+
 	var colMap util.FastIntMap
 	for colIndex, outColID := range src {
 		colMap.Set(int(outColID), int(dst[colIndex]))
 	}
+	return colMap
+}
 
+// MapFiltersItemCols maps filter expressions by replacing occurrences of
+// the keys of colMap with the corresponding values. Outer columns are not
+// replaced.
+func (c *CustomFuncs) MapFiltersItemCols(
+	filter *memo.FiltersItem, colMap util.FastIntMap,
+) opt.ScalarExpr {
 	// Recursively walk the scalar sub-tree looking for references to columns
 	// that need to be replaced and then replace them appropriately.
 	var replace ReplaceFunc
 	replace = func(nd opt.Expr) opt.Expr {
 		switch t := nd.(type) {
 		case *memo.VariableExpr:
-			dstCol, inCol := colMap.Get(int(t.Col))
-			if !inCol {
-				// Its not part of the out cols so no replacement required.
+			dstCol, ok := colMap.Get(int(t.Col))
+			if !ok {
+				// It is not part of the output cols so no replacement required.
 				return nd
 			}
 			return c.f.ConstructVariable(opt.ColumnID(dstCol))
@@ -1829,15 +2293,35 @@ func (c *CustomFuncs) IsConstArray(scalar opt.ScalarExpr) bool {
 	return false
 }
 
+// IsStaticArray returns true if the expression is either a ConstExpr that
+// wraps a DArray or an ArrayExpr. The complete set of expressions within a
+// static array can be determined during planning:
+//
+//   ARRAY[1,2]
+//   ARRAY[x,y]
+//
+// By contrast, expressions within a dynamic array can only be determined at
+// run-time:
+//
+//   SELECT (SELECT array_agg(x) FROM xy)
+//
+// Here, the length of the array is only known at run-time.
+func (c *CustomFuncs) IsStaticArray(scalar opt.ScalarExpr) bool {
+	if _, ok := scalar.(*memo.ArrayExpr); ok {
+		return true
+	}
+	return c.IsConstArray(scalar)
+}
+
 // ConvertConstArrayToTuple converts a constant ARRAY datum to the equivalent
 // homogeneous tuple, so ARRAY[1, 2, 3] becomes (1, 2, 3).
 func (c *CustomFuncs) ConvertConstArrayToTuple(scalar opt.ScalarExpr) opt.ScalarExpr {
 	darr := scalar.(*memo.ConstExpr).Value.(*tree.DArray)
 	elems := make(memo.ScalarListExpr, len(darr.Array))
-	ts := make([]types.T, len(darr.Array))
+	ts := make([]*types.T, len(darr.Array))
 	for i, delem := range darr.Array {
 		elems[i] = c.f.ConstructConstVal(delem, delem.ResolvedType())
-		ts[i] = *darr.ParamTyp
+		ts[i] = darr.ParamTyp
 	}
 	return c.f.ConstructTuple(elems, types.MakeTuple(ts))
 }
@@ -1896,12 +2380,53 @@ func (c *CustomFuncs) MakeArrayAggCol(typ *types.T) opt.ColumnID {
 	return c.mem.Metadata().AddColumn("array_agg", typ)
 }
 
-// MakeOrderedGrouping constructs a new GroupingPrivate using the given
-// grouping columns and OrderingChoice private. The ErrorOnDup will be false.
-func (c *CustomFuncs) MakeOrderedGrouping(
+// MakeGrouping constructs a new GroupingPrivate using the given grouping
+// columns and OrderingChoice. ErrorOnDup will be empty.
+func (c *CustomFuncs) MakeGrouping(
 	groupingCols opt.ColSet, ordering physical.OrderingChoice,
 ) *memo.GroupingPrivate {
 	return &memo.GroupingPrivate{GroupingCols: groupingCols, Ordering: ordering}
+}
+
+// MakeErrorOnDupGrouping constructs a new GroupingPrivate using the given
+// grouping columns, OrderingChoice, and ErrorOnDup text.
+func (c *CustomFuncs) MakeErrorOnDupGrouping(
+	groupingCols opt.ColSet, ordering physical.OrderingChoice, errorText string,
+) *memo.GroupingPrivate {
+	return &memo.GroupingPrivate{
+		GroupingCols: groupingCols, Ordering: ordering, ErrorOnDup: errorText,
+	}
+}
+
+// ErrorOnDup returns the error text contained by the given GroupingPrivate.
+func (c *CustomFuncs) ErrorOnDup(private *memo.GroupingPrivate) string {
+	return private.ErrorOnDup
+}
+
+// RaisesErrorOnDup returns true if an EnsureDistinctOn or UpsertDistinctOn
+// operator with the given GroupingPrivate raises an error upon detection
+// of duplicate values.
+func (c *CustomFuncs) RaisesErrorOnDup(private *memo.GroupingPrivate) bool {
+	return private.ErrorOnDup != ""
+}
+
+// ExtractGroupingOrdering returns the ordering associated with the input
+// GroupingPrivate.
+func (c *CustomFuncs) ExtractGroupingOrdering(
+	private *memo.GroupingPrivate,
+) physical.OrderingChoice {
+	return private.Ordering
+}
+
+// AddColsToGrouping returns a new GroupByDef that is a copy of the given
+// GroupingPrivate, except with the given set of grouping columns union'ed with
+// the existing grouping columns.
+func (c *CustomFuncs) AddColsToGrouping(
+	private *memo.GroupingPrivate, groupingCols opt.ColSet,
+) *memo.GroupingPrivate {
+	p := *private
+	p.GroupingCols = private.GroupingCols.Union(groupingCols)
+	return &p
 }
 
 // IsLimited indicates whether a limit was pushed under the subquery
@@ -1941,9 +2466,9 @@ func (c *CustomFuncs) InlineValues(v memo.RelExpr) *memo.TupleExpr {
 	values := v.(*memo.ValuesExpr)
 	md := c.mem.Metadata()
 	if len(values.Cols) > 1 {
-		colTypes := make([]types.T, len(values.Cols))
+		colTypes := make([]*types.T, len(values.Cols))
 		for i, colID := range values.Cols {
-			colTypes[i] = *md.ColumnMeta(colID).Type
+			colTypes[i] = md.ColumnMeta(colID).Type
 		}
 		// Inlining a multi-column VALUES results in a tuple of tuples. Example:
 		//
@@ -1952,7 +2477,7 @@ func (c *CustomFuncs) InlineValues(v memo.RelExpr) *memo.TupleExpr {
 		//   (a,b) IN ((1,1), (2,2))
 		return &memo.TupleExpr{
 			Elems: values.Rows,
-			Typ:   types.MakeTuple([]types.T{*types.MakeTuple(colTypes)}),
+			Typ:   types.MakeTuple([]*types.T{types.MakeTuple(colTypes)}),
 		}
 	}
 	// Inlining a sngle-column VALUES results in a simple tuple. Example:
@@ -1962,12 +2487,46 @@ func (c *CustomFuncs) InlineValues(v memo.RelExpr) *memo.TupleExpr {
 	colType := md.ColumnMeta(values.Cols[0]).Type
 	tuple := &memo.TupleExpr{
 		Elems: make(memo.ScalarListExpr, len(values.Rows)),
-		Typ:   types.MakeTuple([]types.T{*colType}),
+		Typ:   types.MakeTuple([]*types.T{colType}),
 	}
 	for i := range values.Rows {
 		tuple.Elems[i] = values.Rows[i].(*memo.TupleExpr).Elems[0]
 	}
 	return tuple
+}
+
+// VarsAreSame returns true if the two variables are the same.
+func (c *CustomFuncs) VarsAreSame(left, right opt.ScalarExpr) bool {
+	lv := left.(*memo.VariableExpr)
+	rv := right.(*memo.VariableExpr)
+	return lv.Col == rv.Col
+}
+
+// IsStaticTuple returns true if the given ScalarExpr is either a TupleExpr or a
+// ConstExpr wrapping a DTuple. Expressions within a static tuple can be
+// determined during planning:
+//
+//   (1, 2)
+//   (x, y)
+//
+// By contrast, expressions within a dynamic tuple can only be determined at
+// run-time:
+//
+//   SELECT (SELECT (x, y) FROM xy)
+//
+// Here, if there are 0 rows in xy, the tuple value will be NULL. Or, if there
+// is more than one row in xy, a dynamic error will be raised.
+func (c *CustomFuncs) IsStaticTuple(expr opt.ScalarExpr) bool {
+	switch t := expr.(type) {
+	case *memo.TupleExpr:
+		return true
+
+	case *memo.ConstExpr:
+		if _, ok := t.Value.(*tree.DTuple); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // ----------------------------------------------------------------------
@@ -2037,11 +2596,15 @@ func (c *CustomFuncs) CanAddConstInts(first tree.Datum, second tree.Datum) bool 
 // ----------------------------------------------------------------------
 
 // CanInlineWith returns whether or not it's valid to inline binding in expr.
-// This is the case when:
+// This is the case when materialize is explicitly set to false, or when:
 // 1. binding has no side-effects (because once it's inlined, there's no
 //    guarantee it will be executed fully), and
 // 2. binding is referenced at most once in expr.
 func (c *CustomFuncs) CanInlineWith(binding, expr memo.RelExpr, private *memo.WithPrivate) bool {
+	// If materialization is set, ignore the checks below.
+	if private.Mtr.Set {
+		return !private.Mtr.Materialize
+	}
 	if binding.Relational().CanHaveSideEffects {
 		return false
 	}

@@ -130,7 +130,7 @@ func (r *Replica) executeWriteBatch(
 	// If the command is proposed to Raft, ownership of and responsibility for
 	// the concurrency guard will be assumed by Raft, so provide the guard to
 	// evalAndPropose.
-	ch, abandon, maxLeaseIndex, g, pErr := r.evalAndPropose(ctx, ba, g, &st.Lease)
+	ch, abandon, maxLeaseIndex, pErr := r.evalAndPropose(ctx, ba, g, &st.Lease)
 	if pErr != nil {
 		if maxLeaseIndex != 0 {
 			log.Fatalf(
@@ -140,6 +140,8 @@ func (r *Replica) executeWriteBatch(
 		}
 		return nil, g, pErr
 	}
+	g = nil // ownership passed to Raft, prevent misuse
+
 	// A max lease index of zero is returned when no proposal was made or a lease was proposed.
 	// In both cases, we don't need to communicate a MLAI. Furthermore, for lease proposals we
 	// cannot communicate under the lease's epoch. Instead the code calls EmitMLAI explicitly
@@ -188,37 +190,38 @@ func (r *Replica) executeWriteBatch(
 				if err := r.store.intentResolver.CleanupIntentsAsync(
 					ctx, propResult.EncounteredIntents, true, /* allowSync */
 				); err != nil {
-					log.Warning(ctx, err)
+					log.Warningf(ctx, "%v", err)
 				}
 			}
 			if len(propResult.EndTxns) > 0 {
 				if err := r.store.intentResolver.CleanupTxnIntentsAsync(
 					ctx, r.RangeID, propResult.EndTxns, true, /* allowSync */
 				); err != nil {
-					log.Warning(ctx, err)
+					log.Warningf(ctx, "%v", err)
 				}
 			}
-			return propResult.Reply, g, propResult.Err
+			return propResult.Reply, nil, propResult.Err
 		case <-slowTimer.C:
 			slowTimer.Read = true
 			r.store.metrics.SlowRaftRequests.Inc(1)
 
-			log.Error(ctx, rangeUnavailableMessage(r.Desc(), r.store.cfg.NodeLiveness.GetIsLiveMap(),
-				r.RaftStatus(), ba, timeutil.Since(startPropTime)))
+			log.Errorf(ctx, "range unavailable: %v",
+				rangeUnavailableMessage(r.Desc(), r.store.cfg.NodeLiveness.GetIsLiveMap(),
+					r.RaftStatus(), ba, timeutil.Since(startPropTime)))
 		case <-ctxDone:
 			// If our context was canceled, return an AmbiguousResultError,
 			// which indicates to the caller that the command may have executed.
 			abandon()
 			log.VEventf(ctx, 2, "context cancellation after %0.1fs of attempting command %s",
 				timeutil.Since(startTime).Seconds(), ba)
-			return nil, g, roachpb.NewError(roachpb.NewAmbiguousResultError(ctx.Err().Error()))
+			return nil, nil, roachpb.NewError(roachpb.NewAmbiguousResultError(ctx.Err().Error()))
 		case <-shouldQuiesce:
 			// If shutting down, return an AmbiguousResultError, which indicates
 			// to the caller that the command may have executed.
 			abandon()
 			log.VEventf(ctx, 2, "shutdown cancellation after %0.1fs of attempting command %s",
 				timeutil.Since(startTime).Seconds(), ba)
-			return nil, g, roachpb.NewError(roachpb.NewAmbiguousResultError("server shutdown"))
+			return nil, nil, roachpb.NewError(roachpb.NewAmbiguousResultError("server shutdown"))
 		}
 	}
 }
@@ -314,6 +317,7 @@ func (r *Replica) evaluateWriteBatch(
 	ba *roachpb.BatchRequest,
 	latchSpans *spanset.SpanSet,
 ) (storage.Batch, enginepb.MVCCStats, *roachpb.BatchResponse, result.Result, *roachpb.Error) {
+	log.Event(ctx, "executing read-write batch")
 
 	// If the transaction has been pushed but it can commit at the higher
 	// timestamp, let's evaluate the batch at the bumped timestamp. This will

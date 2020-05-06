@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -98,10 +99,10 @@ func TestShowBackup(t *testing.T) {
 	sqlDB.Exec(t, `CREATE TABLE data.details2()`)
 	sqlDB.Exec(t, `BACKUP data.details1, data.details2 TO $1;`, details)
 
-	details1Desc := sqlbase.GetTableDescriptor(tc.Server(0).DB(), "data", "details1")
-	details2Desc := sqlbase.GetTableDescriptor(tc.Server(0).DB(), "data", "details2")
-	details1Key := roachpb.Key(sqlbase.MakeIndexKeyPrefix(details1Desc, details1Desc.PrimaryIndex.ID))
-	details2Key := roachpb.Key(sqlbase.MakeIndexKeyPrefix(details2Desc, details2Desc.PrimaryIndex.ID))
+	details1Desc := sqlbase.GetTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "data", "details1")
+	details2Desc := sqlbase.GetTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "data", "details2")
+	details1Key := roachpb.Key(sqlbase.MakeIndexKeyPrefix(keys.SystemSQLCodec, details1Desc, details1Desc.PrimaryIndex.ID))
+	details2Key := roachpb.Key(sqlbase.MakeIndexKeyPrefix(keys.SystemSQLCodec, details2Desc, details2Desc.PrimaryIndex.ID))
 
 	sqlDB.CheckQueryResults(t, fmt.Sprintf(`SHOW BACKUP RANGES '%s'`, details), [][]string{
 		{"/Table/56/1", "/Table/56/2", string(details1Key), string(details1Key.PrefixEnd())},
